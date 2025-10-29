@@ -6,7 +6,7 @@ services:
     plan: starter
     region: frankfurt
     runtime:
-      pythonVersion: 3.11.9
+      
     buildCommand: |
       pip install --upgrade pip
       pip install --no-cache-dir -r requirements.txt
