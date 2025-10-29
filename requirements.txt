@@ -1,16 +1,10 @@
-# requirements.txt  (استخدم نفس الأسماء في مشروعك)
-# كل الإصدارات دي لها wheels جاهزة على Linux x86_64
 pip==25.1.1
 setuptools>=68
 wheel>=0.43
-
-# أساسي
 ccxt==4.3.92
 pandas==2.2.2
-numpy==1.26.4         # متوافق مع بايثون 3.11 ومع pandas 2.2.x
+numpy==1.26.4
 Flask==3.0.3
 termcolor==2.4.0
 requests==2.32.3
-
-# (اختياري) لتفادي مشاكل TLS مع مكتبات قديمة
 urllib3==2.2.2
