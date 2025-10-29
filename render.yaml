@@ -5,7 +5,7 @@ services:
     env: python
     plan: starter
     region: frankfurt
-    runtime: python3.11         # <-- نص واحد، ليس خريطة
+    runtime: python3          # ← المسموح به فقط
     buildCommand: |
       pip install --upgrade pip
       pip install --no-cache-dir -r requirements.txt
@@ -13,7 +13,7 @@ services:
     autoDeploy: true
     envVars:
       - key: PIP_ONLY_BINARY
-        value: ":all:"           # اجبار wheels وتفادي build من السورس
+        value: ":all:"
       - key: PIP_NO_BUILD_ISOLATION
         value: "1"
       - key: BINGX_API_KEY
