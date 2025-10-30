@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 DOGE/USDT — Smart Council Pro — AI Trading System
-+ Enhanced Council with MACD/VWAP/Delta Volume
++ Enhanced Council with MACD/VWAP/Delta Volume - NO RF WAITING
 + Smart Profit Taking & Strict Exit
 + True Market Structure Detection
 
@@ -38,7 +38,7 @@ LEVERAGE      = 10
 RISK_ALLOC    = 0.60
 POSITION_MODE = "oneway"
 
-# Enhanced RF
+# Enhanced RF (للتحليل فقط - ليس للدخول)
 RF_SOURCE     = "close"
 RF_PERIOD     = 20
 RF_MULT       = 3.5
@@ -68,7 +68,7 @@ MAX_SPREAD_BPS      = 8.0
 HARD_SPREAD_BPS     = 15.0
 PAUSE_ADX_THRESHOLD = 17.0
 
-# ENHANCED COUNCIL THRESHOLDS
+# ENHANCED COUNCIL THRESHOLDS - مجلس الإدارة له الأولوية
 ENTRY_VOTES_MIN = 7  # Increased for stricter entry
 ENTRY_SCORE_MIN = 5.0
 ENTRY_ADX_MIN   = 22.0
@@ -80,7 +80,7 @@ VOTE_DEMAND_REJECT = 2
 VOTE_SWEEP         = 2
 VOTE_FVG           = 1
 VOTE_EQ_LEVELS     = 1
-VOTE_RF_CONFIRM    = 1
+VOTE_RF_CONFIRM    = 1  # للإشارة فقط - ليس شرطًا أساسيًا
 VOTE_DI_ADX        = 1
 VOTE_RSI_NEUT_TURN = 1
 VOTE_BOOKMAP_ACC   = 1
@@ -102,6 +102,7 @@ VOTE_TREND_ALIGN   = 1
 MAX_SLIP_OPEN_BPS  = 20.0
 MAX_SLIP_CLOSE_BPS = 30.0
 USE_LIMIT_IOC      = True
+SIZE_BUFFER = 0.97
 
 # Enhanced Management
 TP1_PCT_BASE       = 0.40
@@ -118,9 +119,17 @@ OPP_STRONG_DEBOUNCE = 2
 
 # Enhanced Protection
 STATE_FILE = "state_doge_enhanced.json"
+AUTOSAVE_EVERY_LOOP = True
+AUTOSAVE_ON_ORDER = True
+RESTART_SAFE_BARS_HOLD = 2
+RESTART_STRICT_EXCHANGE_SRC = True
 FLIP_COOLDOWN_S = 45
 MAX_TRADES_PER_HOUR = 6
 CLOSE_COOLDOWN_S = 90
+FINAL_CHUNK_QTY = 50.0
+RESIDUAL_MIN_QTY = 9.0
+BASE_SLEEP = 5
+NEAR_CLOSE_S = 1
 
 # ===== ENHANCED LOGGING =====
 def setup_file_logging():
@@ -298,6 +307,120 @@ def orderbook_spread_bps():
     except Exception: 
         return None
 
+def _interval_seconds(iv:str)->int:
+    iv=(iv or "").lower().strip()
+    if iv.endswith("m"): return int(float(iv[:-1]))*60
+    if iv.endswith("h"): return int(float(iv[:-1]))*3600
+    if iv.endswith("d"): return int(float(iv[:-1]))*86400
+    return 15*60
+
+def time_to_candle_close(df: pd.DataFrame)->int:
+    tf=_interval_seconds(INTERVAL)
+    if len(df)==0: return tf
+    cur=int(df["time"].iloc[-1]); now=int(time.time()*1000)
+    nxt=cur+tf*1000
+    while nxt<=now: nxt+=tf*1000
+    return int(max(0,nxt-now)/1000)
+
+def cancel_all_orders():
+    if not MODE_LIVE: return
+    try: ex.cancel_all_orders(SYMBOL)
+    except Exception as e: logging.warning(f"cancel_all_orders: {e}")
+
+# ===== STATE PERSISTENCE =====
+def _atomic_write_json(path: str, payload: dict):
+    try:
+        d=os.path.dirname(path) or "."
+        os.makedirs(d, exist_ok=True)
+        with tempfile.NamedTemporaryFile("w", delete=False, dir=d, encoding="utf-8") as tmp:
+            json.dump(payload, tmp, ensure_ascii=False, separators=(",",":"))
+            tmp.flush(); os.fsync(tmp.fileno())
+            tmp_path=tmp.name
+        os.replace(tmp_path, path)
+    except Exception as e: logging.error(f"atomic_write_json: {e}")
+
+def save_state(tag=""):
+    snap={
+        "STATE": STATE, "compound_pnl": compound_pnl,
+        "symbol":SYMBOL, "interval":INTERVAL,
+        "ts": int(time.time()*1000), "tag": tag
+    }
+    _atomic_write_json(STATE_FILE, snap)
+
+def load_state():
+    try:
+        if not os.path.exists(STATE_FILE): return None
+        with open(STATE_FILE,"r",encoding="utf-8") as f: return json.load(f)
+    except Exception as e:
+        logging.error(f"load_state: {e}"); return None
+
+# ===== RECONCILE FUNCTION =====
+def reconcile_state_with_exchange():
+    """يتأكد من أن حالة البوت متوافقة مع حالة المنصة بعد أي ريستارت أو خطأ"""
+    global compound_pnl, RESTART_HOLD_UNTIL_BAR
+    
+    print(colored("🔄 جاري مزامنة الحالة مع المنصة...", "cyan"))
+    
+    # تحميل الحالة المحفوظة
+    loaded = load_state()
+    if loaded and (loaded.get("symbol") == SYMBOL and loaded.get("interval") == INTERVAL):
+        st = loaded.get("STATE") or {}
+        STATE["highest_profit_pct"] = float(st.get("highest_profit_pct") or 0.0)
+        STATE["trail"] = st.get("trail")
+        STATE["breakeven"] = st.get("breakeven")
+        STATE["profit_targets_achieved"] = int(st.get("profit_targets_achieved") or 0)
+        try: 
+            compound_pnl = float(loaded.get("compound_pnl") or 0.0)
+        except Exception: 
+            pass
+        print(colored("💾 تم تحميل الحالة المحلية", "cyan"))
+    
+    # قراءة المراكز من المنصة
+    try:
+        positions = with_retry(lambda: ex.fetch_positions([SYMBOL]))
+        active_position = None
+        
+        for pos in positions:
+            symbol = pos.get("symbol")
+            contracts = float(pos.get("contracts", 0))
+            
+            if symbol == SYMBOL and abs(contracts) > 0:
+                side = "long" if contracts > 0 else "short"
+                entry_price = float(pos.get("entryPrice", 0))
+                print(colored(f"🔁 تم العثور على مركز نشط: {side.upper()} {contracts} @ {entry_price}", "yellow"))
+                
+                active_position = {
+                    "active": True,
+                    "side": side,
+                    "entry_price": entry_price,
+                    "contracts": abs(contracts),
+                    "timestamp": pos.get("timestamp", int(time.time() * 1000))
+                }
+                break
+        
+        if active_position and RESTART_STRICT_EXCHANGE_SRC:
+            STATE.update({
+                "open": True,
+                "side": active_position["side"],
+                "entry": active_position["entry_price"],
+                "qty": active_position["contracts"],
+                "pnl": 0.0,
+                "bars": 0
+            })
+            RESTART_HOLD_UNTIL_BAR = RESTART_SAFE_BARS_HOLD
+            print(colored(f"♻️ تم استئناف المركز النشط {active_position['side']}", "green"))
+        elif not active_position:
+            STATE.update({
+                "open": False, "side": None, "entry": None, "qty": 0.0, "pnl": 0.0
+            })
+            print(colored("♻️ لا توجد مراكز نشطة - الوضع: مغلق", "yellow"))
+            
+    except Exception as e:
+        print(colored(f"⚠️ خطأ في مزامنة الحالة: {e}", "red"))
+        logging.error(f"reconcile_state_with_exchange error: {e}")
+    
+    save_state(tag="reconcile_boot")
+
 # ===== ENHANCED INDICATORS =====
 def compute_enhanced_indicators(df: pd.DataFrame):
     if len(df) < max(ATR_LEN, RSI_LEN, ADX_LEN, VWAP_LEN, DELTA_VOLUME_LOOKBACK) + 10:
@@ -388,7 +511,7 @@ def compute_enhanced_indicators(df: pd.DataFrame):
         "trend_strength": float(trend_strength.iloc[i])
     }
 
-# ===== ENHANCED RF =====
+# ===== ENHANCED RF (للتحليل فقط) =====
 def _ema(s: pd.Series, n: int): 
     return s.ewm(span=n, adjust=False).mean()
 
@@ -544,7 +667,7 @@ def find_supply_demand_zones(df: pd.DataFrame, lookback: int = 100):
         "demand": sorted(demand_zones, key=lambda x: x["strength"], reverse=True)[:3]
     }
 
-# ===== SMART COUNCIL SYSTEM =====
+# ===== SMART COUNCIL SYSTEM - الأولوية المطلقة =====
 class SmartCouncil:
     def __init__(self):
         self.state = {"open": False, "side": None, "entry": None}
@@ -573,7 +696,7 @@ class SmartCouncil:
         return True
 
     def enhanced_votes(self, df: pd.DataFrame, ind: dict, rf: dict):
-        """Enhanced voting with MACD, VWAP, Delta Volume"""
+        """Enhanced voting with MACD, VWAP, Delta Volume - NO RF REQUIREMENT"""
         b = s = 0
         score = 0.0
         rb = []  # Reasons for buy
@@ -652,7 +775,7 @@ class SmartCouncil:
                 score += 0.4
                 rs.append("RSI_momentum↓")
         
-        # 7. Existing RF and Structure Signals (keep original logic)
+        # 7. Existing Structure Signals (NO RF REQUIRED)
         boxes = find_supply_demand_zones(df)
         current_low = float(df["low"].iloc[-1])
         current_high = float(df["high"].iloc[-1])
@@ -671,7 +794,7 @@ class SmartCouncil:
                 score += zone["strength"] * 0.5
                 rs.append(f"SupplyZone{zone['strength']:.1f}")
         
-        # RF Signals
+        # RF Signals (للإشارة فقط - ليست مطلوبة)
         if rf.get("long"):
             signal_hash = self._get_signal_hash(df, "RF_LONG")
             if self._can_use_signal(signal_hash):
@@ -701,14 +824,14 @@ class SmartCouncil:
         return b, s, score
 
     def decide_entry(self, df, ind, rf):
-        """Enhanced entry decision with multiple confirmations"""
+        """Enhanced entry decision - NO RF WAITING"""
         b, s, score = self.enhanced_votes(df, ind, rf)
         adx = float(ind.get("adx") or 0.0)
         trend_strength = float(ind.get("trend_strength") or 0.0)
         
         entry = None
         if not self.state["open"]:
-            # Stricter entry conditions
+            # مجلس الإدارة له الأولوية المطلقة
             min_votes = ENTRY_VOTES_MIN
             min_score = ENTRY_SCORE_MIN
             min_adx = ENTRY_ADX_MIN
@@ -850,6 +973,50 @@ def _within_hour_rate_limit():
 def _mark_trade_timestamp():
     _trades_timestamps.append(time.time())
 
+def _params_open(side):
+    if POSITION_MODE=="hedge":
+        return {"positionSide":"LONG" if side=="buy" else "SHORT", "reduceOnly":False}
+    return {"positionSide":"BOTH","reduceOnly":False}
+
+def _params_close():
+    if POSITION_MODE=="hedge":
+        return {"positionSide":"LONG" if STATE.get("side")=="long" else "SHORT","reduceOnly":True}
+    return {"positionSide":"BOTH","reduceOnly":True}
+
+def _best_quotes():
+    ob=with_retry(lambda: ex.fetch_order_book(SYMBOL, limit=5))
+    bid=ob["bids"][0][0] if ob["bids"] else None
+    ask=ob["asks"][0][0] if ob["asks"] else None
+    mid=(bid+ask)/2.0 if (bid and ask) else price_now()
+    return bid, ask, mid
+
+def _ioc_price(side: str, mid: float, max_bps: float) -> float:
+    if mid is None or mid<=0: return None
+    slip = max_bps/10000.0
+    return (mid*(1+slip)) if side=="buy" else (mid*(1-slip))
+
+def _create_order_ioc(symbol, side, qty, limit_price, reduce_only=False):
+    params={"timeInForce":"IOC","reduceOnly":reduce_only}
+    if POSITION_MODE=="hedge":
+        params["positionSide"] = "LONG" if (side=="buy") else "SHORT"
+    return ex.create_order(symbol, "limit", side, qty, limit_price, params)
+
+def _read_position():
+    try:
+        poss=with_retry(lambda: ex.fetch_positions(params={"type":"swap"}))
+        for p in poss:
+            sym=(p.get("symbol") or p.get("info",{}).get("symbol") or "")
+            if SYMBOL.split(":")[0] not in sym: continue
+            qty=abs(float(p.get("contracts") or p.get("info",{}).get("positionAmt") or 0))
+            if qty<=0: return 0.0,None,None
+            entry=float(p.get("entryPrice") or p.get("info",{}).get("avgEntryPrice") or 0)
+            side_raw=(p.get("side") or p.get("info",{}).get("positionSide") or "").lower()
+            side="long" if "long" in side_raw or float(p.get("cost",0))>0 else "short"
+            return qty, side, entry
+    except Exception as e:
+        logging.error(f"_read_position: {e}")
+    return 0.0,None,None
+
 def compute_enhanced_size(balance, price, volatility):
     """Enhanced position sizing with volatility adjustment"""
     base_cap = (balance or 0.0) * RISK_ALLOC * LEVERAGE * SIZE_BUFFER
@@ -923,6 +1090,74 @@ def open_enhanced_position(side, qty, price, tag=""):
         save_state(tag="enhanced_open")
     return True
 
+def _reset_after_close(reason, prev_side=None):
+    global wait_for_next_signal_side
+    prev_side = prev_side or STATE.get("side")
+    STATE.update({
+        "open":False,"side":None,"entry":None,"qty":0.0,"pnl":0.0,"bars":0,
+        "trail":None,"breakeven":None,"tp1_done":False,
+        "highest_profit_pct":0.0,"profit_targets_achieved":0,
+        "opp_votes":0,"_last_close_ts": int(time.time())
+    })
+    wait_for_next_signal_side = "sell" if prev_side=="long" else "buy" if prev_side=="short" else None
+
+def close_market_strict(reason="STRICT"):
+    global compound_pnl
+    exch_qty, exch_side, exch_entry = _read_position()
+    if exch_qty<=0 and not STATE.get("open"): return
+    if exch_qty<=0 and STATE.get("open"):
+        px = price_now() or STATE["entry"]; entry=STATE["entry"]; side=STATE["side"]
+        pnl=(px-entry)*STATE["qty"]*(1 if side=="long" else -1); compound_pnl+=pnl
+        print(colored(f"🔚 STRICT CLOSE {side} reason={reason} pnl={fmt(pnl)} total={fmt(compound_pnl)}","magenta"))
+        _reset_after_close(reason, prev_side=side)
+        if AUTOSAVE_ON_ORDER: save_state(tag="strict_close")
+        return
+    side_to_close="sell" if exch_side=="long" else "buy"
+    qty_to_close=safe_qty(exch_qty)
+    attempts=0; last=None
+    while attempts<6:
+        try:
+            if MODE_LIVE and USE_LIMIT_IOC:
+                _,_,mid=_best_quotes()
+                limit_price=_ioc_price(side_to_close, mid, MAX_SLIP_CLOSE_BPS)
+                _create_order_ioc(SYMBOL, side_to_close, qty_to_close, limit_price, reduce_only=True)
+            elif MODE_LIVE:
+                params=_params_close(); params["reduceOnly"]=True
+                ex.create_order(SYMBOL,"market",side_to_close,qty_to_close,None,params)
+            time.sleep(2.0)
+            left,_,_= _read_position()
+            if left<=0:
+                px=price_now() or STATE.get("entry") or exch_entry
+                entry_px=STATE.get("entry") or exch_entry or px
+                side=STATE.get("side") or exch_side
+                pnl=(px-entry_px)*exch_qty*(1 if side=="long" else -1); compound_pnl+=pnl
+                print(colored(f"🔚 STRICT CLOSE {side} reason={reason} pnl={fmt(pnl)} total={fmt(compound_pnl)}","magenta"))
+                _reset_after_close(reason, prev_side=side)
+                if AUTOSAVE_ON_ORDER: save_state(tag="strict_close")
+                return
+            qty_to_close=safe_qty(left); attempts+=1
+            print(colored(f"⚠️ strict close retry {attempts} residual={fmt(left,4)}","yellow"))
+        except Exception as e:
+            last=e; attempts+=1; time.sleep(2.0)
+    print(colored(f"❌ STRICT CLOSE FAILED last_error={last}","red"))
+
+def close_partial(frac, reason):
+    if not STATE["open"] or STATE["qty"]<=0: return
+    qty_close=safe_qty(max(0.0, STATE["qty"]*min(max(frac,0.0),1.0)))
+    px=price_now() or STATE["entry"]
+    min_unit=max(RESIDUAL_MIN_QTY, LOT_MIN or RESIDUAL_MIN_QTY)
+    if qty_close<min_unit: 
+        print(colored(f"⏸️ skip partial (amount={fmt(qty_close,4)} < min_unit={fmt(min_unit,4)})","yellow")); return
+    side="sell" if STATE["side"]=="long" else "buy"
+    if MODE_LIVE:
+        try: ex.create_order(SYMBOL,"market",side,qty_close,None,_params_close())
+        except Exception as e: print(colored(f"❌ partial: {e}","red")); return
+    pnl=(px-STATE["entry"])*qty_close*(1 if STATE["side"]=="long" else -1)
+    STATE["qty"]=safe_qty(STATE["qty"]-qty_close)
+    print(colored(f"🔻 PARTIAL {reason} closed={fmt(qty_close,4)} pnl={fmt(pnl)} rem={fmt(STATE['qty'],4)}","magenta"))
+    if STATE["qty"]<=FINAL_CHUNK_QTY and STATE["qty"]>0:
+        close_market_strict("FINAL_CHUNK_RULE")
+
 def smart_profit_taking(df, ind, current_profit_pct):
     """Enhanced profit taking based on multiple factors"""
     if not STATE["open"] or STATE["qty"] <= 0:
@@ -981,11 +1216,43 @@ def detect_exhaustion(df, ind, side, profit_pct):
         
     return False
 
-# ===== ENHANCED MAIN LOOP =====
+def manage_enhanced_position(df, ind, info):
+    """إدارة الصفقة المحسنة - لا تنتظر إشارة RF"""
+    if not STATE["open"] or STATE["qty"] <= 0: return
+    px = info["price"]; entry = STATE["entry"]; side = STATE["side"]
+    rr = (px - entry) / entry * 100 * (1 if side == "long" else -1)
+    
+    # Dynamic profit taking
+    smart_profit_taking(df, ind, rr)
+    
+    # Update highest profit
+    if rr > STATE["highest_profit_pct"]: 
+        STATE["highest_profit_pct"] = rr
+    
+    # Trail management
+    atr = float(ind.get("atr") or 0.0)
+    if rr >= TRAIL_ACTIVATE_PCT and atr > 0:
+        gap = atr * ATR_TRAIL_MULT
+        if side == "long":
+            new = px - gap
+            STATE["trail"] = max(STATE["trail"] or new, new)
+            if STATE["breakeven"] is not None: 
+                STATE["trail"] = max(STATE["trail"], STATE["breakeven"])
+            if px < STATE["trail"]: 
+                close_market_strict(f"TRAIL_ATR({ATR_TRAIL_MULT}x)")
+        else:
+            new = px + gap
+            STATE["trail"] = min(STATE["trail"] or new, new)
+            if STATE["breakeven"] is not None: 
+                STATE["trail"] = min(STATE["trail"], STATE["breakeven"])
+            if px > STATE["trail"]: 
+                close_market_strict(f"TRAIL_ATR({ATR_TRAIL_MULT}x)")
+
+# ===== ENHANCED MAIN LOOP - بدون انتظار RF =====
 app = Flask(__name__)
 
 def enhanced_trade_loop():
-    """Enhanced main trading loop with smart decision making"""
+    """Enhanced main trading loop with smart decision making - NO RF WAITING"""
     global wait_for_next_signal_side, RESTART_HOLD_UNTIL_BAR, compound_pnl
     
     reconcile_state_with_exchange()
@@ -997,7 +1264,7 @@ def enhanced_trade_loop():
             bal = balance_usdt()
             df = fetch_ohlcv()
             ind = compute_enhanced_indicators(df)
-            rf = rf_signal_enhanced(df)
+            rf = rf_signal_enhanced(df)  # للتحليل فقط - ليس للدخول
             spread = orderbook_spread_bps()
             px = price_now() or rf["price"] or STATE.get("entry") or 0.0
             
@@ -1013,7 +1280,7 @@ def enhanced_trade_loop():
                 if current_profit_pct > STATE["highest_profit_pct"]:
                     STATE["highest_profit_pct"] = current_profit_pct
             
-            # Smart Council Decision
+            # Smart Council Decision - الأولوية المطلقة
             council_decision = smart_council.decide_entry(df, ind, rf)
             council_log = council_decision.get("log")
             
@@ -1031,7 +1298,7 @@ def enhanced_trade_loop():
             # Manage position with enhanced logic
             manage_enhanced_position(df, ind, {"price": px, **rf})
             
-            # Entry Logic
+            # === ENTRY LOGIC - مجلس الإدارة فقط ===
             decision_time = rf["time"]
             new_bar = decision_time != last_decision_bar_time
             
@@ -1042,11 +1309,12 @@ def enhanced_trade_loop():
                 if RESTART_HOLD_UNTIL_BAR > 0:
                     RESTART_HOLD_UNTIL_BAR -= 1
                 
-                # Enhanced Entry Conditions
+                # === الدخول بناءً على قرار المجلس فقط ===
                 if not STATE["open"] and RESTART_HOLD_UNTIL_BAR <= 0:
                     sig = None
                     tag = ""
                     
+                    # مجلس الإدارة له الأولوية المطلقة
                     if council_decision["entry"]:
                         sig = council_decision["entry"]["side"]
                         tag = f"[SMART_COUNCIL] {council_decision['entry']['reason']}"
@@ -1096,7 +1364,7 @@ def display_enhanced_dashboard(bal, info, ind, spread_bps, df=None, council_log=
     left_s = time_to_candle_close(df) if df is not None else 0
     
     print(colored("═" * 120, "cyan"))
-    print(colored(f"🎯 SMART COUNCIL PRO — {SYMBOL} {INTERVAL} • {'LIVE' if MODE_LIVE else 'PAPER'} • {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC", "cyan"))
+    print(colored(f"🎯 SMART COUNCIL PRO - NO RF WAITING — {SYMBOL} {INTERVAL} • {'LIVE' if MODE_LIVE else 'PAPER'} • {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC", "cyan"))
     print(colored("═" * 120, "cyan"))
     
     # Market Data Section
@@ -1110,7 +1378,7 @@ def display_enhanced_dashboard(bal, info, ind, spread_bps, df=None, council_log=
         print(colored(f"   🏛️  {council_log}", "white"))
     
     # Position Section
-    print("\n💼 ENHANCED POSITION")
+    print("\n💼 ENHANCED POSITION - مجلس الإدارة الأولوية")
     equity = (bal or 0) + compound_pnl
     bal_line = f"Balance={fmt(bal,2)} | Equity={fmt(equity,2)} | CompoundPnL={fmt(compound_pnl)} | Risk={int(RISK_ALLOC*100)}%×{LEVERAGE}x"
     print(colored(f"   {bal_line}", "yellow"))
@@ -1134,7 +1402,7 @@ def display_enhanced_dashboard(bal, info, ind, spread_bps, df=None, council_log=
 @app.route("/")
 def home():
     mode = 'LIVE' if MODE_LIVE else 'PAPER'
-    return f"🎯 SMART COUNCIL PRO — {SYMBOL} {INTERVAL} — {mode} — AI Trading System"
+    return f"🎯 SMART COUNCIL PRO - NO RF WAITING — {SYMBOL} {INTERVAL} — {mode} — AI Trading System"
 
 @app.route("/metrics")
 def enhanced_metrics():
@@ -1168,8 +1436,22 @@ def health():
         "open": STATE["open"],
         "side": STATE["side"],
         "qty": STATE["qty"],
-        "system": "enhanced_smart_council"
+        "system": "enhanced_smart_council_no_rf_waiting"
     }), 200
+
+@app.route("/bookmap", methods=["POST"])
+def bookmap_feed():
+    try:
+        payload = request.get_json(silent=True) or {}
+        levels = payload.get("levels", [])
+        parsed=[]
+        for row in levels:
+            p=float(row[0]); liq=float(row[1]); imb=float(row[2]); ab=int(row[3])
+            parsed.append((p,liq,imb,ab))
+        bookmap.supply(parsed)
+        return jsonify({"ok":True,"count":len(parsed)})
+    except Exception as e:
+        return jsonify({"ok":False,"error":str(e)}),400
 
 # ===== ENHANCED KEEPALIVE =====
 def enhanced_keepalive_loop():
@@ -1197,14 +1479,15 @@ def enhanced_keepalive_loop():
 
 # ===== ENHANCED BOOT =====
 if __name__ == "__main__":
-    print(colored("🎯 SMART COUNCIL PRO TRADING BOT", "green"))
+    print(colored("🎯 SMART COUNCIL PRO TRADING BOT - NO RF WAITING", "green"))
     print(colored("═" * 80, "green"))
     print(colored(f"MODE: {'LIVE' if MODE_LIVE else 'PAPER'} • {SYMBOL} • {INTERVAL}", "yellow"))
-    print(colored(f"RISK: {int(RISK_ALLOC*100)}%×{LEVERAGE}x • ENTRY: Smart Council + Enhanced RF", "yellow"))
+    print(colored(f"RISK: {int(RISK_ALLOC*100)}%×{LEVERAGE}x • ENTRY: Smart Council ONLY", "yellow"))
+    print(colored("🚫 NO RF WAITING - مجلس الإدارة له الأولوية المطلقة", "red"))
     print(colored("FEATURES: MACD + VWAP + Delta Volume + Smart Profit Taking + AI Decisions", "yellow"))
     print(colored("═" * 80, "green"))
     
-    logging.info("Smart Council Pro starting...")
+    logging.info("Smart Council Pro - No RF Waiting starting...")
     
     # Signal handling
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
