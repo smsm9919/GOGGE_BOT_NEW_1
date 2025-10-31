@@ -61,7 +61,7 @@ FLIP_COOLDOWN_S = 45
 # Gates
 MAX_SPREAD_BPS      = 8.0
 HARD_SPREAD_BPS     = 15.0
-PAUSE_ADX_THRESHOLD = 19.0  # ← موحّد حسب طلبك: وقف التداول تحت 19
+PAUSE_ADX_THRESHOLD = 17.0  # ← موحّد حسب طلبك: وقف التداول تحت 19
 
 # Council thresholds - ENHANCED
 ENTRY_VOTES_MIN = 7
