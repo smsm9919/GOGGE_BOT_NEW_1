@@ -61,13 +61,13 @@ FLIP_COOLDOWN_S = 45
 # Gates
 MAX_SPREAD_BPS      = 8.0
 HARD_SPREAD_BPS     = 15.0
-PAUSE_ADX_THRESHOLD = 17.0
+PAUSE_ADX_THRESHOLD = 19.0  # ← موحّد حسب طلبك: وقف التداول تحت 19
 
 # Council thresholds - ENHANCED
-ENTRY_VOTES_MIN = 7  # Increased from 6
-ENTRY_SCORE_MIN = 4.5  # Increased from 4.0
+ENTRY_VOTES_MIN = 7
+ENTRY_SCORE_MIN = 4.5
 ENTRY_ADX_MIN   = 22.0
-EXIT_VOTES_MIN  = 4  # Increased from 3
+EXIT_VOTES_MIN  = 4
 
 # Voting weights - ENHANCED
 VOTE_SUPPLY_REJECT = 2;  VOTE_DEMAND_REJECT = 2
@@ -511,7 +511,6 @@ def structure_trend(df: pd.DataFrame, look=20):
     highs=[(i,v) for i,v in enumerate(ph) if v is not None]
     lows =[(i,v) for i,v in enumerate(pl) if v is not None]
     if len(highs)<2 or len(lows)<2: return "range"
-    # last two swings
     hh = highs[-1][1] > highs[-2][1]
     hl = lows[-1][1]  > lows[-2][1]
     lh = highs[-1][1] < highs[-2][1]
@@ -550,11 +549,6 @@ def true_pivot(df: pd.DataFrame, ind: dict, feats: dict, rf: dict, tol_bps=30.0)
     o,h,l,c = map(float, df[["open","high","low","close"]].iloc[-1])
     sh, sl = pivot_candidates(df, look=50)
     if not atr: atr=1e-9
-    def near(a,b):
-        try: return abs((a-b)/b)*10000.0 <= tol_bps
-        except: return False
-
-    # sweep context
     sw = detect_sweep(df, lookback=30, bps=tol_bps/2)
 
     # BOTTOM logic
@@ -568,7 +562,6 @@ def true_pivot(df: pd.DataFrame, ind: dict, feats: dict, rf: dict, tol_bps=30.0)
         if adx>=17: bottom_score+=0.6; why.append("ADX>=17")
         if (c-o) >= 1.0*atr: bottom_score+=0.6; why.append("body>=1*ATR")
         if rf.get("long"): bottom_score+=0.5; why.append("RF_long")
-        # Retest zone between sl and mid of last candle
         ret_lo = sl
         ret_hi = min(c, h) - 0.25*(h-l)
         ret_hi = max(ret_hi, sl)
@@ -612,245 +605,152 @@ def detect_impulse(df: pd.DataFrame, ind: dict):
             return {"type":"explosion_down","reason":f"VEI{vei:.2f} body≥{IMPULSE_BODY_ATR}ATR marubozu↓ ADX{adx:.1f}"}
     return None
 
-# ===== Enhanced Chop Detection =====
+# ===== Enhanced Chop Detection (patched) =====
 def advanced_chop_detection(df, ind, lookback=20):
-    """Enhanced chop detection using multiple indicators"""
-    if len(df) < lookback: return True
-    
-    # ADX for trend strength
+    """Less aggressive chop: يعتمد أساسًا على ADX<19 + مدى ضيق جدًا وأجسام صغيرة جدًا"""
+    if len(df) < lookback:
+        return True  # أمان افتراضي
     adx = float(ind.get("adx") or 0.0)
-    if adx < 18: return True
-    
-    # Price range analysis
-    highs = df["high"].astype(float).tail(lookback)
-    lows = df["low"].astype(float).tail(lookback)
-    price_range = (highs.max() - lows.min()) / lows.min() * 100
-    
-    # If price range is less than 2%, consider it chop
-    if price_range < 2.0: return True
-    
-    # Candlestick body analysis
-    bodies = (df["close"] - df["open"]).abs().tail(lookback)
-    ranges = (df["high"] - df["low"]).tail(lookback)
-    body_ratio = (bodies / ranges).mean()
-    
-    if body_ratio < 0.3:  # Most candles have small bodies
+    if adx < 19:
         return True
-    
-    return False
+    highs = df["high"].astype(float).tail(lookback)
+    lows  = df["low"].astype(float).tail(lookback)
+    price_range_pct = (highs.max() - lows.min()) / max(lows.min(), 1e-9) * 100.0
+    bodies = (df["close"] - df["open"]).abs().tail(lookback).astype(float)
+    ranges = (df["high"] - df["low"]).tail(lookback).astype(float)
+    body_ratio = float((bodies / ranges.replace(0, 1e-12)).mean())
+    return (price_range_pct < 1.2) and (body_ratio < 0.22)
 
 def wait_for_breakout(df, ind, direction):
     """Wait for clear breakout from chop zone"""
     if len(df) < 3: return False
-    
     current_price = float(df["close"].iloc[-1])
     prev_high = float(df["high"].iloc[-2])
     prev_low = float(df["low"].iloc[-2])
     atr = float(ind.get("atr") or 0.0)
-    
+    body = abs(float(df["close"].iloc[-1]) - float(df["open"].iloc[-1]))
     if direction == "long":
-        # Break resistance with strong body
-        body = abs(float(df["close"].iloc[-1]) - float(df["open"].iloc[-1]))
         return current_price > prev_high + (atr * 0.3) and body > (atr * 0.5)
-    
     elif direction == "short":
-        body = abs(float(df["close"].iloc[-1]) - float(df["open"].iloc[-1]))
         return current_price < prev_low - (atr * 0.3) and body > (atr * 0.5)
-    
     return False
 
 # ===== Enhanced Council Monitoring =====
 def detect_liquidity_wall(df, side, current_price, distance_threshold=0.02):
-    """Detect nearby liquidity walls"""
     bm_data = bookmap.evaluate()
-    
     for wall in bm_data.get("walls", []):
         wall_price = (wall[0] + wall[1]) / 2
         distance = abs(wall_price - current_price) / current_price
-        
         if distance <= distance_threshold:
             return {"price": wall_price, "distance_pct": distance * 100}
-    
     return None
 
 def analyze_trend_strength(df, ind, side):
-    """Analyze current trend strength"""
     adx = float(ind.get("adx") or 0.0)
     di_plus = float(ind.get("plus_di") or 0.0)
     di_minus = float(ind.get("minus_di") or 0.0)
     macd_hist = float(ind.get("macd_hist") or 0.0)
-    
-    weakening = False
-    reason = ""
-    
+    weakening = False; reason = ""
     if side == "long":
         if di_plus < di_minus and adx > 25:
-            weakening = True
-            reason = "DI+ became less than DI- with high ADX"
+            weakening = True; reason = "DI+ became less than DI- with high ADX"
         elif macd_hist < 0:
-            weakening = True
-            reason = "MACD histogram negative in long trade"
-            
+            weakening = True; reason = "MACD histogram negative in long trade"
     elif side == "short":
         if di_minus < di_plus and adx > 25:
-            weakening = True
-            reason = "DI- became less than DI+ with high ADX"
+            weakening = True; reason = "DI- became less than DI+ with high ADX"
         elif macd_hist > 0:
-            weakening = True
-            reason = "MACD histogram positive in short trade"
-    
+            weakening = True; reason = "MACD histogram positive in short trade"
     return {"weakening": weakening, "reason": reason}
 
 def enhanced_council_monitoring(df, ind, rf_signal):
-    """Enhanced council monitoring during open trades"""
     if not STATE["open"]: return
-    
     side = STATE["side"]
     current_price = price_now() or float(df["close"].iloc[-1])
-    
-    # Monitor liquidity walls
     liquidity_wall = detect_liquidity_wall(df, side, current_price)
     if liquidity_wall:
         print(colored(f"🚧 Liquidity wall {liquidity_wall} near current price", "yellow"))
-    
-    # Monitor trend strength
     strength_analysis = analyze_trend_strength(df, ind, side)
     if strength_analysis.get("weakening"):
         print(colored(f"📉 Trend weakening: {strength_analysis['reason']}", "red"))
 
 # ===== Smart Position Management =====
 def smart_position_management(df, ind, rf_signal):
-    """Smart management of open positions"""
     if not STATE["open"]: return
-    
     current_price = price_now() or float(df["close"].iloc[-1])
     entry_price = STATE["entry"]
     side = STATE["side"]
-    
-    # Calculate P/L
-    if side == "long":
-        pnl_pct = (current_price - entry_price) / entry_price * 100
-    else:
-        pnl_pct = (entry_price - current_price) / entry_price * 100
-    
-    # Enhanced exit strategy
+    pnl_pct = ((current_price - entry_price) / entry_price * 100) if side=="long" else ((entry_price - current_price) / entry_price * 100)
     exit_reason = advanced_exit_strategy(df, ind, rf_signal, pnl_pct)
-    
     if exit_reason:
-        close_market_strict(exit_reason)
-        return
-    
-    # Advanced profit management
+        close_market_strict(exit_reason); return
     advanced_profit_management(df, ind, pnl_pct)
 
 def advanced_exit_strategy(df, ind, rf_signal, pnl_pct):
-    """Advanced exit strategy"""
     current_price = price_now() or float(df["close"].iloc[-1])
     side = STATE["side"]
-    
-    # 1. Exit on strong council opposite signal
     council_exit = council_exit_signal(df, ind, side)
-    if council_exit and abs(pnl_pct) > 0.5:  # At least 0.5% profit
+    if council_exit and abs(pnl_pct) > 0.5:
         return f"COUNCIL_EXIT: {council_exit}"
-    
-    # 2. Exit on key level break
     key_level_break = detect_key_level_break(df, side, current_price)
-    if key_level_break and pnl_pct > -2.0:  # No more than 2% loss
+    if key_level_break and pnl_pct > -2.0:
         return f"KEY_LEVEL_BREAK: {key_level_break}"
-    
-    # 3. Exit on market condition change
     market_condition_exit = market_condition_change(df, ind, side)
     if market_condition_exit and pnl_pct > -1.5:
         return f"MARKET_CONDITION: {market_condition_exit}"
-    
     return None
 
 def council_exit_signal(df, ind, side):
-    """Check for council exit signal"""
-    # This would be implemented based on council voting for exit
     return None  # Placeholder
 
 def detect_key_level_break(df, side, current_price):
-    """Detect key level break"""
-    # Implementation would detect break of important support/resistance
     return None  # Placeholder
 
 def market_condition_change(df, ind, side):
-    """Detect significant market condition changes"""
-    # Implementation would monitor for major market shifts
     return None  # Placeholder
 
 def advanced_profit_management(df, ind, pnl_pct):
-    """Advanced profit management"""
     side = STATE["side"]
     current_price = price_now() or float(df["close"].iloc[-1])
     atr = float(ind.get("atr") or 0.0)
-    
-    # Flexible targets based on trend strength
     adx = float(ind.get("adx") or 0.0)
-    trend_strength = min(adx / 50.0, 1.0)  # Ratio from 0 to 1
-    
-    # Adjust profit targets based on trend strength
+    trend_strength = min(adx / 50.0, 1.0)
     base_tp = TP1_PCT_BASE * (1 + trend_strength)
-    
     if not STATE["tp1_done"] and pnl_pct >= base_tp:
         close_partial(TP1_CLOSE_FRAC, f"SMART_TP1@{base_tp:.2f}%")
         STATE["tp1_done"] = True
-        
-        # Activate breakeven faster in weak trends
-        if trend_strength < 0.5:  # Weak trend
+        if trend_strength < 0.5:
             STATE["breakeven"] = STATE["entry"]
 
-# ===== Improved RF Fallback System =====
+# ===== Improved RF Fallback System (patched) =====
 def improved_rf_fallback(df, ind, rf_signal):
-    """Improved fallback system for RF"""
     if council_strong_signal_exists(): 
-        return None  # Ignore if strong council signal exists
-    
-    # Stricter conditions for fallback signals
+        return None
     adx = float(ind.get("adx") or 0.0)
-    volume_ok = check_volume_confirmation(df)
+    volume_ok = check_volume_confirmation(df)  # تعزيز فقط
     trend_ok = check_trend_alignment(df, ind)
-    
-    # RF signal considered "weak" and needs additional confirmations
-    weak_signal = (adx < 25 or 
-                  not volume_ok or 
-                  not trend_ok or
-                  advanced_chop_detection(df, ind))
-    
+    weak_signal = (adx < 19 or advanced_chop_detection(df, ind) or not trend_ok)
     if rf_signal["long"] and not weak_signal:
         return {"side": "buy", "strength": "weak", "reason": "RF_FALLBACK"}
     elif rf_signal["short"] and not weak_signal:
         return {"side": "sell", "strength": "weak", "reason": "RF_FALLBACK"}
-    
     return None
 
 def council_strong_signal_exists():
-    """Check if strong council signal exists"""
-    # This would check the latest council decision
     return False  # Temporary
 
 def check_volume_confirmation(df, lookback=5):
-    """Volume confirmation for signals"""
     if len(df) < lookback + 1: return True
-    
     current_volume = float(df["volume"].iloc[-1])
     avg_volume = float(df["volume"].tail(lookback).mean())
-    
-    return current_volume > avg_volume * 0.8  # Adequate volume
+    return current_volume > avg_volume * 0.8
 
 def check_trend_alignment(df, ind):
-    """Signal alignment with trend direction"""
     trend = structure_trend(df)
     macd_hist = float(ind.get("macd_hist") or 0.0)
-    
-    if trend == "bull" and macd_hist > 0:
-        return True
-    elif trend == "bear" and macd_hist < 0:
-        return True
-    elif trend == "range":
-        return True  # Acceptable in range
-    
+    if trend == "bull" and macd_hist > 0: return True
+    elif trend == "bear" and macd_hist < 0: return True
+    elif trend == "range": return True
     return False
 
 # ===== Council =====
@@ -865,60 +765,48 @@ class Council:
         b=s=0; score=0.0; rb=[]; rs=[]
         boxes=detect_boxes(df); sup=boxes.get("supply"); dem=boxes.get("demand")
         feats=candle_features(df)
-        # Bookmap
         bm = bookmap.evaluate()
         if bm["accumulation"]: b += VOTE_BOOKMAP_ACC; score += 0.5; rb.append("BM-acc")
         if bm["sweep"]:        s += VOTE_BOOKMAP_SWEEP; score += 0.5; rs.append("BM-sweep")
-        # Box rejects
         if touch_reject(df, dem): b += VOTE_DEMAND_REJECT; score+=1.6; rb.append("reject@demand")
         if touch_reject(df, sup): s += VOTE_SUPPLY_REJECT; score+=1.6; rs.append("reject@supply")
-        # Sweeps
         sw=detect_sweep(df)
         if sw:
             if sw["type"]=="sweep_low":  b+=VOTE_SWEEP; score+=0.6; rb.append("sweep_low")
             else:                        s+=VOTE_SWEEP; score+=0.6; rs.append("sweep_high")
-        # FVG
         fvg=detect_fvg(df)
         if fvg:
             if fvg["type"]=="bull": b+=VOTE_FVG; score+=0.5; rb.append("FVG(bull)")
             else:                   s+=VOTE_FVG; score+=0.5; rs.append("FVG(bear)")
-        # Displacement/Retest
         atr=float(ind.get("atr") or 0.0)
         disp=detect_retest_displacement(df, atr, mult=1.2, lookback=10)
         if disp:
             if float(df["close"].iloc[-1])>float(df["open"].iloc[-1]): b+=1; score+=0.7; rb.append("displacement")
             else: s+=1; score+=0.7; rs.append("displacement")
-        # Trap wick
         trap=detect_trap_wick(df, 0.6)
         if trap:
             if trap["type"]=="bull_trap_reject": b+=1; score+=0.6; rb.append("trap_reject")
             else: s+=1; score+=0.6; rs.append("trap_reject")
-        # DI/ADX
         pdi,mdi,adx = ind.get("plus_di",0), ind.get("minus_di",0), ind.get("adx",0)
         if adx>=18 and pdi>mdi: b+=VOTE_DI_ADX; score+=0.5; rb.append("DI+>DI- & ADX")
         if adx>=18 and mdi>pdi: s+=VOTE_DI_ADX; score+=0.5; rs.append("DI->DI+ & ADX")
-        # RSI neutral turn
         rsi=ind.get("rsi",50.0); o=float(df["open"].iloc[-1]); c=float(df["close"].iloc[-1])
         if 45<=rsi<=55:
             if c>o: b+=VOTE_RSI_NEUT_TURN; score+=0.5; rb.append("RSI_neutral_up")
             else:   s+=VOTE_RSI_NEUT_TURN; score+=0.5; rs.append("RSI_neutral_down")
-        # MACD momentum
         hist=float(ind.get("macd_hist") or 0.0)
         if adx>=17 and hist>0: b += VOTE_MACD_MOMENTUM; score += 0.8; rb.append("MACD+ADX↑")
         if adx>=17 and hist<0: s += VOTE_MACD_MOMENTUM; score += 0.8; rs.append("MACD+ADX↓")
-        # Candles power
         if feats["engulf_bull"] or feats["marubozu_up"] or feats["hammer"] or feats["dragonfly"]:
             b += VOTE_CANDLE_POWER; score += 0.4; rb.append("candle↑")
         if feats["engulf_bear"] or feats["marubozu_down"] or feats["inverted_hammer"] or feats["gravestone"]:
             s += VOTE_CANDLE_POWER; score += 0.4; rs.append("candle↓")
-        # Impulse bonus
         impulse = detect_impulse(df, ind)
         self._last_impulse = impulse
         if impulse and impulse["type"]=="explosion_up":
             b += VOTE_IMPULSE_BONUS; score += 0.8; rb.append("IMPULSE↑")
         if impulse and impulse["type"]=="explosion_down":
             s += VOTE_IMPULSE_BONUS; score += 0.8; rs.append("IMPULSE↓")
-        # TRUE PIVOT (NEW)
         piv = true_pivot(df, ind, feats, rf)
         self._last_pivot = piv
         if piv and piv["type"]=="bottom":
@@ -929,21 +817,16 @@ class Council:
             add = VOTE_TRUE_PIVOT_STRONG if piv["conf"]>=0.7 else VOTE_TRUE_PIVOT_WEAK
             s += add; score += 1.0 if add==VOTE_TRUE_PIVOT_STRONG else 0.5
             rs.append("TRUE_TOP[" + ";".join(piv["why"]) + "]")
-        
-        # ENHANCED: Trend alignment vote
         trend = structure_trend(df)
         if trend == "bull": 
             b += VOTE_TREND_ALIGNMENT; score += 0.8; rb.append("trend_bull")
         elif trend == "bear": 
             s += VOTE_TREND_ALIGNMENT; score += 0.8; rs.append("trend_bear")
-            
-        # ENHANCED: Volume confirmation
         if check_volume_confirmation(df):
             if b > s: 
                 b += VOTE_VOLUME_CONFIRM; score += 0.3; rb.append("volume_confirm")
             elif s > b:
                 s += VOTE_VOLUME_CONFIRM; score += 0.3; rs.append("volume_confirm")
-
         self._last_log = f"🏛 BUY={b} [{', '.join(rb) or '—'}] | SELL={s} [{', '.join(rs) or '—'}] | score={score:.2f} | ADX={ind.get('adx'):.1f} | MACD_hist={hist:.4f}"
         print(colored(self._last_log, "green" if b>s else "red" if s>b else "cyan"))
         return b, s, score
@@ -952,21 +835,18 @@ class Council:
         b,s,score = self.votes(df, ind, rf)
         adx=float(ind.get("adx") or 0.0)
         entry=None
-        
-        # Enhanced entry conditions
         if not self.state["open"]:
-            # Check for chop conditions first
             if advanced_chop_detection(df, ind):
                 print(colored("⏸️ Council paused due to chop conditions", "yellow"))
                 return {"entry":None,"exit":None,"log":self._last_log + " | CHOP_PAUSE"}
-                
             if b>=ENTRY_VOTES_MIN and score>=ENTRY_SCORE_MIN and adx>=ENTRY_ADX_MIN:
-                # Additional confirmation for strong signals
-                if wait_for_breakout(df, ind, "long"):
+                ok = True if adx>=28 else wait_for_breakout(df, ind, "long")
+                if ok:
                     self.state.update({"open":True,"side":"long","entry":float(df['close'].iloc[-1])})
                     entry={"side":"buy","reason":self._last_log}
             elif s>=ENTRY_VOTES_MIN and score>=ENTRY_SCORE_MIN and adx>=ENTRY_ADX_MIN:
-                if wait_for_breakout(df, ind, "short"):
+                ok = True if adx>=28 else wait_for_breakout(df, ind, "short")
+                if ok:
                     self.state.update({"open":True,"side":"short","entry":float(df['close'].iloc[-1])})
                     entry={"side":"sell","reason":self._last_log}
         return {"entry":entry,"exit":None,"log":self._last_log}
@@ -1031,17 +911,24 @@ def _create_order_ioc(symbol, side, qty, limit_price, reduce_only=False):
         params["positionSide"] = "LONG" if (side=="buy") else "SHORT"
     return ex.create_order(symbol, "limit", side, qty, limit_price, params)
 
+# ---- Improved position reader (patched) ----
 def _read_position():
     try:
-        poss=with_retry(lambda: ex.fetch_positions(params={"type":"swap"}))
+        poss = with_retry(lambda: ex.fetch_positions(params={"type":"swap"}))
+        base = SYMBOL.split(":")[0].replace("/", "").replace("-", "")
         for p in poss:
-            sym=(p.get("symbol") or p.get("info",{}).get("symbol") or "")
-            if SYMBOL.split(":")[0] not in sym: continue
-            qty=abs(float(p.get("contracts") or p.get("info",{}).get("positionAmt") or 0))
-            if qty<=0: return 0.0,None,None
-            entry=float(p.get("entryPrice") or p.get("info",{}).get("avgEntryPrice") or 0)
-            side_raw=(p.get("side") or p.get("info",{}).get("positionSide") or "").lower()
-            side="long" if "long" in side_raw or float(p.get("cost",0))>0 else "short"
+            sym = (p.get("symbol") or p.get("info",{}).get("symbol") or "")
+            sym_norm = sym.replace("/", "").replace("-", "")
+            if base not in sym_norm: 
+                continue
+            qty = abs(float(p.get("contracts") or p.get("info",{}).get("positionAmt") or 0) or 0.0)
+            if qty <= 0: 
+                continue
+            entry = float(p.get("entryPrice") or p.get("info",{}).get("avgEntryPrice") or 0.0)
+            side_raw = (p.get("side") or p.get("info",{}).get("positionSide") or "").lower()
+            if not side_raw:
+                side_raw = "long" if float(p.get("unrealizedPnl") or 0) >= 0 else "short"
+            side = "long" if "long" in side_raw else "short"
             return qty, side, entry
     except Exception as e:
         logging.error(f"_read_position: {e}")
@@ -1053,14 +940,19 @@ def compute_size(balance, price):
     return safe_qty(raw)
 
 def open_market(side, qty, price, tag=""):
-    if qty<=0: print(colored("❌ skip open (qty<=0)","red")); return False
+    if qty<=0: 
+        print(colored("❌ skip open (qty<=0)","red")); 
+        return False
     if STATE["_reversal_guard_bars"]>0 and side in ("buy","sell"):
-        print(colored("⛔ Reversal-Guard active — council-only entries","yellow")); return False
+        print(colored("⛔ Reversal-Guard active — council-only entries","yellow")); 
+        return False
     spr=orderbook_spread_bps()
     if spr is not None and (spr>HARD_SPREAD_BPS or spr>MAX_SPREAD_BPS):
-        print(colored(f"⛔ spread {fmt(spr,2)}bps — guard","yellow")); return False
+        print(colored(f"⛔ spread {fmt(spr,2)}bps — guard","yellow")); 
+        return False
     if not _within_hour_rate_limit():
-        print(colored("⛔ rate-limit: too many trades/hour","yellow")); return False
+        print(colored("⛔ rate-limit: too many trades/hour","yellow")); 
+        return False
     _,_,mid=_best_quotes()
     if MODE_LIVE and USE_LIMIT_IOC:
         limit_price=_ioc_price(side, mid, MAX_SLIP_OPEN_BPS)
@@ -1269,7 +1161,6 @@ def pretty_snapshot(bal, info, ind, spread_bps, reason=None, df=None, council_lo
     print(f"   💲 Price {fmt(info.get('price'))} | filt={fmt(info.get('filter'))} hi={fmt(info.get('hi'))} lo={fmt(info.get('lo'))} | spread={fmt(spread_bps,2)}bps")
     print(f"   🧮 RSI={fmt(ind.get('rsi'))} +DI={fmt(ind.get('plus_di'))} -DI={fmt(ind.get('minus_di'))} ADX={fmt(ind.get('adx'))} ATR={fmt(ind.get('atr'))} VEI~{fmt(ind.get('vei'),2)} MACD_hist={fmt(ind.get('macd_hist'),4)}")
     if council_log: print(colored(council_log,"white"))
-    # show pivot/retest zoned
     if council._last_pivot:
         z=council._last_pivot.get("retest_zone")
         if z: print(colored(f"   🔁 Retest zone: [{fmt(z[0])}, {fmt(z[1])}] • {council._last_pivot['type'].upper()} conf={council._last_pivot.get('conf',0):.2f}","yellow"))
@@ -1284,7 +1175,8 @@ def pretty_snapshot(bal, info, ind, spread_bps, reason=None, df=None, council_lo
     else:
         print("   ⚪ FLAT")
         if wait_for_next_signal_side: print(colored(f"   ⏳ Waiting opposite RF: {wait_for_next_signal_side.upper()}","cyan"))
-    if reason: print(colored(f"   ℹ️ reason: {reason}","white"))
+    if reason: 
+        print(colored(f"   ℹ️ reason: {reason}","white"))
     print(colored("─"*110,"cyan"))
 
 # ===== Main loop =====
@@ -1327,8 +1219,6 @@ def trade_loop():
                     print(colored(f"🔄 Reversal risk → lock profit {rr:.2f}%","yellow"))
                     close_market_strict("REVERSAL_LOCK")
                     STATE["_reversal_guard_bars"]=4
-
-                # Impulse Flip
                 flip = council.impulse_flip(df, ind, STATE["side"])
                 if flip and (time.time()-STATE.get("_last_flip_ts",0) >= FLIP_COOLDOWN_S):
                     if spread is None or (spread <= MAX_SPREAD_BPS and spread <= HARD_SPREAD_BPS):
@@ -1384,6 +1274,8 @@ def trade_loop():
                                     wait_for_next_signal_side=None
                             else:
                                 reason="qty<=0 or price=None"
+                    if reason:
+                        print(colored(f"🚫 ENTRY_BLOCKED: {reason}", "yellow"))
 
             pretty_snapshot(bal, {"price":px, **rf}, ind, spread, reason, df, council_log)
 
