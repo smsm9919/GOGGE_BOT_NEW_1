@@ -1,18 +1,18 @@
 # -*- coding: utf-8 -*-
 """
-DOGE/USDT — Smart Council Pro — AI Trading System
-+ Enhanced Council with MACD/VWAP/Delta Volume - NO RF WAITING
-+ Smart Profit Taking & Strict Exit
-+ True Market Structure Detection
-
-Exchange: BingX USDT Perp via CCXT
+COUNCIL-ONLY PRO — BingX USDT Perps (DOGE/USDT:USDT) — Single Position
+• Entry/Exit: Smart Council only (VWAP/MACD/Delta/SMC/Bookmap) — NO RF waiting
+• ADX Gate ≥ 17 — Spread/Slippage guards — Circuit Breaker + Retries
+• Smart management: TP1 partial -> Breakeven -> ATR Trail (Ratchet) -> Strict Close
+• Chop exit: VEI<0.8 & ADX<18 & PnL>0 → Close & wait
+• Resume after restart (sync with exchange) — /metrics /health /bookmap endpoints
 """
 
-import os, time, math, random, signal, sys, traceback, logging, json, tempfile
+import os, time, math, json, random, signal, sys, traceback, logging, tempfile, functools, threading
 from logging.handlers import RotatingFileHandler
 from datetime import datetime
 from decimal import Decimal, ROUND_DOWN
-from collections import deque, defaultdict
+from collections import deque
 
 import pandas as pd
 import numpy as np
@@ -24,1479 +24,614 @@ try:
 except Exception:
     def colored(t,*a,**k): return t
 
-# ===== ENHANCED CONFIGURATION =====
-API_KEY    = os.getenv("BINGX_API_KEY", "")
-API_SECRET = os.getenv("BINGX_API_SECRET", "")
-MODE_LIVE  = bool(API_KEY and API_SECRET)
-PORT       = int(os.getenv("PORT", 5000))
-SELF_URL   = (os.getenv("SELF_URL") or os.getenv("RENDER_EXTERNAL_URL") or "").strip().rstrip("/")
+# =============== CONFIG ===============
+SYMBOL        = os.getenv("SYMBOL", "DOGE/USDT:USDT")
+TIMEFRAME     = os.getenv("TIMEFRAME", "15m")
+LEVERAGE      = int(os.getenv("LEVERAGE", "10"))
+RISK_FRAC     = float(os.getenv("RISK_FRAC", "0.60"))     # 60% من الرصيد
+MAX_SPREAD_BPS= float(os.getenv("MAX_SPREAD_BPS","6.0"))
+HARD_SPREAD   = float(os.getenv("HARD_SPREAD_BPS","15.0"))
+SLIP_OPEN_BPS = float(os.getenv("SLIP_OPEN_BPS","20.0"))
+SLIP_CLOSE_BPS= float(os.getenv("SLIP_CLOSE_BPS","30.0"))
 
-# ===== ENHANCED STRATEGY PARAMETERS =====
-SYMBOL        = "DOGE/USDT:USDT"
-INTERVAL      = "15m"
-LEVERAGE      = 10
-RISK_ALLOC    = 0.60
-POSITION_MODE = "oneway"
+# Council thresholds
+ENTRY_VOTES_MIN  = int(os.getenv("COUNCIL_VOTES","6"))
+ENTRY_SCORE_MIN  = float(os.getenv("COUNCIL_SCORE_MIN","2.5"))
+ENTRY_ADX_MIN    = float(os.getenv("ENTRY_ADX_MIN","17.0"))  # طلبك
+EXIT_VOTES_MIN   = 4
 
-# Enhanced RF (للتحليل فقط - ليس للدخول)
-RF_SOURCE     = "close"
-RF_PERIOD     = 20
-RF_MULT       = 3.5
-RF_HYST_BPS   = 6.0
+# Indicators
+RSI_LEN=14; ADX_LEN=14; ATR_LEN=14
+MACD_FAST=12; MACD_SLOW=26; MACD_SIG=9
+VEI_FAST=5; VEI_SLOW=30
 
-# Enhanced Indicators
-RSI_LEN = 14
-ADX_LEN = 14
-ATR_LEN = 14
-VWAP_LEN = 20
-DELTA_VOLUME_LOOKBACK = 14
+# Management
+TP1_PCT=0.0035  # 0.35%
+TP1_FRAC=0.30
+BREAKEVEN_AFTER=0.0030  # 0.30%
+ATR_TRAIL_MULT=1.6
+TRAIL_ACTIVATE_PCT=0.012  # 1.2% بالنسب العشرية
+HARD_SL_PCT=0.018  # 1.8% طوارئ إغلاق صارم
 
-# Enhanced MACD
-MACD_FAST = 12
-MACD_SLOW = 26
-MACD_SIG  = 9
+# Pacing & limits
+BASE_SLEEP=5; NEAR_CLOSE_SLEEP=1
+MAX_TRADES_PER_HOUR=6
+CLOSE_COOLDOWN_S=90
 
-# Enhanced Impulse Detection
-IMPULSE_ADX_MIN = 25.0
-IMPULSE_BODY_ATR = 1.8
-IMPULSE_MARUBOZU = 0.75
-IMPULSE_VEI = 2.6
-IMPULSE_VOLUME_RATIO = 2.0
+# Persistence & server
+STATE_FILE="state_council_only.json"
+PORT=int(os.getenv("PORT","5000"))
+SELF_URL=(os.getenv("SELF_URL") or os.getenv("RENDER_EXTERNAL_URL") or "").strip().rstrip("/")
+API_KEY=os.getenv("BINGX_API_KEY","")
+API_SECRET=os.getenv("BINGX_API_SECRET","")
+MODE_LIVE=bool(API_KEY and API_SECRET)
 
-# Enhanced Gates
-MAX_SPREAD_BPS      = 8.0
-HARD_SPREAD_BPS     = 15.0
-PAUSE_ADX_THRESHOLD = 17.0
+# Logging
+logger=logging.getLogger("COUNCIL_ONLY_PRO")
+logger.setLevel(logging.INFO)
+fh=RotatingFileHandler("bot.log", maxBytes=5_000_000, backupCount=5, encoding="utf-8")
+fh.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(message)s"))
+logger.addHandler(fh)
+ch=logging.StreamHandler()
+ch.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(message)s"))
+logger.addHandler(ch)
 
-# ENHANCED COUNCIL THRESHOLDS - مجلس الإدارة له الأولوية
-ENTRY_VOTES_MIN = 7  # Increased for stricter entry
-ENTRY_SCORE_MIN = 5.0
-ENTRY_ADX_MIN   = 17.0
-EXIT_VOTES_MIN  = 4
+def trade_log(event: str, **data):
+    try:
+        human= " | ".join([event.upper()]+[f"{k}={v}" for k,v in data.items()])
+        logger.info(human)
+        logger.info("JSON|"+json.dumps({"ts":int(time.time()),"event":event,**data}, ensure_ascii=False, separators=(",",":")))
+    except Exception as e:
+        logger.error(f"trade_log error: {e}")
 
-# ENHANCED VOTING WEIGHTS - SMART COUNCIL
-VOTE_SUPPLY_REJECT = 2
-VOTE_DEMAND_REJECT = 2
-VOTE_SWEEP         = 2
-VOTE_FVG           = 1
-VOTE_EQ_LEVELS     = 1
-VOTE_RF_CONFIRM    = 1  # للإشارة فقط - ليس شرطًا أساسيًا
-VOTE_DI_ADX        = 1
-VOTE_RSI_NEUT_TURN = 1
-VOTE_BOOKMAP_ACC   = 1
-VOTE_BOOKMAP_SWEEP = 1
-VOTE_MACD_MOMENTUM = 2
-VOTE_CANDLE_POWER  = 1
-VOTE_IMPULSE_BONUS = 2
-VOTE_TRUE_PIVOT_STRONG = 3
-VOTE_TRUE_PIVOT_WEAK   = 1
+# =============== Circuit Breaker + Retries ===============
+CIRCUIT_MAX_ERRORS=5
+CIRCUIT_RESET_TIMEOUT=300
+RETRY_ATTEMPTS=3; RETRY_BASE=1.0; RETRY_MAX=8.0
 
-# NEW ENHANCED VOTES
-VOTE_VWAP_TREND    = 2
-VOTE_DELTA_VOLUME  = 2
-VOTE_MACD_CROSS    = 2
-VOTE_VOLUME_SURGE  = 1
-VOTE_TREND_ALIGN   = 1
-
-# Enhanced Execution
-MAX_SLIP_OPEN_BPS  = 20.0
-MAX_SLIP_CLOSE_BPS = 30.0
-USE_LIMIT_IOC      = True
-SIZE_BUFFER = 0.97
-
-# Enhanced Management
-TP1_PCT_BASE       = 0.40
-TP1_CLOSE_FRAC     = 0.40
-BREAKEVEN_AFTER    = 0.30
-TRAIL_ACTIVATE_PCT = 1.20
-ATR_TRAIL_MULT     = 1.6
-RATCHET_LOCK_FALLBACK = 0.60
-
-# Enhanced Exit Conditions
-EXH_MIN_PROFIT   = 0.35
-OPP_RF_HYST_BPS  = 8.0
-OPP_STRONG_DEBOUNCE = 2
-
-# Enhanced Protection
-STATE_FILE = "state_doge_enhanced.json"
-AUTOSAVE_EVERY_LOOP = True
-AUTOSAVE_ON_ORDER = True
-RESTART_SAFE_BARS_HOLD = 2
-RESTART_STRICT_EXCHANGE_SRC = True
-FLIP_COOLDOWN_S = 45
-MAX_TRADES_PER_HOUR = 6
-CLOSE_COOLDOWN_S = 90
-FINAL_CHUNK_QTY = 50.0
-RESIDUAL_MIN_QTY = 9.0
-BASE_SLEEP = 5
-NEAR_CLOSE_S = 1
-
-# ===== ENHANCED LOGGING =====
-def setup_file_logging():
-    logger = logging.getLogger()
-    logger.setLevel(logging.INFO)
-    if not any(isinstance(h, RotatingFileHandler) and getattr(h,"baseFilename","").endswith("bot_enhanced.log") for h in logger.handlers):
-        fh = RotatingFileHandler("bot_enhanced.log", maxBytes=5_000_000, backupCount=7, encoding="utf-8")
-        fh.setFormatter(logging.Formatter("%(asctime)s %(levelname)s: %(message)s"))
-        logger.addHandler(fh)
-    logging.getLogger("werkzeug").setLevel(logging.ERROR)
-    print(colored("🗂️ Enhanced log rotation ready","cyan"))
-setup_file_logging()
-
-# ===== ENHANCED BOOKMAP ADAPTER =====
-class EnhancedBookmapAdapter:
+class CircuitBreaker:
     def __init__(self): 
-        self.snapshot = []
-        self.history = deque(maxlen=100)
-    
-    def supply(self, levels): 
-        self.snapshot = levels or []
-        self.history.append({
-            'timestamp': time.time(),
-            'levels': levels[:20] if levels else []
-        })
-    
-    def evaluate(self, pip: float = 0.0005):
-        if not self.snapshot: 
-            return {"accumulation": [], "sweep": [], "walls": [], "imbalance": 0.0}
-        
-        by_bucket = {}
-        for p, liq, imb, ab in self.snapshot:
-            key = round(p / pip)
-            by_bucket.setdefault(key, []).append((p, liq, imb, ab))
-        
-        liqs = [r[1] for r in self.snapshot if r[1] is not None]
-        imbs = [r[2] for r in self.snapshot if r[2] is not None]
-        liq_avg = max(1e-9, sum(liqs)/max(len(liqs),1))
-        imb_avg = (sum(imbs)/max(len(imbs),1)) if imbs else 0.0
-        
-        zones_acc, zones_walls, zones_sweep = [], [], []
-        total_imbalance = 0.0
-        
-        for rows in by_bucket.values():
-            prices = [r[0] for r in rows]
-            lo, hi = min(prices), max(prices)
-            liq_sum = sum(r[1] for r in rows)
-            imb_mean = sum(r[2] for r in rows)/max(len(rows),1)
-            ab_hits = sum(1 for r in rows if r[3])
-            
-            if liq_sum > 5 * liq_avg: 
-                zones_acc.append((lo, hi, liq_sum))
-            if abs(imb_mean) > 2 * abs(imb_avg): 
-                zones_walls.append((lo, hi, imb_mean))
-            if ab_hits >= 3: 
-                zones_sweep.append((lo, hi, ab_hits))
-            
-            total_imbalance += imb_mean * liq_sum
-        
-        return {
-            "accumulation": zones_acc, 
-            "sweep": zones_sweep, 
-            "walls": zones_walls,
-            "imbalance": total_imbalance
-        }
+        self.error_count=0; self.last_trip=0.0; self.last_error=""
+    @property
+    def is_open(self):
+        return self.error_count>=CIRCUIT_MAX_ERRORS and (time.time()-self.last_trip)<CIRCUIT_RESET_TIMEOUT
+    def record_success(self): self.error_count=0
+    def record_failure(self, msg):
+        self.error_count+=1; self.last_error=msg
+        if self.error_count>=CIRCUIT_MAX_ERRORS:
+            self.last_trip=time.time()
+            logger.error(f"🚨 CIRCUIT TRIPPED for {CIRCUIT_RESET_TIMEOUT}s | {msg}")
 
-bookmap = EnhancedBookmapAdapter()
+breaker=CircuitBreaker()
 
-# ===== ENHANCED EXCHANGE SETUP =====
+def _is_transient(e:Exception)->bool:
+    s=str(e).lower()
+    keys=["ddos","rate","timeout","etimedout","econnreset","network","503","504","500"]
+    return any(k in s for k in keys) or isinstance(e, getattr(ccxt,"NetworkError",Exception))
+
+def with_resilience(name):
+    def deco(fn):
+        @functools.wraps(fn)
+        def wrap(*a, **kw):
+            if breaker.is_open:
+                logger.warning(f"🧯 CIRCUIT OPEN — block '{name}' | last={breaker.last_error}")
+                raise RuntimeError("CircuitOpen")
+            wait=RETRY_BASE
+            for i in range(1, RETRY_ATTEMPTS+1):
+                try:
+                    r=fn(*a, **kw); breaker.record_success(); return r
+                except Exception as e:
+                    msg=f"{type(e).__name__}: {e}"
+                    if _is_transient(e) and i<RETRY_ATTEMPTS:
+                        sl=min(wait, RETRY_MAX)+random.random()*0.4
+                        logger.warning(f"⏳ {name} transient ({i}/{RETRY_ATTEMPTS}) → retry in {sl:.1f}s | {msg}")
+                        time.sleep(sl); wait*=2; continue
+                    breaker.record_failure(msg); logger.error(f"💥 {name} failed | {msg}"); raise
+        return wrap
+    return deco
+
+# =============== Exchange ===============
 def make_ex():
-    return ccxt.bingx({
-        "apiKey": API_KEY,
-        "secret": API_SECRET,
-        "enableRateLimit": True,
-        "timeout": 20000,
-        "options": {"defaultType": "swap"}
-    })
+    ex=ccxt.bingx({"apiKey":API_KEY,"secret":API_SECRET,"enableRateLimit":True,"timeout":20000,"options":{"defaultType":"swap"}})
+    try: ex.set_leverage(LEVERAGE, SYMBOL, params={"side":"BOTH"})
+    except Exception as e: logger.warning(f"set_leverage: {e}")
+    return ex
 
-ex = make_ex()
-MARKET = {}; AMT_PREC = 0; LOT_STEP = None; LOT_MIN = None
-
-def load_market_specs():
-    global MARKET, AMT_PREC, LOT_STEP, LOT_MIN
-    try:
-        ex.load_markets()
-        MARKET = ex.markets.get(SYMBOL, {})
-        AMT_PREC = int((MARKET.get("precision",{}) or {}).get("amount", 0) or 0)
-        lims = (MARKET.get("limits",{}) or {}).get("amount",{}) or {}
-        LOT_STEP = lims.get("step"); LOT_MIN = lims.get("min")
-        print(colored(f"🔧 Enhanced precision={AMT_PREC}, step={LOT_STEP}, min={LOT_MIN}","cyan"))
-    except Exception as e:
-        print(colored(f"⚠️ load_market_specs: {e}","yellow"))
-
-def ensure_leverage_mode():
-    try:
-        ex.set_leverage(LEVERAGE, SYMBOL, params={"side":"BOTH"})
-        print(colored(f"✅ Enhanced leverage set {LEVERAGE}x","green"))
-    except Exception as e:
-        print(colored(f"⚠️ set_leverage warn: {e}","yellow"))
-
+ex=make_ex()
+AMT_PREC=0; LOT_STEP=None; LOT_MIN=None
 try:
-    load_market_specs()
-    ensure_leverage_mode()
+    ex.load_markets()
+    m=ex.markets.get(SYMBOL,{})
+    AMT_PREC=int((m.get("precision",{}) or {}).get("amount",0) or 0)
+    lims=(m.get("limits",{}) or {}).get("amount",{}) or {}
+    LOT_STEP=lims.get("step"); LOT_MIN=lims.get("min")
 except Exception as e:
-    print(colored(f"⚠️ exchange init: {e}","yellow"))
+    logger.warning(f"load_markets: {e}")
 
-# ===== ENHANCED HELPERS =====
+@with_resilience("fetch_ohlcv")
+def ex_fetch_ohlcv(sym, tf, limit=600): return ex.fetch_ohlcv(sym, timeframe=tf, limit=limit, params={"type":"swap"})
+@with_resilience("fetch_ticker")
+def ex_fetch_ticker(sym): return ex.fetch_ticker(sym)
+@with_resilience("fetch_order_book")
+def ex_fetch_order_book(sym,limit=5): return ex.fetch_order_book(sym, limit=limit)
+@with_resilience("fetch_balance")
+def ex_fetch_balance(): return ex.fetch_balance(params={"type":"swap"})
+@with_resilience("fetch_positions")
+def ex_fetch_positions(symbols=None): return ex.fetch_positions(symbols or [SYMBOL])
+@with_resilience("create_order")
+def ex_create_order(sym, typ, side, qty, price=None, params=None): return ex.create_order(sym, typ, side, qty, price, params or {})
+@with_resilience("cancel_all_orders")
+def ex_cancel_all_orders(sym): return ex.cancel_all_orders(sym)
+
+# =============== Helpers ===============
 def _round_amt(q):
     if q is None: return 0.0
     try:
-        d = Decimal(str(q))
+        d=Decimal(str(q))
         if LOT_STEP and isinstance(LOT_STEP,(int,float)) and LOT_STEP>0:
-            step = Decimal(str(LOT_STEP))
-            d = (d/step).to_integral_value(rounding=ROUND_DOWN)*step
-        prec = int(AMT_PREC) if AMT_PREC>=0 else 0
-        d = d.quantize(Decimal(1).scaleb(-prec), rounding=ROUND_DOWN)
-        if LOT_MIN and isinstance(LOT_MIN,(int,float)) and LOT_MIN>0 and d<Decimal(str(LOT_MIN)): 
-            return 0.0
+            step=Decimal(str(LOT_STEP))
+            d=(d/step).to_integral_value(rounding=ROUND_DOWN)*step
+        prec=int(AMT_PREC) if AMT_PREC>=0 else 0
+        d=d.quantize(Decimal(1).scaleb(-prec), rounding=ROUND_DOWN)
+        if LOT_MIN and isinstance(LOT_MIN,(int,float)) and LOT_MIN>0 and d<Decimal(str(LOT_MIN)): return 0.0
         return float(d)
-    except Exception: 
-        return max(0.0, float(q))
+    except Exception: return max(0.0, float(q))
 
-def safe_qty(q):
-    q = _round_amt(q)
-    if q <= 0: 
-        print(colored(f"⚠️ qty invalid after normalize → {q}","yellow"))
+def safe_qty(q): 
+    q=_round_amt(q)
+    if q<=0: logger.warning(f"qty invalid → {q}")
     return q
 
-def fmt(v, d=6, na="—"):
-    try:
-        if v is None or (isinstance(v,float) and (math.isinf(v) or math.isnan(v))): 
-            return na
-        return f"{float(v):.{d}f}"
-    except Exception: 
-        return na
-
-def with_retry(fn, tries=3, base=0.4):
-    for i in range(tries):
-        try: 
-            return fn()
-        except Exception:
-            if i == tries-1: 
-                raise
-            time.sleep(base*(2**i) + random.random()*0.25)
-
 def fetch_ohlcv(limit=600):
-    rows = with_retry(lambda: ex.fetch_ohlcv(SYMBOL, timeframe=INTERVAL, limit=limit, params={"type":"swap"}))
+    rows=ex_fetch_ohlcv(SYMBOL, TIMEFRAME, limit=limit)
     return pd.DataFrame(rows, columns=["time","open","high","low","close","volume"])
 
 def price_now():
     try:
-        t = with_retry(lambda: ex.fetch_ticker(SYMBOL))
-        return t.get("last") or t.get("close")
-    except Exception: 
-        return None
-
-def balance_usdt():
-    if not MODE_LIVE: 
-        return 1000.0  # Higher paper balance for testing
-    try:
-        b = with_retry(lambda: ex.fetch_balance(params={"type":"swap"}))
-        return b.get("total",{}).get("USDT") or b.get("free",{}).get("USDT")
-    except Exception: 
-        return None
+        t=ex_fetch_ticker(SYMBOL); return t.get("last") or t.get("close")
+    except Exception: return None
 
 def orderbook_spread_bps():
     try:
-        ob = with_retry(lambda: ex.fetch_order_book(SYMBOL, limit=5))
-        bid = ob["bids"][0][0] if ob["bids"] else None
-        ask = ob["asks"][0][0] if ob["asks"] else None
-        if not (bid and ask): 
-            return None
-        mid = (bid+ask)/2.0
+        ob=ex_fetch_order_book(SYMBOL, limit=5)
+        bid=ob["bids"][0][0] if ob["bids"] else None
+        ask=ob["asks"][0][0] if ob["asks"] else None
+        if not (bid and ask): return None
+        mid=(bid+ask)/2.0
         return ((ask-bid)/mid)*10000.0
-    except Exception: 
-        return None
+    except Exception: return None
+
+def balance_usdt():
+    if not MODE_LIVE: return 1000.0
+    try:
+        b=ex_fetch_balance()
+        return b.get("total",{}).get("USDT") or b.get("free",{}).get("USDT")
+    except Exception: return None
 
 def _interval_seconds(iv:str)->int:
     iv=(iv or "").lower().strip()
     if iv.endswith("m"): return int(float(iv[:-1]))*60
     if iv.endswith("h"): return int(float(iv[:-1]))*3600
     if iv.endswith("d"): return int(float(iv[:-1]))*86400
-    return 15*60
+    return 900
 
 def time_to_candle_close(df: pd.DataFrame)->int:
-    tf=_interval_seconds(INTERVAL)
+    tf=_interval_seconds(TIMEFRAME)
     if len(df)==0: return tf
     cur=int(df["time"].iloc[-1]); now=int(time.time()*1000)
     nxt=cur+tf*1000
     while nxt<=now: nxt+=tf*1000
     return int(max(0,nxt-now)/1000)
 
-def cancel_all_orders():
-    if not MODE_LIVE: return
-    try: ex.cancel_all_orders(SYMBOL)
-    except Exception as e: logging.warning(f"cancel_all_orders: {e}")
+# =============== Indicators ===============
+def atr(df, n=ATR_LEN):
+    h=df["high"].astype(float); l=df["low"].astype(float); c=df["close"].astype(float)
+    tr=pd.concat([(h-l).abs(), (h-c.shift(1)).abs(), (l-c.shift(1)).abs()], axis=1).max(axis=1)
+    return tr.rolling(n).mean()
 
-# ===== STATE PERSISTENCE =====
-def _atomic_write_json(path: str, payload: dict):
-    try:
-        d=os.path.dirname(path) or "."
-        os.makedirs(d, exist_ok=True)
-        with tempfile.NamedTemporaryFile("w", delete=False, dir=d, encoding="utf-8") as tmp:
-            json.dump(payload, tmp, ensure_ascii=False, separators=(",",":"))
-            tmp.flush(); os.fsync(tmp.fileno())
-            tmp_path=tmp.name
-        os.replace(tmp_path, path)
-    except Exception as e: logging.error(f"atomic_write_json: {e}")
+def adx(df, n=ADX_LEN):
+    h=df["high"].astype(float); l=df["low"].astype(float); c=df["close"].astype(float)
+    up=h.diff(); dn=-l.diff()
+    plusDM=np.where((up>dn)&(up>0), up, 0.0)
+    minusDM=np.where((dn>up)&(dn>0), dn, 0.0)
+    tr=pd.concat([(h-l).abs(), (h-c.shift(1)).abs(), (l-c.shift(1)).abs()], axis=1).max(axis=1)
+    atr14=tr.rolling(n).mean()
+    plusDI=100*(pd.Series(plusDM).rolling(n).sum()/(atr14+1e-12))
+    minusDI=100*(pd.Series(minusDM).rolling(n).sum()/(atr14+1e-12))
+    dx=((plusDI-minusDI).abs()/((plusDI+minusDI)+1e-12))*100
+    return dx.rolling(n).mean(), plusDI, minusDI
+
+def rsi(series, n=RSI_LEN):
+    delta=series.diff()
+    up=np.where(delta>0, delta, 0.0); dn=np.where(delta<0, -delta, 0.0)
+    roll_up=pd.Series(up).rolling(n).mean(); roll_dn=pd.Series(dn).rolling(n).mean()
+    rs=roll_up/(roll_dn+1e-12); return 100-(100/(1+rs))
+
+def macd(series):
+    ema_f=series.ewm(span=MACD_FAST, adjust=False).mean()
+    ema_s=series.ewm(span=MACD_SLOW, adjust=False).mean()
+    macd_=ema_f-ema_s; sig=macd_.ewm(span=MACD_SIG, adjust=False).mean()
+    return macd_, sig, macd_-sig
+
+def vwap(df):
+    tp=(df["high"]+df["low"]+df["close"])/3.0
+    vol=df["volume"]; return (tp*vol).cumsum()/(vol.cumsum()+1e-12)
+
+def vei(df, f=VEI_FAST, s=VEI_SLOW):
+    rng=(df["high"]-df["low"]).rolling(f).mean()
+    base=(df["high"]-df["low"]).rolling(s).mean()
+    return (rng/(base+1e-12))
+
+# =============== Bookmap-lite + SMC (خفيف) ===============
+class Bookmap:
+    def __init__(self): self.snapshot=[]; self.history=deque(maxlen=100)
+    def supply(self, levels): 
+        self.snapshot=levels or []; self.history.append({"ts":time.time(),"levels":self.snapshot[:20]})
+    def eval(self, pip=0.0005):
+        if not self.snapshot: return {"accum":[], "sweep":[], "walls":[], "imbalance":0.0}
+        liqs=[x[1] for x in self.snapshot if x[1] is not None]; imbs=[x[2] for x in self.snapshot if x[2] is not None]
+        liq_avg=max(1e-9, sum(liqs)/max(1,len(liqs))); imb_avg=(sum(imbs)/max(1,len(imbs))) if imbs else 0.0
+        buckets={}
+        for p,liq,imb,ab in self.snapshot:
+            k=round(p/pip); buckets.setdefault(k,[]).append((p,liq,imb,ab))
+        zones_acc=[]; zones_walls=[]; zones_sweep=[]; total=0.0
+        for rows in buckets.values():
+            liq_sum=sum(r[1] for r in rows); imb_mean=sum(r[2] for r in rows)/max(1,len(rows))
+            ab_hits=sum(1 for r in rows if r[3])
+            if liq_sum>5*liq_avg: zones_acc.append(liq_sum)
+            if abs(imb_mean)>2*abs(imb_avg): zones_walls.append(imb_mean)
+            if ab_hits>=3: zones_sweep.append(ab_hits)
+            total+=imb_mean*liq_sum
+        return {"accum":zones_acc,"sweep":zones_sweep,"walls":zones_walls,"imbalance":total}
+
+bookmap=Bookmap()
+
+def detect_eq_levels(df, lookback=50): 
+    hi=df["high"][-lookback:].max(); lo=df["low"][-lookback:].min()
+    return {"eqh":float(hi),"eql":float(lo),"tol_bps":10.0}
+
+def detect_true_extrema(df, ind, bm):
+    last=df.iloc[-1]; prev=df.iloc[-2]
+    rng=max(last["high"]-last["low"],1e-12)
+    wick_up=last["high"]-max(last["close"], last["open"])
+    wick_dn=min(last["close"], last["open"])-last["low"]
+    sweep_up = (wick_dn/rng>0.5) and (last["close"]>prev["high"]) and (ind["rsi"]<40)
+    sweep_dn = (wick_up/rng>0.5) and (last["close"]<prev["low"]) and (ind["rsi"]>60)
+    # تأكيد بموازنة Bookmap (تقريبية)
+    imbb=bm["imbalance"]
+    true_bottom = sweep_up and imbb>0
+    true_top    = sweep_dn and imbb<0
+    return bool(true_bottom), bool(true_top)
+
+def near_ob_fvg(df):
+    at=atr(df,14).iloc[-1]; last=df.iloc[-1]
+    impulse=( (last["high"]-last["low"]) > 1.2*(at+1e-12) )
+    return {"near_ob_side": "buy" if impulse and last["close"]>last["open"] else "sell" if impulse and last["close"]<last["open"] else None}
+
+# =============== Council ===============
+def council_vote(df: pd.DataFrame):
+    c=df["close"].astype(float); h=df["high"].astype(float); l=df["low"].astype(float)
+    ind={}
+    ind["atr"]=float(atr(df).iloc[-1])
+    adxv,pdi,mdi=adx(df); ind["adx"]=float(adxv.iloc[-1]); ind["pdi"]=float(pdi.iloc[-1]); ind["mdi"]=float(mdi.iloc[-1])
+    ind["rsi"]=float(rsi(c).iloc[-1])
+    macd_,sig,hist=macd(c); ind["macd"]=float(macd_.iloc[-1]); ind["macd_sig"]=float(sig.iloc[-1]); ind["macd_hist"]=float(hist.iloc[-1])
+    ind["vwap"]=float(vwap(df).iloc[-1]); ind["vei"]=float(vei(df).iloc[-1])
+    last=float(c.iloc[-1]); ind["price"]=last
+    # Bookmap + SMC
+    bm=bookmap.eval(); levels=detect_eq_levels(df); tb,tt=detect_true_extrema(df, ind, bm); smc=near_ob_fvg(df)
+
+    buy=sell=0; reasons=[]
+    # Trend/VWAP/MACD
+    if last>ind["vwap"] and ind["macd"]>ind["macd_sig"]: buy+=2; reasons.append("Price>VWAP,MACD+")
+    if last<ind["vwap"] and ind["macd"]<ind["macd_sig"]: sell+=2; reasons.append("Price<VWAP,MACD-")
+    # ADX strong bias
+    if ind["adx"]>=28 and ind["pdi"]>ind["mdi"] and last>ind["vwap"]: buy+=1; reasons.append("StrongTrend+")
+    if ind["adx"]>=28 and ind["mdi"]>ind["pdi"] and last<ind["vwap"]: sell+=1; reasons.append("StrongTrend-")
+    # Bookmap
+    if bm["imbalance"]>0: buy+=1; reasons.append("BM+")
+    if bm["imbalance"]<0: sell+=1; reasons.append("BM-")
+    # SMC
+    if smc["near_ob_side"]=="buy": buy+=1; reasons.append("OB(buy)")
+    if smc["near_ob_side"]=="sell": sell+=1; reasons.append("OB(sell)")
+    # True extremes
+    if tb: buy+=2; reasons.append("TrueBottom++")
+    if tt: sell+=2; reasons.append("TrueTop++")
+
+    score=buy-sell
+    side="buy" if score>0 else "sell" if score<0 else None
+    chop=(ind["vei"]<0.8) and (ind["adx"]<18)
+    council={"buy":buy,"sell":sell,"score":float(score),"side":side,"reasons":reasons,"ind":ind,"bm":bm,"smc":smc,"chop":chop}
+    logger.info(f"🏛️ COUNCIL | B={buy} S={sell} score={score:.1f} side={side} | ADX={ind['adx']:.1f} RSI={ind['rsi']:.1f} VEI={ind['vei']:.2f} | chop={chop}")
+    return council
+
+# =============== State ===============
+STATE={"open":False,"side":None,"entry":None,"qty":0.0,"pnl":0.0,"bars":0,"trail":None,"breakeven":None,"hp":0.0,"_last_close_ts":0}
+compound_pnl=0.0
+_trades=[]
+
+def _rate_ok():
+    now=time.time()
+    while _trades and now-_trades[0]>3600: _trades.pop(0)
+    return len(_trades)<MAX_TRADES_PER_HOUR
+def _mark_trade(): _trades.append(time.time())
 
 def save_state(tag=""):
-    snap={
-        "STATE": STATE, "compound_pnl": compound_pnl,
-        "symbol":SYMBOL, "interval":INTERVAL,
-        "ts": int(time.time()*1000), "tag": tag
-    }
-    _atomic_write_json(STATE_FILE, snap)
+    snap={"STATE":STATE,"compound_pnl":compound_pnl,"symbol":SYMBOL,"interval":TIMEFRAME,"ts":int(time.time()*1000),"tag":tag}
+    try:
+        d=os.path.dirname(STATE_FILE) or "."
+        os.makedirs(d, exist_ok=True)
+        with tempfile.NamedTemporaryFile("w", delete=False, dir=d, encoding="utf-8") as tmp:
+            json.dump(snap, tmp, ensure_ascii=False, separators=(",",":")); tmp.flush(); os.fsync(tmp.fileno()); p=tmp.name
+        os.replace(p, STATE_FILE)
+    except Exception as e: logger.error(f"save_state: {e}")
 
 def load_state():
     try:
         if not os.path.exists(STATE_FILE): return None
         with open(STATE_FILE,"r",encoding="utf-8") as f: return json.load(f)
     except Exception as e:
-        logging.error(f"load_state: {e}"); return None
+        logger.error(f"load_state: {e}"); return None
 
-# ===== RECONCILE FUNCTION =====
-def reconcile_state_with_exchange():
-    """يتأكد من أن حالة البوت متوافقة مع حالة المنصة بعد أي ريستارت أو خطأ"""
-    global compound_pnl, RESTART_HOLD_UNTIL_BAR
-    
-    print(colored("🔄 جاري مزامنة الحالة مع المنصة...", "cyan"))
-    
-    # تحميل الحالة المحفوظة
-    loaded = load_state()
-    if loaded and (loaded.get("symbol") == SYMBOL and loaded.get("interval") == INTERVAL):
-        st = loaded.get("STATE") or {}
-        STATE["highest_profit_pct"] = float(st.get("highest_profit_pct") or 0.0)
-        STATE["trail"] = st.get("trail")
-        STATE["breakeven"] = st.get("breakeven")
-        STATE["profit_targets_achieved"] = int(st.get("profit_targets_achieved") or 0)
-        try: 
-            compound_pnl = float(loaded.get("compound_pnl") or 0.0)
-        except Exception: 
-            pass
-        print(colored("💾 تم تحميل الحالة المحلية", "cyan"))
-    
-    # قراءة المراكز من المنصة
+def reconcile():
+    global compound_pnl
+    loaded=load_state()
+    if loaded and loaded.get("symbol")==SYMBOL and loaded.get("interval")==TIMEFRAME:
+        st=loaded.get("STATE") or {}
+        for k in ["trail","breakeven","hp"]: STATE[k]=st.get(k)
+        try: compound_pnl=float(loaded.get("compound_pnl") or 0.0)
+        except Exception: pass
+        logger.info("💾 Loaded local state.")
     try:
-        positions = with_retry(lambda: ex.fetch_positions([SYMBOL]))
-        active_position = None
-        
-        for pos in positions:
-            symbol = pos.get("symbol")
-            contracts = float(pos.get("contracts", 0))
-            
-            if symbol == SYMBOL and abs(contracts) > 0:
-                side = "long" if contracts > 0 else "short"
-                entry_price = float(pos.get("entryPrice", 0))
-                print(colored(f"🔁 تم العثور على مركز نشط: {side.upper()} {contracts} @ {entry_price}", "yellow"))
-                
-                active_position = {
-                    "active": True,
-                    "side": side,
-                    "entry_price": entry_price,
-                    "contracts": abs(contracts),
-                    "timestamp": pos.get("timestamp", int(time.time() * 1000))
-                }
-                break
-        
-        if active_position and RESTART_STRICT_EXCHANGE_SRC:
-            STATE.update({
-                "open": True,
-                "side": active_position["side"],
-                "entry": active_position["entry_price"],
-                "qty": active_position["contracts"],
-                "pnl": 0.0,
-                "bars": 0
-            })
-            RESTART_HOLD_UNTIL_BAR = RESTART_SAFE_BARS_HOLD
-            print(colored(f"♻️ تم استئناف المركز النشط {active_position['side']}", "green"))
-        elif not active_position:
-            STATE.update({
-                "open": False, "side": None, "entry": None, "qty": 0.0, "pnl": 0.0
-            })
-            print(colored("♻️ لا توجد مراكز نشطة - الوضع: مغلق", "yellow"))
-            
+        pos=ex_fetch_positions([SYMBOL])
+        for p in pos:
+            if p.get("symbol")==SYMBOL and float(p.get("contracts",0))>0:
+                side="long" if float(p["contracts"])>0 else "short"
+                entry=float(p.get("entryPrice",0))
+                qty=abs(float(p.get("contracts",0)))
+                STATE.update({"open":True,"side":side,"entry":entry,"qty":qty,"pnl":0.0,"bars":0})
+                logger.info(f"🔁 Resume {side.upper()} {qty} @ {entry}")
+                save_state("reconcile")
+                return
+        STATE.update({"open":False,"side":None,"entry":None,"qty":0.0,"pnl":0.0})
+        logger.info("♻️ No live position — FLAT.")
+        save_state("reconcile")
     except Exception as e:
-        print(colored(f"⚠️ خطأ في مزامنة الحالة: {e}", "red"))
-        logging.error(f"reconcile_state_with_exchange error: {e}")
-    
-    save_state(tag="reconcile_boot")
+        logger.error(f"reconcile: {e}")
 
-# ===== ENHANCED INDICATORS =====
-def compute_enhanced_indicators(df: pd.DataFrame):
-    if len(df) < max(ATR_LEN, RSI_LEN, ADX_LEN, VWAP_LEN, DELTA_VOLUME_LOOKBACK) + 10:
-        return {
-            "rsi": 50.0, "plus_di": 0.0, "minus_di": 0.0, "dx": 0.0, "adx": 0.0, 
-            "atr": 0.0, "vei": 1.0, "macd": 0.0, "macd_signal": 0.0, "macd_hist": 0.0,
-            "vwap": 0.0, "delta_volume": 0.0, "volume_ratio": 1.0, "trend_strength": 0.0
-        }
-    
-    c = df["close"].astype(float)
-    h = df["high"].astype(float)
-    l = df["low"].astype(float)
-    v = df["volume"].astype(float)
-    
-    # ATR
-    tr = pd.concat([(h-l).abs(), (h-c.shift(1)).abs(), (l-c.shift(1)).abs()], axis=1).max(axis=1)
-    atr = tr.ewm(alpha=1/ATR_LEN, adjust=False).mean()
-    
-    # RSI
-    delta = c.diff()
-    up = delta.clip(lower=0.0)
-    dn = (-delta).clip(lower=0.0)
-    rs = up.ewm(alpha=1/RSI_LEN, adjust=False).mean() / dn.ewm(alpha=1/RSI_LEN, adjust=False).mean().replace(0,1e-12)
-    rsi = 100 - (100/(1+rs))
-    
-    # ADX
-    upm = h.diff()
-    dnm = l.shift(1)-l
-    plus_dm = upm.where((upm>dnm)&(upm>0),0.0)
-    minus_dm = dnm.where((dnm>upm)&(dnm>0),0.0)
-    plus_di = 100*(plus_dm.ewm(alpha=1/ADX_LEN, adjust=False).mean()/atr.replace(0,1e-12))
-    minus_di = 100*(minus_dm.ewm(alpha=1/ADX_LEN, adjust=False).mean()/atr.replace(0,1e-12))
-    dx = (100*(plus_di-minus_di).abs()/(plus_di+minus_di).replace(0,1e-12)).fillna(0.0)
-    adx = dx.ewm(alpha=1/ADX_LEN, adjust=False).mean()
-    
-    # VEI
-    rng = (h-l).astype(float)
-    try:
-        lb = rng.rolling(20).mean()
-        vei = (rng / lb.replace(0,1e-9))
-        vei = float(vei.iloc[-1])
-        if math.isinf(vei) or math.isnan(vei): 
-            vei = 1.0
-    except Exception:
-        vei = 1.0
-    
-    # MACD
-    ema_fast = c.ewm(span=MACD_FAST, adjust=False).mean()
-    ema_slow = c.ewm(span=MACD_SLOW, adjust=False).mean()
-    macd_line = ema_fast - ema_slow
-    macd_sig = macd_line.ewm(span=MACD_SIG, adjust=False).mean()
-    macd_hist = macd_line - macd_sig
-    
-    # VWAP
-    typical_price = (h + l + c) / 3
-    cumulative_vp = (typical_price * v).cumsum()
-    cumulative_volume = v.cumsum()
-    vwap = cumulative_vp / cumulative_volume.replace(0,1e-9)
-    
-    # Delta Volume
-    price_change = c.diff()
-    volume_positive = v.where(price_change > 0, 0)
-    volume_negative = v.where(price_change < 0, 0)
-    delta_volume = (volume_positive - volume_negative).rolling(DELTA_VOLUME_LOOKBACK).sum()
-    
-    # Volume Ratio
-    volume_ma = v.rolling(20).mean()
-    volume_ratio = v / volume_ma.replace(0,1e-9)
-    
-    # Trend Strength
-    trend_strength = adx * (vei / 2.0)  # Combined strength indicator
-    
-    i = len(df)-1
-    return {
-        "rsi": float(rsi.iloc[i]),
-        "plus_di": float(plus_di.iloc[i]),
-        "minus_di": float(minus_di.iloc[i]),
-        "dx": float(dx.iloc[i]),
-        "adx": float(adx.iloc[i]),
-        "atr": float(atr.iloc[i]),
-        "vei": vei,
-        "macd": float(macd_line.iloc[i]),
-        "macd_signal": float(macd_sig.iloc[i]),
-        "macd_hist": float(macd_hist.iloc[i]),
-        "vwap": float(vwap.iloc[i]),
-        "delta_volume": float(delta_volume.iloc[i]),
-        "volume_ratio": float(volume_ratio.iloc[i]),
-        "trend_strength": float(trend_strength.iloc[i])
-    }
-
-# ===== ENHANCED RF (للتحليل فقط) =====
-def _ema(s: pd.Series, n: int): 
-    return s.ewm(span=n, adjust=False).mean()
-
-def _rng_size(src: pd.Series, qty: float, n: int) -> pd.Series:
-    avrng = _ema((src-src.shift(1)).abs(), n)
-    wper = (n*2)-1
-    return _ema(avrng, wper)*qty
-
-def _rng_filter(src: pd.Series, rsize: pd.Series):
-    rf = [float(src.iloc[0])]
-    for i in range(1, len(src)):
-        prev = rf[-1]
-        x = float(src.iloc[i])
-        r = float(rsize.iloc[i])
-        cur = prev
-        if x - r > prev: 
-            cur = x - r
-        if x + r < prev: 
-            cur = x + r
-        rf.append(cur)
-    filt = pd.Series(rf, index=src.index, dtype="float64")
-    return filt + rsize, filt - rsize, filt
-
-def rf_signal_enhanced(df: pd.DataFrame):
-    if len(df) < RF_PERIOD + 4:
-        return {
-            "time": int(time.time()*1000), "price": None, "long": False, "short": False,
-            "filter": None, "hi": None, "lo": None, "strength": 0.0
-        }
-    
-    d = df.iloc[:-1]
-    src = d[RF_SOURCE].astype(float)
-    hi, lo, filt = _rng_filter(src, _rng_size(src, RF_MULT, RF_PERIOD))
-    
-    p_now = float(src.iloc[-1])
-    p_prev = float(src.iloc[-2])
-    f_now = float(filt.iloc[-1])
-    f_prev = float(filt.iloc[-2])
-    
-    def _bps(a, b):
-        try: 
-            return abs((a-b)/b)*10000.0
-        except Exception: 
-            return 0.0
-    
-    long_flip = (p_prev <= f_prev and p_now > f_now and _bps(p_now, f_now) >= RF_HYST_BPS)
-    short_flip = (p_prev >= f_prev and p_now < f_now and _bps(p_now, f_now) >= RF_HYST_BPS)
-    
-    # Calculate signal strength
-    strength = 0.0
-    if long_flip or short_flip:
-        strength = min(_bps(p_now, f_now) / RF_HYST_BPS, 2.0)  # Normalized strength
-    
-    return {
-        "time": int(d["time"].iloc[-1]), 
-        "price": p_now, 
-        "long": bool(long_flip),
-        "short": bool(short_flip), 
-        "filter": f_now, 
-        "hi": float(hi.iloc[-1]), 
-        "lo": float(lo.iloc[-1]),
-        "strength": strength
-    }
-
-# ===== ENHANCED MARKET STRUCTURE DETECTION =====
-def detect_enhanced_pivots(df: pd.DataFrame, left: int = 3, right: int = 3):
-    """Enhanced pivot detection with confirmation"""
-    if len(df) < left + right + 3: 
-        return None, None, None
-    
-    h = df["high"].astype(float).values
-    l = df["low"].astype(float).values
-    c = df["close"].astype(float).values
-    
-    ph = [None] * len(df)
-    pl = [None] * len(df)
-    pivot_strength = [0] * len(df)
-    
-    for i in range(left, len(df)-right):
-        # Higher High / Lower Low confirmation
-        if all(h[i] >= h[j] for j in range(i-left, i+right+1)):
-            ph[i] = h[i]
-            # Strength based on how much higher and volume
-            strength = min((h[i] - max(h[i-left:i])) / h[i] * 1000, 5.0)
-            pivot_strength[i] = strength
-            
-        if all(l[i] <= l[j] for j in range(i-left, i+right+1)):
-            pl[i] = l[i]
-            strength = min((min(l[i-left:i]) - l[i]) / l[i] * 1000, 5.0)
-            pivot_strength[i] = strength
-    
-    return ph, pl, pivot_strength
-
-def find_supply_demand_zones(df: pd.DataFrame, lookback: int = 100):
-    """Find key supply and demand zones"""
-    if len(df) < lookback:
-        return {"supply": [], "demand": []}
-    
-    ph, pl, strength = detect_enhanced_pivots(df, 2, 2)
-    
-    supply_zones = []
-    demand_zones = []
-    
-    # Find recent pivots
-    recent_highs = [(i, ph[i], strength[i]) for i in range(len(ph)) if ph[i] is not None and i >= len(ph)-20]
-    recent_lows = [(i, pl[i], strength[i]) for i in range(len(pl)) if pl[i] is not None and i >= len(pl)-20]
-    
-    # Cluster similar levels
-    def cluster_levels(levels, tolerance=0.002):
-        if not levels: return []
-        clusters = []
-        levels.sort(key=lambda x: x[1])
-        
-        current_cluster = [levels[0]]
-        for level in levels[1:]:
-            if abs(level[1] - current_cluster[0][1]) / current_cluster[0][1] <= tolerance:
-                current_cluster.append(level)
-            else:
-                clusters.append(current_cluster)
-                current_cluster = [level]
-        clusters.append(current_cluster)
-        return clusters
-    
-    high_clusters = cluster_levels(recent_highs)
-    low_clusters = cluster_levels(recent_lows)
-    
-    for cluster in high_clusters:
-        if len(cluster) >= 2:  # Need at least 2 touches
-            prices = [item[1] for item in cluster]
-            strengths = [item[2] for item in cluster]
-            zone = {
-                "price": sum(prices) / len(prices),
-                "strength": sum(strengths) / len(strengths),
-                "touches": len(cluster),
-                "type": "supply"
-            }
-            supply_zones.append(zone)
-    
-    for cluster in low_clusters:
-        if len(cluster) >= 2:
-            prices = [item[1] for item in cluster]
-            strengths = [item[2] for item in cluster]
-            zone = {
-                "price": sum(prices) / len(prices),
-                "strength": sum(strengths) / len(strengths),
-                "touches": len(cluster),
-                "type": "demand"
-            }
-            demand_zones.append(zone)
-    
-    return {
-        "supply": sorted(supply_zones, key=lambda x: x["strength"], reverse=True)[:3],
-        "demand": sorted(demand_zones, key=lambda x: x["strength"], reverse=True)[:3]
-    }
-
-# ===== SMART COUNCIL SYSTEM - الأولوية المطلقة =====
-class SmartCouncil:
-    def __init__(self):
-        self.state = {"open": False, "side": None, "entry": None}
-        self._last_log = None
-        self._last_impulse = None
-        self._last_pivot = None
-        self._used_signals = set()  # Prevent signal repetition
-        self._signal_history = deque(maxlen=20)
-        self._vote_history = deque(maxlen=10)
-        
-    def _get_signal_hash(self, df, signal_type):
-        """Create unique hash for signal to prevent repetition"""
-        if len(df) < 2:
-            return None
-        current_bar = int(df["time"].iloc[-1])
-        return f"{signal_type}_{current_bar}"
-    
-    def _can_use_signal(self, signal_hash):
-        """Check if signal can be used (not recently used)"""
-        if signal_hash in self._used_signals:
-            return False
-        self._used_signals.add(signal_hash)
-        # Clean old signals (keep only last 50)
-        if len(self._used_signals) > 50:
-            self._used_signals = set(list(self._used_signals)[-50:])
-        return True
-
-    def enhanced_votes(self, df: pd.DataFrame, ind: dict, rf: dict):
-        """Enhanced voting with MACD, VWAP, Delta Volume - NO RF REQUIREMENT"""
-        b = s = 0
-        score = 0.0
-        rb = []  # Reasons for buy
-        rs = []  # Reasons for sell
-        
-        current_price = float(df["close"].iloc[-1])
-        adx = float(ind.get("adx") or 0.0)
-        rsi = float(ind.get("rsi") or 50.0)
-        macd_hist = float(ind.get("macd_hist") or 0.0)
-        vwap = float(ind.get("vwap") or 0.0)
-        delta_volume = float(ind.get("delta_volume") or 0.0)
-        volume_ratio = float(ind.get("volume_ratio") or 1.0)
-        
-        # 1. VWAP Trend Analysis
-        if current_price > vwap and vwap > 0:
-            b += VOTE_VWAP_TREND
-            score += 0.8
-            rb.append("Price>VWAP")
-        elif current_price < vwap and vwap > 0:
-            s += VOTE_VWAP_TREND
-            score += 0.8
-            rs.append("Price<VWAP")
-        
-        # 2. Delta Volume Analysis
-        if delta_volume > 0:
-            b += VOTE_DELTA_VOLUME
-            score += 0.7
-            rb.append(f"DeltaVol+{delta_volume:.0f}")
-        elif delta_volume < 0:
-            s += VOTE_DELTA_VOLUME
-            score += 0.7
-            rs.append(f"DeltaVol{delta_volume:.0f}")
-        
-        # 3. MACD Cross Analysis
-        macd = float(ind.get("macd") or 0.0)
-        macd_signal = float(ind.get("macd_signal") or 0.0)
-        if macd > macd_signal and macd_hist > 0:
-            b += VOTE_MACD_CROSS
-            score += 0.9
-            rb.append("MACD↑")
-        elif macd < macd_signal and macd_hist < 0:
-            s += VOTE_MACD_CROSS
-            score += 0.9
-            rs.append("MACD↓")
-        
-        # 4. Volume Surge
-        if volume_ratio > IMPULSE_VOLUME_RATIO:
-            if current_price > float(df["open"].iloc[-1]):
-                b += VOTE_VOLUME_SURGE
-                score += 0.6
-                rb.append(f"VolSurge{volume_ratio:.1f}x")
-            else:
-                s += VOTE_VOLUME_SURGE
-                score += 0.6
-                rs.append(f"VolSurge{volume_ratio:.1f}x")
-        
-        # 5. Trend Alignment
-        if adx > 25:
-            if ind.get("plus_di", 0) > ind.get("minus_di", 0):
-                b += VOTE_TREND_ALIGN
-                score += 0.5
-                rb.append("Trend↑")
-            else:
-                s += VOTE_TREND_ALIGN
-                score += 0.5
-                rs.append("Trend↓")
-        
-        # 6. RSI Momentum
-        if 30 <= rsi <= 70:  # Avoid extremes
-            if rsi > 55 and current_price > float(df["open"].iloc[-1]):
-                b += 1
-                score += 0.4
-                rb.append("RSI_momentum↑")
-            elif rsi < 45 and current_price < float(df["open"].iloc[-1]):
-                s += 1
-                score += 0.4
-                rs.append("RSI_momentum↓")
-        
-        # 7. Existing Structure Signals (NO RF REQUIRED)
-        boxes = find_supply_demand_zones(df)
-        current_low = float(df["low"].iloc[-1])
-        current_high = float(df["high"].iloc[-1])
-        
-        # Check demand zone bounce
-        for zone in boxes.get("demand", []):
-            if current_low <= zone["price"] * 1.002 and current_price > zone["price"]:
-                b += VOTE_DEMAND_REJECT
-                score += zone["strength"] * 0.5
-                rb.append(f"DemandZone{zone['strength']:.1f}")
-        
-        # Check supply zone rejection
-        for zone in boxes.get("supply", []):
-            if current_high >= zone["price"] * 0.998 and current_price < zone["price"]:
-                s += VOTE_SUPPLY_REJECT
-                score += zone["strength"] * 0.5
-                rs.append(f"SupplyZone{zone['strength']:.1f}")
-        
-        # RF Signals (للإشارة فقط - ليست مطلوبة)
-        if rf.get("long"):
-            signal_hash = self._get_signal_hash(df, "RF_LONG")
-            if self._can_use_signal(signal_hash):
-                b += VOTE_RF_CONFIRM
-                score += rf.get("strength", 1.0) * 0.8
-                rb.append(f"RF_LONG{rf.get('strength', 1.0):.1f}")
-        
-        if rf.get("short"):
-            signal_hash = self._get_signal_hash(df, "RF_SHORT")
-            if self._can_use_signal(signal_hash):
-                s += VOTE_RF_CONFIRM
-                score += rf.get("strength", 1.0) * 0.8
-                rs.append(f"RF_SHORT{rf.get('strength', 1.0):.1f}")
-        
-        self._last_log = f"🏛️ SMART COUNCIL | BUY={b} [{', '.join(rb) or '—'}] | SELL={s} [{', '.join(rs) or '—'}] | Score={score:.2f} | ADX={adx:.1f}"
-        print(colored(self._last_log, "green" if b > s else "red" if s > b else "cyan"))
-        
-        # Record vote history
-        self._vote_history.append({
-            'timestamp': time.time(),
-            'buy_votes': b,
-            'sell_votes': s,
-            'score': score,
-            'price': current_price
-        })
-        
-        return b, s, score
-
-    def decide_entry(self, df, ind, rf):
-        """Enhanced entry decision - NO RF WAITING"""
-        b, s, score = self.enhanced_votes(df, ind, rf)
-        adx = float(ind.get("adx") or 0.0)
-        trend_strength = float(ind.get("trend_strength") or 0.0)
-        
-        entry = None
-        if not self.state["open"]:
-            # مجلس الإدارة له الأولوية المطلقة
-            min_votes = ENTRY_VOTES_MIN
-            min_score = ENTRY_SCORE_MIN
-            min_adx = ENTRY_ADX_MIN
-            
-            # Adjust requirements based on market conditions
-            if trend_strength > 30:  # Strong trend
-                min_votes -= 1  # Easier entry in strong trends
-                min_score -= 1.0
-            
-            if b >= min_votes and score >= min_score and adx >= min_adx:
-                self.state.update({
-                    "open": True, 
-                    "side": "long", 
-                    "entry": float(df['close'].iloc[-1]),
-                    "entry_time": time.time(),
-                    "entry_votes": b,
-                    "entry_score": score
-                })
-                entry = {"side": "buy", "reason": self._last_log}
-                
-            elif s >= min_votes and score >= min_score and adx >= min_adx:
-                self.state.update({
-                    "open": True, 
-                    "side": "short", 
-                    "entry": float(df['close'].iloc[-1]),
-                    "entry_time": time.time(),
-                    "entry_votes": s,
-                    "entry_score": score
-                })
-                entry = {"side": "sell", "reason": self._last_log}
-        
-        return {"entry": entry, "exit": None, "log": self._last_log}
-
-    def decide_exit(self, df, ind, rf, current_profit_pct):
-        """Smart exit decision making"""
-        if not self.state["open"]:
-            return None
-        
-        b, s, score = self.enhanced_votes(df, ind, rf)
-        adx = float(ind.get("adx") or 0.0)
-        current_side = self.state["side"]
-        
-        # Exit if opposite votes are strong
-        if current_side == "long" and s >= EXIT_VOTES_MIN and score >= 3.0:
-            return {"exit": "sell", "reason": f"Opposite votes strong: {s} votes"}
-        
-        if current_side == "short" and b >= EXIT_VOTES_MIN and score >= 3.0:
-            return {"exit": "buy", "reason": f"Opposite votes strong: {b} votes"}
-        
-        # Exit on trend weakness
-        if adx < 18 and current_profit_pct > 0.5:  # Take profit when trend weakens
-            return {"exit": "close", "reason": f"Trend weakening ADX={adx:.1f}"}
-        
-        # Exit on overextension
-        rsi = float(ind.get("rsi") or 50.0)
-        if current_side == "long" and rsi > 75 and current_profit_pct > 1.0:
-            return {"exit": "close", "reason": f"Overbought RSI={rsi:.1f}"}
-        
-        if current_side == "short" and rsi < 25 and current_profit_pct > 1.0:
-            return {"exit": "close", "reason": f"Oversold RSI={rsi:.1f}"}
-        
-        return None
-
-# ===== ENHANCED POSITION MANAGEMENT =====
-class SmartPositionManager:
-    def __init__(self):
-        self.breakeven_triggered = False
-        self.trail_activated = False
-        self.profit_targets = [0.4, 0.8, 1.5, 2.5]  # Dynamic targets
-        self.targets_achieved = 0
-        
-    def calculate_dynamic_targets(self, atr_pct, trend_strength):
-        """Calculate dynamic profit targets based on market conditions"""
-        base_multipliers = [1.0, 2.0, 3.0, 4.0]
-        if trend_strength > 30:
-            base_multipliers = [x * 1.5 for x in base_multipliers]
-        elif trend_strength < 15:
-            base_multipliers = [x * 0.7 for x in base_multipliers]
-            
-        return [m * atr_pct for m in base_multipliers]
-    
-    def manage_take_profits(self, current_profit_pct, atr_pct, trend_strength):
-        """Manage multiple take profit levels"""
-        targets = self.calculate_dynamic_targets(atr_pct, trend_strength)
-        close_fractions = [0.25, 0.35, 0.25, 0.15]  # Fractions to close at each target
-        
-        for i in range(self.targets_achieved, len(targets)):
-            if current_profit_pct >= targets[i]:
-                close_fraction = close_fractions[i]
-                self.targets_achieved += 1
-                return close_fraction, f"TP_{i+1}@{targets[i]:.2f}%"
-        
-        return 0.0, None
-    
-    def should_trail(self, current_profit_pct, highest_profit):
-        """Determine if trailing should be activated"""
-        if not self.trail_activated and current_profit_pct >= TRAIL_ACTIVATE_PCT:
-            self.trail_activated = True
-            return True
-        return self.trail_activated
-    
-    def calculate_trail_level(self, price, side, atr, highest_profit_pct):
-        """Calculate dynamic trail level"""
-        if not self.trail_activated:
-            return None
-            
-        trail_distance = atr * ATR_TRAIL_MULT
-        if side == "long":
-            return price - trail_distance
-        else:
-            return price + trail_distance
-
-# ===== ENHANCED TRADING SYSTEM =====
-smart_council = SmartCouncil()
-position_manager = SmartPositionManager()
-
-# Enhanced State
-STATE = {
-    "open": False, "side": None, "entry": None, "qty": 0.0,
-    "pnl": 0.0, "bars": 0, "trail": None, "breakeven": None,
-    "tp1_done": False, "highest_profit_pct": 0.0,
-    "profit_targets_achieved": 0, "opp_votes": 0,
-    "_last_entry_ts": 0, "_last_close_ts": 0, "_rf_debounce": 0,
-    "_reversal_guard_bars": 0, "_last_flip_ts": 0,
-    "entry_votes": 0, "entry_score": 0.0, "entry_time": 0
-}
-
-compound_pnl = 0.0
-wait_for_next_signal_side = None
-RESTART_HOLD_UNTIL_BAR = 0
-_trades_timestamps = []
-
-def _within_hour_rate_limit():
-    now = time.time()
-    while _trades_timestamps and now - _trades_timestamps[0] > 3600:
-        _trades_timestamps.pop(0)
-    return len(_trades_timestamps) < MAX_TRADES_PER_HOUR
-
-def _mark_trade_timestamp():
-    _trades_timestamps.append(time.time())
-
-def _params_open(side):
-    if POSITION_MODE=="hedge":
-        return {"positionSide":"LONG" if side=="buy" else "SHORT", "reduceOnly":False}
-    return {"positionSide":"BOTH","reduceOnly":False}
-
-def _params_close():
-    if POSITION_MODE=="hedge":
-        return {"positionSide":"LONG" if STATE.get("side")=="long" else "SHORT","reduceOnly":True}
-    return {"positionSide":"BOTH","reduceOnly":True}
+# =============== Sizing/Execution ===============
+def compute_qty(balance, price, atr_val):
+    if not balance or not price: return 0.0
+    # تقليل الحجم مع التقلب العالي
+    vol_adj=max(0.5, min(1.2, 1.0/(max(atr_val/price, 1e-6)*10)))
+    cap=balance*RISK_FRAC*LEVERAGE*vol_adj
+    return safe_qty(cap/price)
 
 def _best_quotes():
-    ob=with_retry(lambda: ex.fetch_order_book(SYMBOL, limit=5))
+    ob=ex_fetch_order_book(SYMBOL,5)
     bid=ob["bids"][0][0] if ob["bids"] else None
     ask=ob["asks"][0][0] if ob["asks"] else None
     mid=(bid+ask)/2.0 if (bid and ask) else price_now()
     return bid, ask, mid
 
-def _ioc_price(side: str, mid: float, max_bps: float) -> float:
-    if mid is None or mid<=0: return None
-    slip = max_bps/10000.0
-    return (mid*(1+slip)) if side=="buy" else (mid*(1-slip))
+def _ioc_price(side, mid, bps):
+    if not mid: return None
+    slip=bps/10000.0
+    return mid*(1+slip) if side=="buy" else mid*(1-slip)
 
-def _create_order_ioc(symbol, side, qty, limit_price, reduce_only=False):
-    params={"timeInForce":"IOC","reduceOnly":reduce_only}
-    if POSITION_MODE=="hedge":
-        params["positionSide"] = "LONG" if (side=="buy") else "SHORT"
-    return ex.create_order(symbol, "limit", side, qty, limit_price, params)
-
-def _read_position():
+def open_position(side, qty, px, reason="COUNCIL"):
+    if STATE["open"] or qty<=0: return False
+    spr=orderbook_spread_bps()
+    if spr is not None and (spr>HARD_SPREAD or spr>MAX_SPREAD_BPS):
+        logger.warning(f"⛔ spread {spr:.2f}bps guard"); return False
+    if not _rate_ok():
+        logger.warning("⛔ rate-limit"); return False
+    if breaker.is_open:
+        logger.warning("🧯 CIRCUIT OPEN — block entry"); return False
+    bid,ask,mid=_best_quotes()
     try:
-        poss=with_retry(lambda: ex.fetch_positions(params={"type":"swap"}))
-        for p in poss:
-            sym=(p.get("symbol") or p.get("info",{}).get("symbol") or "")
-            if SYMBOL.split(":")[0] not in sym: continue
-            qty=abs(float(p.get("contracts") or p.get("info",{}).get("positionAmt") or 0))
-            if qty<=0: return 0.0,None,None
-            entry=float(p.get("entryPrice") or p.get("info",{}).get("avgEntryPrice") or 0)
-            side_raw=(p.get("side") or p.get("info",{}).get("positionSide") or "").lower()
-            side="long" if "long" in side_raw or float(p.get("cost",0))>0 else "short"
-            return qty, side, entry
+        if MODE_LIVE:
+            limit=_ioc_price("buy" if side=="long" else "sell", mid, SLIP_OPEN_BPS)
+            ex_create_order(SYMBOL,"limit","buy" if side=="long" else "sell", qty, limit, {"timeInForce":"IOC","reduceOnly":False,"positionSide":"BOTH"})
+        # تحديث الحالة
+        STATE.update({"open":True,"side":side,"entry":px,"qty":qty,"pnl":0.0,"bars":0,"trail":None,"breakeven":None,"hp":0.0})
+        _mark_trade()
+        trade_log("open", side=side.upper(), qty=round(qty,4), price=px, leverage=LEVERAGE, risk_frac=RISK_FRAC, spread_bps=round(spr or 0.0,2), reason=reason)
+        save_state("open")
+        return True
     except Exception as e:
-        logging.error(f"_read_position: {e}")
-    return 0.0,None,None
-
-def compute_enhanced_size(balance, price, volatility):
-    """Enhanced position sizing with volatility adjustment"""
-    base_cap = (balance or 0.0) * RISK_ALLOC * LEVERAGE * SIZE_BUFFER
-    
-    # Adjust for volatility (reduce size in high volatility)
-    vol_adjustment = max(0.5, min(1.5, 1.0 / (volatility * 10)))
-    adjusted_cap = base_cap * vol_adjustment
-    
-    raw = max(0.0, adjusted_cap / max(float(price or 0.0), 1e-9))
-    return safe_qty(raw)
-
-def open_enhanced_position(side, qty, price, tag=""):
-    """Enhanced position opening with better risk management"""
-    if qty <= 0:
-        print(colored("❌ skip open (qty<=0)", "red"))
+        logger.error(f"open_position: {e}")
         return False
-        
-    if STATE["_reversal_guard_bars"] > 0 and side in ("buy", "sell"):
-        print(colored("⛔ Reversal-Guard active — council-only entries", "yellow"))
-        return False
-        
-    spr = orderbook_spread_bps()
-    if spr is not None and (spr > HARD_SPREAD_BPS or spr > MAX_SPREAD_BPS):
-        print(colored(f"⛔ spread {fmt(spr,2)}bps — guard", "yellow"))
-        return False
-        
-    if not _within_hour_rate_limit():
-        print(colored("⛔ rate-limit: too many trades/hour", "yellow"))
-        return False
-    
-    _, _, mid = _best_quotes()
-    
-    if MODE_LIVE and USE_LIMIT_IOC:
-        limit_price = _ioc_price(side, mid, MAX_SLIP_OPEN_BPS)
-        try:
-            ex.set_leverage(LEVERAGE, SYMBOL, params={"side": "BOTH"})
-            _create_order_ioc(SYMBOL, side, qty, limit_price, reduce_only=False)
-        except Exception as e:
-            print(colored(f"❌ IOC open fail: {e}", "red"))
-            logging.error(e)
-            return False
-    elif MODE_LIVE:
-        try:
-            ex.create_order(SYMBOL, "market", side, qty, None, _params_open(side))
-        except Exception as e:
-            print(colored(f"❌ market open fail: {e}", "red"))
-            logging.error(e)
-            return False
-            
-    STATE.update({
-        "open": True, 
-        "side": "long" if side == "buy" else "short", 
-        "entry": price,
-        "qty": qty, 
-        "pnl": 0.0, 
-        "bars": 0, 
-        "trail": None, 
-        "breakeven": None,
-        "tp1_done": False, 
-        "highest_profit_pct": 0.0, 
-        "profit_targets_achieved": 0,
-        "opp_votes": 0, 
-        "_last_entry_ts": int(time.time()),
-        "entry_time": time.time()
-    })
-    
-    _mark_trade_timestamp()
-    print(colored(f"🚀 ENHANCED OPEN {('🟩 LONG' if side=='buy' else '🟥 SHORT')} qty={fmt(qty,4)} @ {fmt(price)} {tag}", "green" if side=='buy' else 'red'))
-    
-    if AUTOSAVE_ON_ORDER:
-        save_state(tag="enhanced_open")
-    return True
 
-def _reset_after_close(reason, prev_side=None):
-    global wait_for_next_signal_side
-    prev_side = prev_side or STATE.get("side")
-    STATE.update({
-        "open":False,"side":None,"entry":None,"qty":0.0,"pnl":0.0,"bars":0,
-        "trail":None,"breakeven":None,"tp1_done":False,
-        "highest_profit_pct":0.0,"profit_targets_achieved":0,
-        "opp_votes":0,"_last_close_ts": int(time.time())
-    })
-    wait_for_next_signal_side = "sell" if prev_side=="long" else "buy" if prev_side=="short" else None
-
-def close_market_strict(reason="STRICT"):
-    global compound_pnl
-    exch_qty, exch_side, exch_entry = _read_position()
-    if exch_qty<=0 and not STATE.get("open"): return
-    if exch_qty<=0 and STATE.get("open"):
-        px = price_now() or STATE["entry"]; entry=STATE["entry"]; side=STATE["side"]
-        pnl=(px-entry)*STATE["qty"]*(1 if side=="long" else -1); compound_pnl+=pnl
-        print(colored(f"🔚 STRICT CLOSE {side} reason={reason} pnl={fmt(pnl)} total={fmt(compound_pnl)}","magenta"))
-        _reset_after_close(reason, prev_side=side)
-        if AUTOSAVE_ON_ORDER: save_state(tag="strict_close")
-        return
-    side_to_close="sell" if exch_side=="long" else "buy"
-    qty_to_close=safe_qty(exch_qty)
-    attempts=0; last=None
-    while attempts<6:
-        try:
-            if MODE_LIVE and USE_LIMIT_IOC:
-                _,_,mid=_best_quotes()
-                limit_price=_ioc_price(side_to_close, mid, MAX_SLIP_CLOSE_BPS)
-                _create_order_ioc(SYMBOL, side_to_close, qty_to_close, limit_price, reduce_only=True)
-            elif MODE_LIVE:
-                params=_params_close(); params["reduceOnly"]=True
-                ex.create_order(SYMBOL,"market",side_to_close,qty_to_close,None,params)
-            time.sleep(2.0)
-            left,_,_= _read_position()
-            if left<=0:
-                px=price_now() or STATE.get("entry") or exch_entry
-                entry_px=STATE.get("entry") or exch_entry or px
-                side=STATE.get("side") or exch_side
-                pnl=(px-entry_px)*exch_qty*(1 if side=="long" else -1); compound_pnl+=pnl
-                print(colored(f"🔚 STRICT CLOSE {side} reason={reason} pnl={fmt(pnl)} total={fmt(compound_pnl)}","magenta"))
-                _reset_after_close(reason, prev_side=side)
-                if AUTOSAVE_ON_ORDER: save_state(tag="strict_close")
-                return
-            qty_to_close=safe_qty(left); attempts+=1
-            print(colored(f"⚠️ strict close retry {attempts} residual={fmt(left,4)}","yellow"))
-        except Exception as e:
-            last=e; attempts+=1; time.sleep(2.0)
-    print(colored(f"❌ STRICT CLOSE FAILED last_error={last}","red"))
-
-def close_partial(frac, reason):
+def close_partial(frac, tag):
     if not STATE["open"] or STATE["qty"]<=0: return
-    qty_close=safe_qty(max(0.0, STATE["qty"]*min(max(frac,0.0),1.0)))
-    px=price_now() or STATE["entry"]
-    min_unit=max(RESIDUAL_MIN_QTY, LOT_MIN or RESIDUAL_MIN_QTY)
-    if qty_close<min_unit: 
-        print(colored(f"⏸️ skip partial (amount={fmt(qty_close,4)} < min_unit={fmt(min_unit,4)})","yellow")); return
+    qty=safe_qty(STATE["qty"]*min(max(frac,0.0),1.0))
+    if qty<=0: return
     side="sell" if STATE["side"]=="long" else "buy"
-    if MODE_LIVE:
-        try: ex.create_order(SYMBOL,"market",side,qty_close,None,_params_close())
-        except Exception as e: print(colored(f"❌ partial: {e}","red")); return
-    pnl=(px-STATE["entry"])*qty_close*(1 if STATE["side"]=="long" else -1)
-    STATE["qty"]=safe_qty(STATE["qty"]-qty_close)
-    print(colored(f"🔻 PARTIAL {reason} closed={fmt(qty_close,4)} pnl={fmt(pnl)} rem={fmt(STATE['qty'],4)}","magenta"))
-    if STATE["qty"]<=FINAL_CHUNK_QTY and STATE["qty"]>0:
-        close_market_strict("FINAL_CHUNK_RULE")
+    try:
+        if MODE_LIVE: ex_create_order(SYMBOL,"market",side,qty,None,{"reduceOnly":True,"positionSide":"BOTH"})
+        px=price_now() or STATE["entry"]
+        pnl=(px-STATE["entry"])*qty*(1 if STATE["side"]=="long" else -1)
+        STATE["qty"]=safe_qty(STATE["qty"]-qty)
+        trade_log("partial_close", side=STATE["side"], qty=round(qty,4), pnl=round(pnl,6), reason=tag)
+        if STATE["qty"]<=0: strict_close("Partial->Zero")
+    except Exception as e:
+        logger.error(f"close_partial: {e}")
 
-def smart_profit_taking(df, ind, current_profit_pct):
-    """Enhanced profit taking based on multiple factors"""
-    if not STATE["open"] or STATE["qty"] <= 0:
-        return
-        
-    price = float(df["close"].iloc[-1])
-    atr_pct = (float(ind.get("atr") or 0.0) / price) * 100
-    trend_strength = float(ind.get("trend_strength") or 0.0)
-    
-    # Check for dynamic profit taking
-    close_fraction, reason = position_manager.manage_take_profits(
-        current_profit_pct, atr_pct, trend_strength
-    )
-    
-    if close_fraction > 0:
-        close_partial(close_fraction, reason)
-        
-    # Check for exhaustion signals
-    if detect_exhaustion(df, ind, STATE["side"], current_profit_pct):
-        close_partial(0.5, "Exhaustion signal")
-        
-    # Update trailing stop
-    if position_manager.should_trail(current_profit_pct, STATE["highest_profit_pct"]):
-        trail_level = position_manager.calculate_trail_level(
-            price, STATE["side"], float(ind.get("atr") or 0.0), STATE["highest_profit_pct"]
-        )
-        STATE["trail"] = trail_level
+def strict_close(tag="STRICT"):
+    global compound_pnl
+    if not STATE["open"]: return
+    side=STATE["side"]; qty=STATE["qty"]
+    try:
+        if MODE_LIVE:
+            bid,ask,mid=_best_quotes()
+            limit=_ioc_price("sell" if side=="long" else "buy", mid, SLIP_CLOSE_BPS)
+            ex_create_order(SYMBOL,"limit","sell" if side=="long" else "buy", qty, limit, {"timeInForce":"IOC","reduceOnly":True,"positionSide":"BOTH"})
+        px=price_now() or STATE["entry"]
+        pnl=(px-STATE["entry"])*qty*(1 if side=="long" else -1)
+        compound_pnl+=pnl
+        trade_log("strict_close", side=side, qty=round(qty,4), price=px, pnl=round(pnl,6), total=round(compound_pnl,6), reason=tag)
+    except Exception as e:
+        logger.error(f"strict_close: {e}")
+    finally:
+        STATE.update({"open":False,"side":None,"entry":None,"qty":0.0,"pnl":0.0,"bars":0,"trail":None,"breakeven":None,"hp":0.0,"_last_close_ts":int(time.time())})
+        save_state("strict_close")
 
-def detect_exhaustion(df, ind, side, profit_pct):
-    """Detect exhaustion signals for smart profit taking"""
-    if len(df) < 3:
-        return False
-        
-    o, h, l, c = map(float, df[["open", "high", "low", "close"]].iloc[-1])
-    rsi = float(ind.get("rsi") or 50.0)
-    volume_ratio = float(ind.get("volume_ratio") or 1.0)
-    
-    # Large wick against position
-    rng = max(h - l, 1e-12)
-    if side == "long":
-        upper_wick = h - max(o, c)
-        if upper_wick / rng > 0.6 and profit_pct > 1.0:
-            return True
-    else:
-        lower_wick = min(o, c) - l
-        if lower_wick / rng > 0.6 and profit_pct > 1.0:
-            return True
-            
-    # Volume divergence
-    if volume_ratio > 2.0 and profit_pct > 2.0:
-        return True
-        
-    # RSI extreme with profit
-    if ((side == "long" and rsi > 75) or (side == "short" and rsi < 25)) and profit_pct > 1.5:
-        return True
-        
-    return False
+# =============== Management ===============
+def manage_position(df, council):
+    if not STATE["open"] or STATE["qty"]<=0: return
+    px=float(df["close"].iloc[-1]); entry=STATE["entry"]; side=STATE["side"]
+    rr=(px-entry)/entry*(1 if side=="long" else -1)  # decimal
+    STATE["pnl"]=rr*entry*STATE["qty"];  # تقريب
+    if rr>STATE["hp"]: STATE["hp"]=rr
 
-def manage_enhanced_position(df, ind, info):
-    """إدارة الصفقة المحسنة - لا تنتظر إشارة RF"""
-    if not STATE["open"] or STATE["qty"] <= 0: return
-    px = info["price"]; entry = STATE["entry"]; side = STATE["side"]
-    rr = (px - entry) / entry * 100 * (1 if side == "long" else -1)
-    
-    # Dynamic profit taking
-    smart_profit_taking(df, ind, rr)
-    
-    # Update highest profit
-    if rr > STATE["highest_profit_pct"]: 
-        STATE["highest_profit_pct"] = rr
-    
-    # Trail management
-    atr = float(ind.get("atr") or 0.0)
-    if rr >= TRAIL_ACTIVATE_PCT and atr > 0:
-        gap = atr * ATR_TRAIL_MULT
-        if side == "long":
-            new = px - gap
-            STATE["trail"] = max(STATE["trail"] or new, new)
-            if STATE["breakeven"] is not None: 
-                STATE["trail"] = max(STATE["trail"], STATE["breakeven"])
-            if px < STATE["trail"]: 
-                close_market_strict(f"TRAIL_ATR({ATR_TRAIL_MULT}x)")
+    ind=council["ind"]; atrv=float(ind["atr"]); adx=float(ind["adx"])
+    # Hard SL طوارئ
+    if rr <= -HARD_SL_PCT:
+        strict_close("HARD_SL"); return
+
+    # Chop exit (ربح + سوق هادي)
+    if council["chop"] and rr>0:
+        strict_close("ChopProfit"); return
+
+    # TP1 + Breakeven
+    if STATE["breakeven"] is None and rr >= BREAKEVEN_AFTER:
+        close_partial(TP1_FRAC, f"TP1@{round(rr*100,2)}%")
+        STATE["breakeven"]=entry
+        trade_log("breakeven_set", price=entry)
+
+    # Trail activation
+    if rr >= TRAIL_ACTIVATE_PCT and atrv>0:
+        dist=atrv*ATR_TRAIL_MULT
+        if side=="long":
+            new=px - dist
+            STATE["trail"]=max(STATE["trail"] or new, new, STATE["breakeven"] or -1e9)
+            if px<STATE["trail"]: strict_close(f"TRAIL({ATR_TRAIL_MULT}x)")
         else:
-            new = px + gap
-            STATE["trail"] = min(STATE["trail"] or new, new)
-            if STATE["breakeven"] is not None: 
-                STATE["trail"] = min(STATE["trail"], STATE["breakeven"])
-            if px > STATE["trail"]: 
-                close_market_strict(f"TRAIL_ATR({ATR_TRAIL_MULT}x)")
+            new=px + dist
+            STATE["trail"]=min(STATE["trail"] or new, new, STATE["breakeven"] or 1e9)
+            if px>STATE["trail"]: strict_close(f"TRAIL({ATR_TRAIL_MULT}x)")
 
-# ===== ENHANCED MAIN LOOP - بدون انتظار RF =====
-app = Flask(__name__)
+    # انعكاس قوي عبر المجلس (تصويت معاكس قوي)
+    b=council["buy"]; s=council["sell"]; score=council["score"]
+    if side=="long" and s>=EXIT_VOTES_MIN and score<=-3:
+        strict_close("CouncilOppStrong")
+    elif side=="short" and b>=EXIT_VOTES_MIN and score>=3:
+        strict_close("CouncilOppStrong")
 
-def enhanced_trade_loop():
-    """Enhanced main trading loop with smart decision making - NO RF WAITING"""
-    global wait_for_next_signal_side, RESTART_HOLD_UNTIL_BAR, compound_pnl
-    
-    reconcile_state_with_exchange()
-    last_decision_bar_time = 0
-    
+# =============== Main Loop ===============
+def time_to_next_sleep(df):
+    return NEAR_CLOSE_SLEEP if time_to_candle_close(df)<=10 else BASE_SLEEP
+
+def council_entry_ok(council, spread_bps):
+    if STATE["open"]: return (False,"HasOpen")
+    if breaker.is_open: return (False,"CircuitOpen")
+    if spread_bps is not None and spread_bps>MAX_SPREAD_BPS: return (False,f"Spread>{MAX_SPREAD_BPS}bps")
+    if council["side"] is None: return (False,"NoSide")
+    if council["ind"]["adx"]<ENTRY_ADX_MIN: return (False,f"ADX<{ENTRY_ADX_MIN}")
+    if max(council["buy"],council["sell"])<ENTRY_VOTES_MIN: return (False,"CouncilWeak")
+    if abs(council["score"])<ENTRY_SCORE_MIN: return (False,"ScoreLow")
+    if council["chop"]: return (False,"Chop")
+    return (True,"OK")
+
+def main_loop():
+    reconcile()
+    last_bar=0
     while True:
         try:
-            # Fetch market data
-            bal = balance_usdt()
-            df = fetch_ohlcv()
-            ind = compute_enhanced_indicators(df)
-            rf = rf_signal_enhanced(df)  # للتحليل فقط - ليس للدخول
-            spread = orderbook_spread_bps()
-            px = price_now() or rf["price"] or STATE.get("entry") or 0.0
-            
-            # Update PnL if position open
-            if STATE["open"] and px:
-                entry = STATE["entry"]
-                if STATE["side"] == "long":
-                    STATE["pnl"] = (px - entry) * STATE["qty"]
-                else:
-                    STATE["pnl"] = (entry - px) * STATE["qty"]
-                    
-                current_profit_pct = (STATE["pnl"] / (entry * STATE["qty"])) * 100
-                if current_profit_pct > STATE["highest_profit_pct"]:
-                    STATE["highest_profit_pct"] = current_profit_pct
-            
-            # Smart Council Decision - الأولوية المطلقة
-            council_decision = smart_council.decide_entry(df, ind, rf)
-            council_log = council_decision.get("log")
-            
-            # Smart Exit Decisions
+            df=fetch_ohlcv()
+            df[["open","high","low","close","volume"]]=df[["open","high","low","close","volume"]].astype(float)
+            px=price_now()
+            spread=orderbook_spread_bps()
+            council=council_vote(df)
+
+            # إدارة مركز
             if STATE["open"]:
-                exit_decision = smart_council.decide_exit(df, ind, rf, current_profit_pct)
-                if exit_decision:
-                    print(colored(f"🎯 SMART EXIT: {exit_decision['reason']}", "yellow"))
-                    close_market_strict(f"COUNCIL_EXIT: {exit_decision['reason']}")
-            
-            # Enhanced Profit Taking
-            if STATE["open"]:
-                smart_profit_taking(df, ind, current_profit_pct)
-            
-            # Manage position with enhanced logic
-            manage_enhanced_position(df, ind, {"price": px, **rf})
-            
-            # === ENTRY LOGIC - مجلس الإدارة فقط ===
-            decision_time = rf["time"]
-            new_bar = decision_time != last_decision_bar_time
-            
-            if new_bar:
-                last_decision_bar_time = decision_time
-                if STATE["_reversal_guard_bars"] > 0:
-                    STATE["_reversal_guard_bars"] -= 1
-                if RESTART_HOLD_UNTIL_BAR > 0:
-                    RESTART_HOLD_UNTIL_BAR -= 1
-                
-                # === الدخول بناءً على قرار المجلس فقط ===
-                if not STATE["open"] and RESTART_HOLD_UNTIL_BAR <= 0:
-                    sig = None
-                    tag = ""
-                    
-                    # مجلس الإدارة له الأولوية المطلقة
-                    if council_decision["entry"]:
-                        sig = council_decision["entry"]["side"]
-                        tag = f"[SMART_COUNCIL] {council_decision['entry']['reason']}"
-                    
-                    if sig:
-                        if wait_for_next_signal_side and sig != wait_for_next_signal_side:
-                            print(colored(f"⏳ Waiting for {wait_for_next_signal_side.upper()} signal", "cyan"))
-                        elif (time.time() - STATE.get("_last_close_ts", 0)) < CLOSE_COOLDOWN_S:
-                            cooldown_left = CLOSE_COOLDOWN_S - (time.time() - STATE.get("_last_close_ts", 0))
-                            print(colored(f"⏳ Cooldown: {int(cooldown_left)}s remaining", "cyan"))
-                        elif not _within_hour_rate_limit():
-                            print(colored("⏳ Rate limit: too many trades this hour", "cyan"))
-                        else:
-                            # Enhanced position sizing
-                            atr_volatility = (float(ind.get("atr") or 0.0) / (px or 1.0))
-                            qty = compute_enhanced_size(bal, px or rf["price"], atr_volatility)
-                            
-                            if qty > 0 and (px or rf["price"]):
-                                if open_enhanced_position(sig, qty, px or rf["price"], tag):
-                                    wait_for_next_signal_side = None
-                                    position_manager.__init__()  # Reset for new position
-                            else:
-                                print(colored("⚠️ Invalid quantity or price for entry", "yellow"))
-            
-            # Enhanced UI Display
-            display_enhanced_dashboard(bal, {"price": px, **rf}, ind, spread, df, council_log)
-            
-            # Update bars count
-            if len(df) >= 2 and int(df["time"].iloc[-1]) != int(df["time"].iloc[-2]) and STATE["open"]:
-                STATE["bars"] += 1
-            
-            # Auto-save
-            if AUTOSAVE_EVERY_LOOP:
-                save_state(tag="enhanced_loop")
-                
-            # Adaptive sleep
-            sleep_time = NEAR_CLOSE_S if time_to_candle_close(df) <= 10 else BASE_SLEEP
-            time.sleep(sleep_time)
-            
+                manage_position(df, council)
+
+            # محاولة دخول (على شمعة جديدة فقط)
+            bar=int(df["time"].iloc[-1])
+            if bar!=last_bar:
+                last_bar=bar
+                cooldown_left=max(0, CLOSE_COOLDOWN_S-(time.time()-STATE.get("_last_close_ts",0)))
+                ok,why=council_entry_ok(council, spread or 0.0)
+                trade_log("entry_check", side_hint=council["side"], votes_buy=council["buy"], votes_sell=council["sell"],
+                          score=round(council["score"],2), adx=round(council["ind"]["adx"],1),
+                          spread_bps=round(spread or 0.0,2), chop=council["chop"],
+                          cooldown=int(cooldown_left), blockers=("None" if ok and cooldown_left==0 and _rate_ok() else
+                          ",".join([x for x in [
+                              None if ok else why,
+                              f"Cooldown{int(cooldown_left)}s" if cooldown_left>0 else None,
+                              "RateLimit" if not _rate_ok() else None
+                          ] if x]))
+                          )
+                if ok and cooldown_left==0 and _rate_ok() and px:
+                    bal=balance_usdt()
+                    qty=compute_qty(bal, px, council["ind"]["atr"])
+                    if qty>0:
+                        opened=open_position("long" if council["side"]=="buy" else "short", qty, px, "COUNCIL")
+                        if not opened:
+                            logger.info("⏸️ entry blocked at execution.")
+                elif not ok:
+                    logger.info(f"⏸️ skip entry: {why}")
+
+            # حفظ وتهوية
+            save_state("loop")
+            time.sleep(time_to_next_sleep(df))
         except Exception as e:
-            print(colored(f"❌ Enhanced loop error: {e}\n{traceback.format_exc()}", "red"))
-            logging.error(f"Enhanced loop error: {e}\n{traceback.format_exc()}")
+            logger.error(f"Loop error: {e}\n{traceback.format_exc()}")
             time.sleep(BASE_SLEEP)
 
-def display_enhanced_dashboard(bal, info, ind, spread_bps, df=None, council_log=None):
-    """Enhanced dashboard display"""
-    left_s = time_to_candle_close(df) if df is not None else 0
-    
-    print(colored("═" * 120, "cyan"))
-    print(colored(f"🎯 SMART COUNCIL PRO - NO RF WAITING — {SYMBOL} {INTERVAL} • {'LIVE' if MODE_LIVE else 'PAPER'} • {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC", "cyan"))
-    print(colored("═" * 120, "cyan"))
-    
-    # Market Data Section
-    print("📊 ENHANCED MARKET DATA")
-    print(f"   💲 Price {fmt(info.get('price'))} | VWAP={fmt(ind.get('vwap'))} | Spread={fmt(spread_bps,2)}bps")
-    print(f"   📈 RSI={fmt(ind.get('rsi'))} | ADX={fmt(ind.get('adx'))} | ATR={fmt(ind.get('atr'))} | VEI={fmt(ind.get('vei'),2)}")
-    print(f"   🔄 MACD={fmt(ind.get('macd'),4)} | Signal={fmt(ind.get('macd_signal'),4)} | Hist={fmt(ind.get('macd_hist'),4)}")
-    print(f"   📊 DeltaVol={fmt(ind.get('delta_volume'),0)} | VolRatio={fmt(ind.get('volume_ratio'),2)} | TrendStr={fmt(ind.get('trend_strength'),2)}")
-    
-    if council_log:
-        print(colored(f"   🏛️  {council_log}", "white"))
-    
-    # Position Section
-    print("\n💼 ENHANCED POSITION - مجلس الإدارة الأولوية")
-    equity = (bal or 0) + compound_pnl
-    bal_line = f"Balance={fmt(bal,2)} | Equity={fmt(equity,2)} | CompoundPnL={fmt(compound_pnl)} | Risk={int(RISK_ALLOC*100)}%×{LEVERAGE}x"
-    print(colored(f"   {bal_line}", "yellow"))
-    
-    if STATE["open"]:
-        side_icon = '🟩 LONG' if STATE['side'] == 'long' else '🟥 SHORT'
-        profit_pct = ((STATE['pnl'] / (STATE['entry'] * STATE['qty'])) * 100) if STATE['entry'] and STATE['qty'] else 0
-        
-        print(f"   {side_icon} Entry={fmt(STATE['entry'])} | Qty={fmt(STATE['qty'],4)} | PnL={fmt(STATE['pnl'])} ({fmt(profit_pct,2)}%)")
-        print(f"   🎯 Bars={STATE['bars']} | Trail={fmt(STATE['trail'])} | BE={fmt(STATE['breakeven'])}")
-        print(f"   🚀 TP_Levels={position_manager.targets_achieved}/{len(position_manager.profit_targets)} | HP={fmt(STATE['highest_profit_pct'],2)}%")
-    else:
-        print("   ⚪ FLAT")
-        if wait_for_next_signal_side:
-            print(colored(f"   ⏳ Waiting opposite signal: {wait_for_next_signal_side.upper()}", "cyan"))
-    
-    print(f"   ⏱️  Next candle in: {left_s}s")
-    print(colored("═" * 120, "cyan"))
+# =============== Flask ===============
+app=Flask(__name__)
 
-# ===== ENHANCED HTTP ENDPOINTS =====
 @app.route("/")
 def home():
-    mode = 'LIVE' if MODE_LIVE else 'PAPER'
-    return f"🎯 SMART COUNCIL PRO - NO RF WAITING — {SYMBOL} {INTERVAL} — {mode} — AI Trading System"
+    return f"COUNCIL-ONLY PRO — {SYMBOL} {TIMEFRAME} — {'LIVE' if MODE_LIVE else 'PAPER'}"
 
 @app.route("/metrics")
-def enhanced_metrics():
+def metrics():
+    try_spread=orderbook_spread_bps()
     return jsonify({
-        "symbol": SYMBOL,
-        "interval": INTERVAL,
-        "mode": "live" if MODE_LIVE else "paper",
-        "leverage": LEVERAGE,
-        "risk_alloc": RISK_ALLOC,
-        "price": price_now(),
-        "state": STATE,
-        "compound_pnl": compound_pnl,
-        "council_log": smart_council._last_log,
-        "position_manager": {
-            "targets_achieved": position_manager.targets_achieved,
-            "trail_activated": position_manager.trail_activated,
-            "breakeven_triggered": position_manager.breakeven_triggered
-        },
-        "market_conditions": {
-            "max_spread_bps": MAX_SPREAD_BPS,
-            "hard_spread_bps": HARD_SPREAD_BPS,
-            "pause_adx": PAUSE_ADX_THRESHOLD
-        }
+        "symbol":SYMBOL,"interval":TIMEFRAME,"mode":"live" if MODE_LIVE else "paper",
+        "price": price_now(), "spread_bps": try_spread,
+        "state": STATE, "compound_pnl": compound_pnl,
+        "circuit": {"open": breaker.is_open, "errors": breaker.error_count, "last_trip": int(breaker.last_trip or 0), "last_error": breaker.last_error}
     })
 
 @app.route("/health")
 def health():
-    return jsonify({
-        "ok": True,
-        "ts": datetime.utcnow().isoformat(),
-        "open": STATE["open"],
-        "side": STATE["side"],
-        "qty": STATE["qty"],
-        "system": "enhanced_smart_council_no_rf_waiting"
-    }), 200
+    return jsonify({"ok":True,"ts":datetime.utcnow().isoformat(),"open":STATE["open"],"side":STATE["side"],"qty":STATE["qty"]}),200
 
 @app.route("/bookmap", methods=["POST"])
 def bookmap_feed():
     try:
-        payload = request.get_json(silent=True) or {}
-        levels = payload.get("levels", [])
-        parsed=[]
-        for row in levels:
+        payload=request.get_json(silent=True) or {}
+        levels=[]
+        for row in payload.get("levels",[]):
             p=float(row[0]); liq=float(row[1]); imb=float(row[2]); ab=int(row[3])
-            parsed.append((p,liq,imb,ab))
-        bookmap.supply(parsed)
-        return jsonify({"ok":True,"count":len(parsed)})
+            levels.append((p,liq,imb,ab))
+        bookmap.supply(levels)
+        return jsonify({"ok":True,"count":len(levels)})
     except Exception as e:
         return jsonify({"ok":False,"error":str(e)}),400
 
-# ===== ENHANCED KEEPALIVE =====
-def enhanced_keepalive_loop():
-    if not SELF_URL:
-        print(colored("⛔ Enhanced keepalive disabled (no SELF_URL)", "yellow"))
-        return
-        
+def keepalive_loop():
+    if not SELF_URL: logger.warning("Keepalive disabled (no SELF_URL)"); return
     import requests
-    sess = requests.Session()
-    sess.headers.update({"User-Agent": "smart-council-pro/keepalive"})
-    
-    print(colored(f"🔗 Enhanced keepalive every 50s → {SELF_URL}", "cyan"))
-    
+    s=requests.Session(); s.headers.update({"User-Agent":"council-only-keepalive"})
     while True:
         try:
-            resp = sess.get(SELF_URL, timeout=8)
-            if resp.status_code == 200:
-                print(colored("✅ Keepalive successful", "green"))
-            else:
-                print(colored(f"⚠️ Keepalive status: {resp.status_code}", "yellow"))
-        except Exception as e:
-            print(colored(f"⚠️ Keepalive error: {e}", "yellow"))
-            
+            r=s.get(SELF_URL, timeout=8); logger.info(f"Keepalive: {r.status_code}")
+        except Exception as e: logger.warning(f"Keepalive err: {e}")
         time.sleep(50)
 
-# ===== ENHANCED BOOT =====
-if __name__ == "__main__":
-    print(colored("🎯 SMART COUNCIL PRO TRADING BOT - NO RF WAITING", "green"))
-    print(colored("═" * 80, "green"))
-    print(colored(f"MODE: {'LIVE' if MODE_LIVE else 'PAPER'} • {SYMBOL} • {INTERVAL}", "yellow"))
-    print(colored(f"RISK: {int(RISK_ALLOC*100)}%×{LEVERAGE}x • ENTRY: Smart Council ONLY", "yellow"))
-    print(colored("🚫 NO RF WAITING - مجلس الإدارة له الأولوية المطلقة", "red"))
-    print(colored("FEATURES: MACD + VWAP + Delta Volume + Smart Profit Taking + AI Decisions", "yellow"))
-    print(colored("═" * 80, "green"))
-    
-    logging.info("Smart Council Pro - No RF Waiting starting...")
-    
-    # Signal handling
-    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
-    signal.signal(signal.SIGINT, lambda *_: sys.exit(0))
-    
-    # Start enhanced threads
-    import threading
-    threading.Thread(target=enhanced_trade_loop, daemon=True).start()
-    threading.Thread(target=enhanced_keepalive_loop, daemon=True).start()
-    
-    # Start Flask app
+# =============== Boot ===============
+if __name__=="__main__":
+    print(colored("🎯 COUNCIL-ONLY PRO — BingX USDT Perps", "green"))
+    print(colored(f"Mode: {'LIVE' if MODE_LIVE else 'PAPER'} • {SYMBOL} • {TIMEFRAME}", "yellow"))
+    print(colored("ENTRY MODE: Council-Only — ADX Gate ≥ 17 — Single Position", "magenta"))
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0)); signal.signal(signal.SIGINT, lambda *_: sys.exit(0))
+    threading.Thread(target=main_loop, daemon=True).start()
+    if SELF_URL: threading.Thread(target=keepalive_loop, daemon=True).start()
     app.run(host="0.0.0.0", port=PORT, debug=False, use_reloader=False)
