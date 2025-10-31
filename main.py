@@ -68,6 +68,14 @@ ENTRY_SCORE_MIN = 4.0
 ENTRY_ADX_MIN   = 22.0
 EXIT_VOTES_MIN  = 3
 
+# >>> NEW: Smart Re-entry thresholds (minimal, isolated) <<<
+STRONG_VOTES_MIN = 8            # why: تعريف "منطقة قوية" من المجلس
+STRONG_SCORE_MIN = 5.5          # why: حد قوة إضافي للـ score
+PIVOT_ENTRY_CONF = 0.80         # why: قاع/قمة مؤكدة
+AFTER_CLOSE_REENTRY_WINDOW_S = 30
+ALLOW_STRONG_OVERRIDE_COOLDOWN = True
+ALLOW_STRONG_OVERRIDE_WAIT_OPPOSITE_RF = True
+
 # Voting weights
 VOTE_SUPPLY_REJECT = 2;  VOTE_DEMAND_REJECT = 2
 VOTE_SWEEP         = 2
@@ -419,7 +427,7 @@ def detect_fvg(df: pd.DataFrame, lookback=40):
         h1,l1 = float(d["high"].iloc[i-2]), float(d["low"].iloc[i-2])
         h3,l3 = float(d["high"].iloc[i]),   float(d["low"].iloc[i])
         if l3 > h1:  res.append({"type":"bull","gap_top":l3,"gap_bot":h1})
-        if h3 < l1:  res.append({"type":"bear","gap_top":l1,"gap_bot":h3})
+        if h3 < l1:  res.append({"type":"bear","gap_top":l1,"gap_bot":l3})
     return res[-1] if res else None
 
 def detect_sweep(df: pd.DataFrame, lookback=30, bps=8.0):
@@ -614,6 +622,8 @@ class Council:
         self._last_log=None
         self._last_impulse=None
         self._last_pivot=None
+        # NEW: keep last vote stats
+        self._last_b=0; self._last_s=0; self._last_score=0.0
 
     def votes(self, df: pd.DataFrame, ind: dict, rf: dict):
         b=s=0; score=0.0; rb=[]; rs=[]
@@ -685,6 +695,7 @@ class Council:
             rs.append("TRUE_TOP[" + ";".join(piv["why"]) + "]")
 
         self._last_log = f"🏛 BUY={b} [{', '.join(rb) or '—'}] | SELL={s} [{', '.join(rs) or '—'}] | score={score:.2f} | ADX={ind.get('adx'):.1f} | MACD_hist={hist:.4f}"
+        self._last_b, self._last_s, self._last_score = b, s, score  # NEW: store last stats
         print(colored(self._last_log, "green" if b>s else "red" if s>b else "cyan"))
         return b, s, score
 
@@ -708,6 +719,22 @@ class Council:
             return {"flip":"sell","reason":imp["reason"]}
         if state_side=="short" and imp["type"]=="explosion_up":
             return {"flip":"buy","reason":imp["reason"]}
+        return None
+
+    # >>> NEW: strong opportunity picker <<<
+    def strong_call(self, adx_now: float):
+        # Pivot priority (why: قاع/قمة مؤكدة فرصة نادرة)
+        piv=self._last_pivot
+        if piv and float(piv.get("conf",0.0))>=PIVOT_ENTRY_CONF and adx_now>=PAUSE_ADX_THRESHOLD:
+            side = "buy" if piv["type"]=="bottom" else "sell"
+            tag  = f"[PIVOT_STRONG conf={piv['conf']:.2f}]"
+            return {"side": side, "tag": tag}
+        # Votes+score strength
+        if adx_now>=ENTRY_ADX_MIN and self._last_score>=STRONG_SCORE_MIN:
+            if self._last_b>=STRONG_VOTES_MIN and self._last_b>self._last_s:
+                return {"side":"buy","tag":"[COUNCIL_STRONG]"}
+            if self._last_s>=STRONG_VOTES_MIN and self._last_s>self._last_b:
+                return {"side":"sell","tag":"[COUNCIL_STRONG]"}
         return None
 
 council = Council()
@@ -1039,6 +1066,14 @@ def trade_loop():
             council_decision = council.decide(df, ind, rf)
             council_log = council_decision.get("log")
 
+            # >>> NEW: strong signal (pivot/strong votes) detection while flat
+            force_sig=None; force_tag=""
+            if not STATE["open"]:
+                adx_now=float(ind.get("adx") or 0.0)
+                strong=council.strong_call(adx_now)
+                if strong:
+                    force_sig=strong["side"]; force_tag=strong["tag"]
+
             reason=None
             if STATE["open"]:
                 opp = (STATE["side"]=="long" and rf["short"]) or (STATE["side"]=="short" and rf["long"])
@@ -1071,6 +1106,7 @@ def trade_loop():
 
             manage_after_entry(df, ind, {"price":px, **rf})
 
+            # Guards → reasons (except strong override path)
             if spread is not None and spread>HARD_SPREAD_BPS:
                 reason=f"hard spread guard {fmt(spread,2)}bps>{HARD_SPREAD_BPS}"
             elif spread is not None and spread>MAX_SPREAD_BPS:
@@ -1085,17 +1121,24 @@ def trade_loop():
                 if STATE["_reversal_guard_bars"]>0: STATE["_reversal_guard_bars"]-=1
                 if RESTART_HOLD_UNTIL_BAR>0: RESTART_HOLD_UNTIL_BAR-=1
 
-                if not STATE["open"] and reason is None and RESTART_HOLD_UNTIL_BAR<=0:
+                if not STATE["open"] and RESTART_HOLD_UNTIL_BAR<=0:
                     sig=None; tag=""
-                    if council_decision["entry"]:
-                        sig=council_decision["entry"]["side"]; tag=f"[COUNCIL] {council_decision['entry']['reason']}"
-                    else:
-                        if STATE["_reversal_guard_bars"]==0 and ((rf["long"] or rf["short"]) and float(ind.get("adx") or 0.0)>=PAUSE_ADX_THRESHOLD):
-                            sig="buy" if rf["long"] else "sell"; tag=f"[RF-closed]"
+                    # >>> Strong override gets priority and can bypass wait/cooldown (with guards/rate-limit kept)
+                    if force_sig:
+                        sig=force_sig; tag=force_tag
+                    elif reason is None:
+                        if council_decision["entry"]:
+                            sig=council_decision["entry"]["side"]; tag=f"[COUNCIL] {council_decision['entry']['reason']}"
+                        else:
+                            if STATE["_reversal_guard_bars"]==0 and ((rf["long"] or rf["short"]) and float(ind.get("adx") or 0.0)>=PAUSE_ADX_THRESHOLD):
+                                sig="buy" if rf["long"] else "sell"; tag=f"[RF-closed]"
                     if sig:
-                        if wait_for_next_signal_side and sig != wait_for_next_signal_side:
+                        bypass_wait = (force_sig is not None and ALLOW_STRONG_OVERRIDE_WAIT_OPPOSITE_RF)
+                        bypass_cool = (force_sig is not None and ALLOW_STRONG_OVERRIDE_COOLDOWN)
+                        # Apply original gates unless we bypass
+                        if (not bypass_wait) and wait_for_next_signal_side and sig != wait_for_next_signal_side:
                             reason=f"waiting opposite RF: need {wait_for_next_signal_side.upper()}"
-                        elif (time.time()-STATE.get("_last_close_ts",0)) < CLOSE_COOLDOWN_S:
+                        elif (not bypass_cool) and (time.time()-STATE.get("_last_close_ts",0) < CLOSE_COOLDOWN_S):
                             reason=f"cooldown {int(CLOSE_COOLDOWN_S - (time.time()-STATE.get('_last_close_ts',0)))}s"
                         elif not _within_hour_rate_limit():
                             reason="rate-limit trades/hour"
@@ -1134,7 +1177,10 @@ def metrics():
         "state":STATE,"compound_pnl":compound_pnl,
         "council_log": council._last_log,
         "last_pivot": council._last_pivot,
-        "guards":{"max_spread_bps":MAX_SPREAD_BPS,"hard_spread_bps":HARD_SPREAD_BPS,"pause_adx":PAUSE_ADX_THRESHOLD}
+        "guards":{"max_spread_bps":MAX_SPREAD_BPS,"hard_spread_bps":HARD_SPREAD_BPS,"pause_adx":PAUSE_ADX_THRESHOLD},
+        # NEW: expose strong stats for observability
+        "council_strength":{"last_b":council._last_b,"last_s":council._last_s,"last_score":council._last_score,
+                            "pivot":council._last_pivot}
     })
 
 @app.route("/health")
