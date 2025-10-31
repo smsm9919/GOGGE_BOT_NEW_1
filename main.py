@@ -2,9 +2,12 @@ import pandas as pd
 import numpy as np
 import time
 import logging
+import os
 from typing import Dict, List, Optional
 from dataclasses import dataclass
 from enum import Enum
+from flask import Flask, jsonify
+import threading
 
 # 🔧 إعداد اللوج الاحترافي
 logging.basicConfig(
@@ -16,6 +19,9 @@ logging.basicConfig(
     ]
 )
 logger = logging.getLogger(__name__)
+
+# 🚀 إنشاء تطبيق Flask
+app = Flask(__name__)
 
 class TradeDirection(Enum):
     LONG = "LONG"
@@ -275,6 +281,7 @@ class ProfessionalTradingBot:
         self.trade_history = []
         self.last_candle_timestamp = None
         self.entry_filter = set()  # لمنع التكرار في نفس الشمعة
+        self.is_running = True
         
         logger.info("🤖 البوت المتداول المحترف يعمل بنظام مجلس الإدارة الذكي")
     
@@ -427,48 +434,120 @@ class ProfessionalTradingBot:
             'total_pnl': total_pnl,
             'average_pnl': avg_pnl
         }
-
-# نموذج استخدام البوت
-def main():
-    # تهيئة البوت
-    bot = ProfessionalTradingBot(api_key="YOUR_API_KEY", api_secret="YOUR_API_SECRET")
     
-    # محاكاة بيانات السوق
-    while True:
-        try:
-            # جلب بيانات السوق (هنا مثال بمحاكاة)
-            market_data = simulate_market_data()
-            
-            # 📈 البحث عن مناطق قوية واتخاذ القرار
-            signal = bot.analyze_market(market_data)
-            
-            if signal and not bot.active_trades:
-                bot.execute_trade(signal)
-            
-            # 📊 إدارة الصفقات المفتوحة
-            if bot.active_trades:
-                bot.manage_open_trades(market_data)
-            
-            # 📈 عرض تقرير الأداء
-            if len(bot.trade_history) % 10 == 0:
-                report = bot.get_performance_report()
-                if report:
-                    logger.info("📈 تقرير أداء البوت:")
-                    logger.info(f"   📊 إجمالي الصفقات: {report['total_trades']}")
-                    logger.info(f"   ✅ صفقات رابحة: {report['winning_trades']}")
-                    logger.info(f"   ❌ صفقات خاسرة: {report['losing_trades']}")
-                    logger.info(f"   🎯 نسبة النجاح: {report['win_rate']:.1f}%")
-                    logger.info(f"   💰 إجمالي الأرباح: {report['total_pnl']:.2f}%")
-            
-            time.sleep(60)  # انتظار دقيقة بين التحليلات
-            
-        except Exception as e:
-            logger.error(f"خطأ في التشغيل: {e}")
-            time.sleep(10)
+    def stop(self):
+        """🛑 إيقاف البوت"""
+        self.is_running = False
+        logger.info("🛑 البوت المتداول توقف")
+
+# إنشاء البوت كمتغير عالمي
+trading_bot = None
+
+# 🔧 إعداد Flask Routes
+@app.route('/')
+def home():
+    return jsonify({
+        "status": "running",
+        "message": "🤖 البوت المتداول المحترف يعمل بنجاح",
+        "version": "2.0.0"
+    })
+
+@app.route('/health')
+def health_check():
+    """✅ Health Check للإستجابة لـ Render"""
+    try:
+        if trading_bot and trading_bot.is_running:
+            return jsonify({
+                "status": "healthy",
+                "bot_status": "running",
+                "active_trades": len(trading_bot.active_trades),
+                "total_trades": len(trading_bot.trade_history),
+                "timestamp": int(time.time())
+            }), 200
+        else:
+            return jsonify({
+                "status": "unhealthy",
+                "bot_status": "stopped",
+                "timestamp": int(time.time())
+            }), 503
+    except Exception as e:
+        return jsonify({
+            "status": "error",
+            "message": str(e),
+            "timestamp": int(time.time())
+        }), 500
+
+@app.route('/status')
+def status():
+    """📊 حالة البوت المفصلة"""
+    if trading_bot:
+        performance = trading_bot.get_performance_report()
+        return jsonify({
+            "bot_status": "running" if trading_bot.is_running else "stopped",
+            "active_trades": len(trading_bot.active_trades),
+            "total_trades": len(trading_bot.trade_history),
+            "performance": performance,
+            "last_decision": trading_bot.council.last_decision.reason if trading_bot.council.last_decision else None,
+            "timestamp": int(time.time())
+        })
+    else:
+        return jsonify({"status": "bot_not_initialized"}), 500
+
+@app.route('/stop', methods=['POST'])
+def stop_bot():
+    """🛑 إيقاف البوت"""
+    if trading_bot:
+        trading_bot.stop()
+        return jsonify({"status": "stopping", "message": "البوت يتوقف..."})
+    return jsonify({"status": "not_running"})
+
+def run_bot():
+    """🤖 تشغيل البوت في thread منفصل"""
+    global trading_bot
+    try:
+        # تهيئة البوت (بدون API keys فعلية للاختبار)
+        trading_bot = ProfessionalTradingBot(api_key="TEST", api_secret="TEST")
+        
+        logger.info("🚀 بدأ تشغيل البوت المتداول...")
+        
+        # محاكاة التداول المستمر
+        while trading_bot.is_running:
+            try:
+                # جلب بيانات السوق (محاكاة)
+                market_data = simulate_market_data()
+                
+                # 📈 البحث عن مناطق قوية واتخاذ القرار
+                signal = trading_bot.analyze_market(market_data)
+                
+                if signal and not trading_bot.active_trades:
+                    trading_bot.execute_trade(signal)
+                
+                # 📊 إدارة الصفقات المفتوحة
+                if trading_bot.active_trades:
+                    trading_bot.manage_open_trades(market_data)
+                
+                # 📈 عرض تقرير الأداء كل 10 صفقات
+                if len(trading_bot.trade_history) % 10 == 0 and trading_bot.trade_history:
+                    report = trading_bot.get_performance_report()
+                    if report:
+                        logger.info("📈 تقرير أداء البوت:")
+                        logger.info(f"   📊 إجمالي الصفقات: {report['total_trades']}")
+                        logger.info(f"   ✅ صفقات رابحة: {report['winning_trades']}")
+                        logger.info(f"   ❌ صفقات خاسرة: {report['losing_trades']}")
+                        logger.info(f"   🎯 نسبة النجاح: {report['win_rate']:.1f}%")
+                        logger.info(f"   💰 إجمالي الأرباح: {report['total_pnl']:.2f}%")
+                
+                time.sleep(60)  # انتظار دقيقة بين التحليلات
+                
+            except Exception as e:
+                logger.error(f"خطأ في دورة التداول: {e}")
+                time.sleep(10)
+                
+    except Exception as e:
+        logger.error(f"خطأ فادح في تشغيل البوت: {e}")
 
 def simulate_market_data() -> pd.DataFrame:
     """محاكاة بيانات السوق للاختبار"""
-    # هذه دالة للمثال فقط - يجب استبدالها ببيانات حقيقية
     dates = pd.date_range(start='2024-01-01', periods=100, freq='1min')
     data = pd.DataFrame({
         'open': np.random.normal(100, 1, 100),
@@ -483,4 +562,16 @@ def simulate_market_data() -> pd.DataFrame:
     return data
 
 if __name__ == "__main__":
-    main()
+    # 🚀 تشغيل البوت في thread منفصل
+    bot_thread = threading.Thread(target=run_bot, daemon=True)
+    bot_thread.start()
+    
+    # 🌐 تشغيل الخادم مع الإعدادات الصحيحة لـ Render
+    PORT = int(os.getenv("PORT", 8080))
+    HOST = os.getenv("HOST", "0.0.0.0")
+    
+    logger.info(f"🚀 بدأ تشغيل الخادم على {HOST}:{PORT}")
+    logger.info("✅ Health Check متاح على: /health")
+    logger.info("📊 حالة البوت متاحة على: /status")
+    
+    app.run(host=HOST, port=PORT, debug=False)
