@@ -7,7 +7,7 @@ DOGE/USDT — Council-Only Pro Trader (Closed-RF Context) — FINAL+
 • إغلاق صارم بذكاء (Opp RF confirmed, Reversal risk, Key level break, Impulse flip)
 • Pullback Plan تلقائي بعد أي إغلاق صارم (يدخل بعد التصحيح بدل مطاردة السعر)
 • حُرّاس: سبريد/انزلاق/معدل صفقات/تبريد بعد الإغلاق + استئناف بعد Restart
-• ترقية: X-Protect بالـ VEI_K + Rate-limit على مستوى الشمعة + min_unit ذكي للجزئيات
+• ترقية: X-Protect بالـ VEI_K + Rate-limit على مستوى الشمعة + min_unit ذكي للجزئيات + سكالب ذكي للسوق المتوسط
 • HTTP: / , /metrics , /health , /bookmap
 """
 
@@ -123,6 +123,23 @@ CHOP_EXIT_PROFIT   = 0.25
 STRONG_ZONE_MODE      = True
 ZONE_PLAN_MAX_BARS    = 12
 PULLBACK_ENTRY_ENABLE = True
+
+# ===== SCALP (medium-market) =====
+SCALP_ENABLE            = True
+SCALP_ADX_MIN           = 19.0    # سوق متوسط (أعلى من Pause وأقل من ترند قوي)
+SCALP_MAX_HOLD_BARS     = 6       # لو الصفقة ما انفجرت خلال N شموع، نخرج بربح/تعادل
+SCALP_TP_PCT            = 0.35    # هدف ربح سريع افتراضي
+SCALP_LONG_WICK_RATIO   = 0.58    # لو فتيلة معاك >=58% من المدى مع ربح محترم → إحصد
+SCALP_LONG_BODY_ATR     = 1.2     # شمعة طويلة = body >= 1.2 * ATR
+
+# ===== Rate/Qty hygiene =====
+BAR_RATE_LIMIT          = 1       # بحد أقصى قرار دخول واحد لكل شمعة
+MIN_UNIT_GUARD_MULT     = 1.0     # × الحد الأدنى لحجم العقد من السوق (نقرأه من LOT_MIN)
+
+# ===== Aggressive Smart (للصفقات الصغيرة في السوق المتوسط) =====
+AGGR_SMART_ENABLE       = True
+AGGR_SMART_MAX_FRAC     = 0.25    # أقصى نسبة من الكمية القياسية
+AGGR_SMART_EXTRA_TP     = 0.20    # طبقة ربح صغيرة إضافية قبل SCALP_TP_PCT
 
 # Restart
 STATE_FILE                  = "state_doge.json"
@@ -748,6 +765,13 @@ def detect_impulse(df: pd.DataFrame, ind: dict):
 
 council = Council()
 
+# ===== Market Regime Classifier =====
+def market_regime(ind):
+    adx = float(ind.get("adx") or 0.0)
+    if adx < PAUSE_ADX_THRESHOLD: return "quiet"      # هادي → توقف
+    if adx >= ENTRY_ADX_MIN + 3:  return "trend"      # اتجاه قوي
+    return "medium"                                  # سوق متوسط
+
 # ===== Orders =====
 def _params_open(side):
     if POSITION_MODE=="hedge":
@@ -793,10 +817,19 @@ def _read_position():
         logging.error(f"_read_position: {e}")
     return 0.0,None,None
 
-def compute_size(balance, price):
-    cap=(balance or 0.0)*RISK_ALLOC*LEVERAGE*SIZE_BUFFER
-    raw=max(0.0, cap/max(float(price or 0.0),1e-9))
-    return safe_qty(raw)
+def compute_size(balance, price, for_aggr=False):
+    cap = (balance or 0.0) * RISK_ALLOC * LEVERAGE * SIZE_BUFFER
+    if for_aggr and AGGR_SMART_ENABLE:
+        cap *= AGGR_SMART_MAX_FRAC  # تقليل المخاطرة للصفقات السريعة
+    raw = max(0.0, cap / max(float(price or 0.0), 1e-9))
+    q = safe_qty(raw)
+
+    # حارس الحد الأدنى
+    min_unit = max(RESIDUAL_MIN_QTY, (LOT_MIN or RESIDUAL_MIN_QTY)) * MIN_UNIT_GUARD_MULT
+    if q < min_unit:
+        # لو حجم Aggressive-Smart أصغر من المسموح — ارفعه لأقرب حد أدنى
+        q = safe_qty(min_unit)
+    return q
 
 def open_market(side, qty, price, tag=""):
     if qty<=0: print(colored("❌ skip open (qty<=0)","red")); return False
@@ -937,7 +970,7 @@ def reconcile_state_with_exchange():
             RESTART_HOLD_UNTIL_BAR=RESTART_SAFE_BARS_HOLD
             print(colored(f"♻️ resumed live position {exch_side} qty={fmt(exch_qty,4)} entry={fmt(exch_entry)}","yellow"))
         else:
-            STATE.update({"open":False,"side":None,"entry":None,"qty":0.0,"pnl":0.0})
+            STATE.update({"open":False,"side":None,"entry":None,"qty":0.0})
             print(colored("♻️ no live position — flat","yellow"))
     save_state(tag="reconcile_boot")
 
@@ -987,6 +1020,39 @@ def smart_position_management(df, ind, info):
     current_price = price_now() or float(df["close"].iloc[-1])
     entry_price = STATE["entry"]; side = STATE["side"]
     pnl_pct = ((current_price - entry_price)/entry_price*100) if side=="long" else ((entry_price - current_price)/entry_price*100)
+
+    # ===== SCALP exits (medium) =====
+    regime = market_regime(ind)
+    atr = float(ind.get("atr") or 0.0)
+    if SCALP_ENABLE and regime == "medium" and atr > 0:
+        # 4.a حصاد فتيلة/شمعة طويلة مع ربح محترم
+        o,h,l,c = map(float, df[["open","high","low","close"]].iloc[-1])
+        rng = max(h-l, 1e-12); body = abs(c-o)
+        wick_against = (STATE["side"]=="long" and (h-max(o,c))/rng >= SCALP_LONG_WICK_RATIO) or \
+                       (STATE["side"]=="short" and (min(o,c)-l)/rng >= SCALP_LONG_WICK_RATIO)
+        long_candle  = (body >= SCALP_LONG_BODY_ATR * atr)
+
+        # طبقة TP صغيرة "Aggressive Smart"
+        if AGGR_SMART_ENABLE and pnl_pct >= AGGR_SMART_EXTRA_TP:
+            close_partial(0.30, f"AGGR-SMART_TP@{AGGR_SMART_EXTRA_TP:.2f}%")
+
+        if (pnl_pct >= SCALP_TP_PCT) and (wick_against or long_candle):
+            close_market_strict("SCALP_HARVEST_LW")  # lock it and move on
+            STATE["_reversal_guard_bars"] = 2
+            return
+
+        # 4.b حد أقصى لعمر السكالب
+        if STATE.get("bars",0) >= SCALP_MAX_HOLD_BARS:
+            if pnl_pct >= 0.05:
+                close_market_strict("SCALP_TIME_EXIT_PROFIT")
+            else:
+                # خروج تعادل/خسارة طفيفة
+                if STATE.get("breakeven"):
+                    # جرّب breakeven trail سريع: لو السعر لمس BE → إغلاق
+                    pass
+                close_market_strict("SCALP_TIME_EXIT_NEUTRAL")
+            STATE["_reversal_guard_bars"] = 2
+            return
 
     # 1) خروج ذكي
     reason = advanced_exit_strategy(df, ind, info, pnl_pct)
@@ -1093,6 +1159,19 @@ def trade_loop():
             council_decision = council.decide(df, ind, rf)
             council_log = council_decision.get("log")
 
+            # bar-rate-limit
+            decision_time = int(rf["time"])
+            global _last_decision_bar_time
+            if '_last_decision_bar_time' not in globals():
+                _last_decision_bar_time = 0
+            new_bar = decision_time != _last_decision_bar_time
+            if not new_bar and BAR_RATE_LIMIT >= 1:
+                # لا تفتح صفقات جديدة داخل نفس الشمعة
+                allow_new_entry_this_bar = False
+            else:
+                allow_new_entry_this_bar = True
+                _last_decision_bar_time = decision_time
+
             # إدارة الصفقة أثناء الفتح
             if STATE["open"]:
                 opp = (STATE["side"]=="long" and rf["short"]) or (STATE["side"]=="short" and rf["long"])
@@ -1177,28 +1256,63 @@ def trade_loop():
                                     else:
                                         reason = "qty<=0 or price=None"
 
-                    # 2) مجلس/RF
+                    # 2) مجلس/RF + سكالب السوق المتوسط
                     if not zone_triggered and reason is None:
-                        sig=None; tag=""
+                        sig=None; tag=""; use_aggr=False
+                        
                         if council_decision.get("entry"):
-                            sig=council_decision["entry"]["side"]; tag=f"[COUNCIL] {council_decision['entry']['reason']}"
-                        elif USE_RF_ENTRY:
-                            if ((rf["long"] or rf["short"]) and float(ind.get("adx") or 0.0)>=PAUSE_ADX_THRESHOLD):
-                                sig="buy" if rf["long"] else "sell"; tag=f"[RF-closed]"
+                            # قرار المجلس يسبق أي شيء (بخاصّة مع BYPASS_WAIT_FOR_COUNCIL)
+                            sig = council_decision["entry"]["side"]
+                            tag = f"[COUNCIL] {council_decision['entry']['reason']}"
+                        else:
+                            # خيار RF-entry إن مفعّل + سوق مناسب
+                            if USE_RF_ENTRY:
+                                regime = market_regime(ind)
+                                if regime != "quiet":
+                                    if (rf["long"] or rf["short"]):
+                                        sig = "buy" if rf["long"] else "sell"
+                                        tag = "[RF-closed]"
+
+                        # سكالب السوق المتوسط (لو ما فيش إشارة مجلس قوية)
+                        if SCALP_ENABLE and sig is None:
+                            regime = market_regime(ind)
+                            if regime == "medium":
+                                # فلتر بسيط: MACD_hist مع الاتجاه اللحظي
+                                hist = float(ind.get("macd_hist") or 0.0)
+                                if hist >= 0.0:
+                                    sig = "buy";  tag = "[SCALP-MEDIUM]"
+                                else:
+                                    sig = "sell"; tag = "[SCALP-MEDIUM]"
+                                use_aggr = True  # صفقات صغيرة وسريعة
+                                
+                                # منع سكالب وقت انفجار مبالغ فيه (تقلّبات قذرة)
+                                try:
+                                    vei_now = float(ind.get("vei") or 1.0)
+                                except:
+                                    vei_now = 1.0
+                                if vei_now >= VEI_K + 1.0:
+                                    # خلّي السكالب ينسحب؛ إماّ Council أو لا دخول
+                                    sig = None
+                                    tag = ""
+
                         if sig:
+                            # احترام انتظار نفس جهة RF إلا لو القرار Council
                             is_council_sig = tag.startswith("[COUNCIL]") or tag.startswith("[COUNCIL-ZONE]")
                             if wait_for_next_signal_side and sig != wait_for_next_signal_side:
                                 if not (BYPASS_WAIT_FOR_COUNCIL and is_council_sig):
                                     reason = f"waiting same-side RF: need {wait_for_next_signal_side.upper()}"
+
                             if reason is None:
                                 if (time.time()-STATE.get("_last_close_ts",0)) < CLOSE_COOLDOWN_S:
                                     reason = f"cooldown {int(CLOSE_COOLDOWN_S - (time.time()-STATE.get('_last_close_ts',0)))}s"
                                 elif not _within_hour_rate_limit():
                                     reason = "rate-limit trades/hour"
+                                elif not allow_new_entry_this_bar:  # bar-rate-limit
+                                    reason = "bar-rate-limit"
                                 elif not can_open_this_bar(decision_time):  # [UPGRADE]
                                     reason = "bar-opened-already"
                                 else:
-                                    qty=compute_size(bal, px or rf["price"])
+                                    qty = compute_size(bal, px or rf["price"], for_aggr=use_aggr)
                                     if qty>0 and (px or rf["price"]):
                                         if open_market(sig, qty, px or rf["price"], tag):
                                             wait_for_next_signal_side=None
@@ -1220,7 +1334,7 @@ def trade_loop():
 @app.route("/")
 def home():
     mode='LIVE' if MODE_LIVE else 'PAPER'
-    return f"✅ Council-Only Pro Trader — {SYMBOL} {INTERVAL} — {mode} — IOC/Slippage — Restart-safe"
+    return f"✅ Council-Only Pro Trader — {SYMBOL} {INTERVAL} — {mode} — IOC/Slippage — Restart-safe — Smart Scalp"
 
 @app.route("/metrics")
 def metrics():
@@ -1231,7 +1345,8 @@ def metrics():
         "council_log": council._last_log,
         "last_pivot": council._last_pivot,
         "zone_plan": {"active":ZONE_PLAN.active,"side":ZONE_PLAN.side,"lo":ZONE_PLAN.lo,"hi":ZONE_PLAN.hi,"bars_left":ZONE_PLAN.bars_left,"reason":ZONE_PLAN.reason},
-        "guards":{"max_spread_bps":MAX_SPREAD_BPS,"hard_spread_bps":HARD_SPREAD_BPS,"pause_adx":PAUSE_ADX_THRESHOLD,"vei_k":VEI_K}
+        "guards":{"max_spread_bps":MAX_SPREAD_BPS,"hard_spread_bps":HARD_SPREAD_BPS,"pause_adx":PAUSE_ADX_THRESHOLD,"vei_k":VEI_K},
+        "scalp":{"enabled":SCALP_ENABLE,"aggr_smart":AGGR_SMART_ENABLE,"max_hold_bars":SCALP_MAX_HOLD_BARS,"tp_pct":SCALP_TP_PCT}
     })
 
 @app.route("/health")
@@ -1267,7 +1382,7 @@ def keepalive_loop():
 if __name__=="__main__":
     print(colored(f"MODE: {'LIVE' if MODE_LIVE else 'PAPER'} • {SYMBOL} • {INTERVAL}","yellow"))
     print(colored(f"RISK: {int(RISK_ALLOC*100)}%×{LEVERAGE}x • ENTRY: Council-Only (RF as context)","yellow"))
-    print(colored("🎯 Smart Council + Candle System + Zone Planner + Trend Rider + Strict Close (+VEI_K/bar-limit/min_unit)","green"))
+    print(colored("🎯 Smart Council + Candle System + Zone Planner + Trend Rider + Strict Close (+VEI_K/bar-limit/min_unit) + Smart Scalp","green"))
     logging.info("service starting…")
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
     signal.signal(signal.SIGINT,  lambda *_: sys.exit(0))
