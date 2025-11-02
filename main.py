@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-DOGE/USDT — Council-Only Pro Trader (Closed-RF Context) — FINAL+ TURBO
+DOGE/USDT — Council-Only Pro Trader (Closed-RF Context) — FINAL+
 • Council قوي + Zone Planner (Pivot/FVG/Box) + تصنيف قوة الصفقة (Strong/Weak)
 • منظومة شموع احترافية (Engulfing, Marubozu, Hammer, Inverted, Doji, Dragonfly, Gravestone)
 • ركوب ترند (ADX/DI + MACD hist) + إدارة ربح: TP1/BE/Trail/Partial/Wick Harvest
@@ -9,7 +9,6 @@ DOGE/USDT — Council-Only Pro Trader (Closed-RF Context) — FINAL+ TURBO
 • حُرّاس: سبريد/انزلاق/معدل صفقات/تبريد بعد الإغلاق + استئناف بعد Restart
 • ترقية: X-Protect بالـ VEI_K + Rate-limit على مستوى الشمعة + min_unit ذكي للجزئيات
 • HTTP: / , /metrics , /health , /bookmap
-• TURBO: Strong-Vote Fast-Path + Pivot Hunter + Dynamic Thresholds + Scalp-Smart
 """
 
 import os, time, math, random, signal, sys, traceback, logging, json, tempfile
@@ -79,28 +78,6 @@ ENTRY_SCORE_MIN = 4.5
 ENTRY_ADX_MIN   = 19.0
 EXIT_VOTES_MIN  = 4
 
-# ======== Council Turbo ========
-STRONG_VOTES   = 8       # كان 7
-STRONG_SCORE   = 5.0     # كان 4.5
-STRONG_ADX     = 22.0    # حد أدنى لقوة الترند عند التنفيذ الفوري
-
-# Hunter
-PIVOT_CONF_FASTPATH = 0.70
-
-# Dynamic thresholds by regime
-REGIME_TUNE = {
-    "trend":  {"votes": -1, "score": -0.5, "adx": -1.0},
-    "medium": {"votes":  0, "score":  0.0, "adx":  0.0},
-    "quiet":  {"votes": +1, "score": +0.5, "adx": +1.0},
-}
-
-# Scalp-Smart
-SCALP_TP_PCT          = 0.40     # كان 0.35
-SCALP_MAX_HOLD_BARS   = 5        # أسرع خروج
-SCALP_LONG_WICK_RATIO = 0.55     # يحصد أسرع
-SCALP_LONG_BODY_ATR   = 1.1
-AGGR_SMART_EXTRA_TP   = 0.25     # طبقة ربح مبكرة للصفقات الصغيرة
-
 # Votes weights
 VOTE_SUPPLY_REJECT=2; VOTE_DEMAND_REJECT=2
 VOTE_SWEEP=2; VOTE_FVG=1; VOTE_EQ_LEVELS=1
@@ -110,6 +87,17 @@ VOTE_MACD_MOMENTUM=2; VOTE_CANDLE_POWER=1
 VOTE_IMPULSE_BONUS=2
 VOTE_TRUE_PIVOT_STRONG=3; VOTE_TRUE_PIVOT_WEAK=1
 VOTE_TREND_ALIGNMENT=2; VOTE_VOLUME_CONFIRM=1
+
+# Candles & Liquidity votes
+VOTE_CANDLE_SET       = 2   # قوة نمط شموعي مُؤكِّد
+VOTE_WICK_REJECT      = 1   # رفض بذيول طويلة ضد الاتجاه
+VOTE_LIQ_GRAB         = 2   # سحب سيولة (sweep) مؤكد
+VOTE_ACCUMULATION     = 1   # تجميع/تصريف حجمي
+
+# Scale-In (تعزيز مركز عند دخول سيولة مع ترند)
+MAX_ADDS              = 2
+ADD_COOLDOWN_BARS     = 3
+ADD_FRAC_OF_REMAIN    = 0.35   # 35% من القدرة المتبقية
 
 # X-Protect
 VEI_LOOKBACK = 20
@@ -497,24 +485,54 @@ def detect_boxes(df: pd.DataFrame):
     return {"supply":sup,"demand":dem}
 
 def candle_features(df: pd.DataFrame):
-    if len(df) < 3: 
-        return {"marubozu_up":False,"marubozu_down":False,"engulf_bull":False,"engulf_bear":False,"body_ratio":0.0,
-                "hammer":False,"inverted_hammer":False,"doji":False,"dragonfly":False,"gravestone":False}
+    """
+    تُعيد:
+      - patterns: list[str]  (أسماء الأنماط المكتشفة)
+      - body_ratio, up_wick, dn_wick
+      - power_bull, power_bear (0..1)
+    """
+    if len(df) < 3:
+        return {"patterns":[], "body_ratio":0.0, "up_wick":0.0, "dn_wick":0.0,
+                "power_bull":0.0, "power_bear":0.0}
+
     o1,h1,l1,c1 = map(float, df[["open","high","low","close"]].iloc[-2])
     o2,h2,l2,c2 = map(float, df[["open","high","low","close"]].iloc[-1])
-    rng2 = max(h2-l2,1e-12); body2 = abs(c2-o2)
-    maru_up   = (c2>o2) and (body2/rng2)>=IMPULSE_MARUBOZU
-    maru_down = (c2<o2) and (body2/rng2)>=IMPULSE_MARUBOZU
-    engulf_bull = (c2>o2) and (c1<o1) and (o2<=c1) and (c2>=o1)
-    engulf_bear = (c2<o2) and (c1>o1) and (o2>=c1) and (c2<=o1)
-    up = h2 - max(o2,c2); dn = min(o2,c2) - l2
-    hammer = (dn >= 2.0*max(body2,1e-12) and (h2-max(o2,c2)) <= 0.35*max(body2,1e-12))
-    inv_h  = (up >= 2.0*max(body2,1e-12) and (min(o2,c2)-l2)   <= 0.35*max(body2,1e-12))
-    doji = body2/rng2 <= 0.1
-    dragonfly = doji and dn/rng2 >= 0.6
-    gravestone= doji and up/rng2 >= 0.6
-    return {"marubozu_up":maru_up,"marubozu_down":maru_down,"engulf_bull":engulf_bull,"engulf_bear":engulf_bear,
-            "body_ratio":body2/rng2,"hammer":hammer,"inverted_hammer":inv_h,"doji":doji,"dragonfly":dragonfly,"gravestone":gravestone}
+    rng2 = max(h2-l2, 1e-12); body2 = abs(c2-o2)
+    up   = h2 - max(o2,c2);   dn   = min(o2,c2) - l2
+    up_r = up/rng2;           dn_r = dn/rng2;   body_r = body2/rng2
+
+    pats=[]
+    # Engulfing
+    if (c2>o2) and (c1>o1) is False and (o2<=c1) and (c2>=o1): pats.append("BullishEngulf")
+    if (c2<o2) and (c1<o1) is False and (o2>=c1) and (c2<=o1): pats.append("BearishEngulf")
+    # Marubozu
+    if (c2>o2) and body_r>=IMPULSE_MARUBOZU: pats.append("MarubozuUp")
+    if (c2<o2) and body_r>=IMPULSE_MARUBOZU: pats.append("MarubozuDown")
+    # Hammers / Stars / Doji
+    if (dn >= 2.0*max(body2,1e-12)) and (up <= 0.35*max(body2,1e-12)): pats.append("Hammer")
+    if (up >= 2.0*max(body2,1e-12)) and (dn <= 0.35*max(body2,1e-12)): pats.append("InvertedHammer")
+    if body_r <= 0.1: 
+        pats.append("Doji")
+        if dn_r>=0.6: pats.append("Dragonfly")
+        if up_r>=0.6: pats.append("Gravestone")
+    # Piercing / Dark Cloud (مبسّط)
+    mid1 = (o1+c1)/2.0
+    if (c2>o2) and (c1<o1) and (c2>mid1) and (o2< c1): pats.append("Piercing")
+    if (c2<o2) and (c1>o1) and (c2<mid1) and (o2> c1): pats.append("DarkCloud")
+    # Three Soldiers / Black Crows (مبسّط)
+    if len(df) >= 4:
+        closes = df["close"].astype(float).values[-4:]
+        opens  = df["open"].astype(float).values[-4:]
+        if all(closes[i]>opens[i] for i in [-3,-2,-1]) and closes[-1]>closes[-2]>closes[-3]:
+            pats.append("ThreeWhiteSoldiers")
+        if all(closes[i]<opens[i] for i in [-3,-2,-1]) and closes[-1]<closes[-2]<closes[-3]:
+            pats.append("ThreeBlackCrows")
+
+    power_bull = min(1.0, (1.0 if "BullishEngulf" in pats else 0.0) + (0.5 if "Hammer" in pats else 0.0) + (0.5 if "MarubozuUp" in pats else 0.0))
+    power_bear = min(1.0, (1.0 if "BearishEngulf" in pats else 0.0) + (0.5 if "InvertedHammer" in pats else 0.0) + (0.5 if "MarubozuDown" in pats else 0.0))
+
+    return {"patterns":pats, "body_ratio":body_r, "up_wick":up_r, "dn_wick":dn_r,
+            "power_bull":power_bull, "power_bear":power_bear}
 
 def structure_trend(df: pd.DataFrame, look=20):
     if len(df) < look+3: return "range"
@@ -586,6 +604,33 @@ def detect_retest_displacement(df: pd.DataFrame, ind: dict, mult=1.2, lookback=1
             return {"type":"displacement_retest"}
     return None
 
+# ===== وحدات السيولة =====
+def liquidity_accumulation(df: pd.DataFrame, win=12):
+    """ تجميع/تصريف: نطاقات صغيرة + حجم مرتفع = احتمالية تراكم أو تصريف """
+    if len(df) < win+2: return None
+    d = df.iloc[-win-1:-1]
+    ranges = (d["high"]-d["low"]).astype(float)
+    vol    = d["volume"].astype(float)
+    small_range = float(ranges.mean())
+    vol_boost   = float(vol.mean())
+    last_r = float(ranges.iloc[-1]); last_v = float(vol.iloc[-1])
+    if last_r <= small_range*0.8 and last_v >= vol_boost*1.25:
+        # اتجاه التراكم التقريبي = إغلاق بالنسبة للمدى
+        rel_close = (float(d["close"].iloc[-1]) - float(d["low"].iloc[-1])) / max(last_r,1e-12)
+        if rel_close >= 0.6:  return {"type":"acc_bull"}  # شراء متراكم
+        if rel_close <= 0.4:  return {"type":"acc_bear"}  # تصريف
+    return None
+
+def liquidity_inflow_metric(df: pd.DataFrame):
+    """ تقدير تدفق السيولة لحظة-بلحظة باستخدام إشارة الحجم × اتجاه الجسم """
+    if len(df)<3: return 0.0
+    d = df.iloc[-20:]
+    vol = d["volume"].astype(float)
+    z = (vol - vol.mean())/max(vol.std(ddof=0), 1e-9)
+    o,h,l,c = map(float, d[["open","high","low","close"]].iloc[-1])
+    dir_ = 1.0 if c>o else -1.0 if c<o else 0.0
+    return float(z.iloc[-1]) * dir_
+
 # ===== Zone Planner =====
 class ZonePlanner:
     def __init__(self):
@@ -639,24 +684,7 @@ def plan_pullback_after_close(df: pd.DataFrame, ind: dict):
         return ("sell", lo, hi, "PULLBACK_RF_RETEST")
     return build_zone_from_pivot_or_fvg(df, ind, None, fvg, boxes)
 
-# ===== Council Turbo =====
-def market_regime(ind) -> str:
-    """تحديد نظام السوق الحالي"""
-    adx = float(ind.get("adx") or 0.0)
-    if adx >= 25.0:
-        return "trend"
-    elif adx >= 18.0:
-        return "medium" 
-    else:
-        return "quiet"
-
-def tuned_entry_thresholds(ind):
-    """عتبات ديناميكية حسب نظام السوق"""
-    base_votes, base_score, base_adx = ENTRY_VOTES_MIN, ENTRY_SCORE_MIN, ENTRY_ADX_MIN
-    regime = market_regime(ind)
-    tune = REGIME_TUNE.get(regime, {"votes":0,"score":0.0,"adx":0.0})
-    return (base_votes + tune["votes"], base_score + tune["score"], base_adx + tune["adx"])
-
+# ===== Council =====
 class Council:
     def __init__(self):
         self.state={"open":False,"side":None,"entry":None}
@@ -677,14 +705,24 @@ class Council:
             if (df["high"].iloc[-1] >= sup["bot"]) and (df["close"].iloc[-1] < (sup["top"]+sup["bot"])/2.0):
                 s += VOTE_SUPPLY_REJECT; score += 1.6; rs.append("reject@supply")
                 
-        sw=detect_sweep(df)
-        if sw: 
-            if sw["type"]=="sweep_low":  b+=VOTE_SWEEP; score+=0.6; rb.append("sweep_low")
-            else:                        s+=VOTE_SWEEP; score+=0.6; rs.append("sweep_high")
-        fvg=detect_fvg(df)
+        sw = detect_sweep(df)
+        if sw:
+            if sw["type"]=="sweep_low":
+                b += VOTE_LIQ_GRAB; score += 0.8; rb.append("liq_grab_low")
+            else:
+                s += VOTE_LIQ_GRAB; score += 0.8; rs.append("liq_grab_high")
+
+        fvg = detect_fvg(df)
         if fvg:
-            if fvg["type"]=="bull": b+=VOTE_FVG; score+=0.5; rb.append("FVG(bull)")
-            else:                   s+=VOTE_FVG; score+=0.5; rs.append("FVG(bear)")
+            if fvg["type"]=="bull": b += VOTE_FVG; score += 0.5; rb.append("FVG(bull)")
+            else:                   s += VOTE_FVG; score += 0.5; rs.append("FVG(bear)")
+
+        acc = liquidity_accumulation(df)
+        if acc and acc["type"]=="acc_bull":
+            b += VOTE_ACCUMULATION; score += 0.4; rb.append("accum(bull)")
+        if acc and acc["type"]=="acc_bear":
+            s += VOTE_ACCUMULATION; score += 0.4; rs.append("accum(bear)")
+
         disp=detect_retest_displacement(df, ind, mult=1.2, lookback=10)
         if disp:
             if float(df["close"].iloc[-1])>float(df["open"].iloc[-1]): b+=1; score+=0.7; rb.append("displacement")
@@ -699,6 +737,19 @@ class Council:
         hist=float(ind.get("macd_hist") or 0.0)
         if adx>=17 and hist>0: b += VOTE_MACD_MOMENTUM; score += 0.8; rb.append("MACD+ADX↑")
         if adx>=17 and hist<0: s += VOTE_MACD_MOMENTUM; score += 0.8; rs.append("MACD+ADX↓")
+
+        # Candle set vote
+        if feats["power_bull"] >= 0.8:
+            b += VOTE_CANDLE_SET; score += 0.6; rb.append("candle_set↑")
+        if feats["power_bear"] >= 0.8:
+            s += VOTE_CANDLE_SET; score += 0.6; rs.append("candle_set↓")
+
+        # Wick rejection ضد الاتجاه الحالي
+        if feats["up_wick"]>=0.6 and float(ind.get("macd_hist") or 0.0) <= 0:
+            s += VOTE_WICK_REJECT; score += 0.3; rs.append("wick_reject_up")
+        if feats["dn_wick"]>=0.6 and float(ind.get("macd_hist") or 0.0) >= 0:
+            b += VOTE_WICK_REJECT; score += 0.3; rb.append("wick_reject_down")
+
         if feats["engulf_bull"] or feats["marubozu_up"] or feats["hammer"] or feats["dragonfly"]:
             b += VOTE_CANDLE_POWER; score += 0.4; rb.append("candle↑")
         if feats["engulf_bear"] or feats["marubozu_down"] or feats["inverted_hammer"] or feats["gravestone"]:
@@ -737,41 +788,34 @@ class Council:
         return "WEAK"
 
     def decide(self, df, ind, rf):
-        b, s, score = self.votes(df, ind, rf)
-        adx = float(ind.get("adx") or 0.0)
-        entry = None
-
-        # 0) Fast-Path: TRUE PIVOT Hunter (قاع/قمة مؤكدة)
-        piv = self._last_pivot or true_pivot(df, ind, candle_features(df), rf_signal_closed(df))
-        if not self.state["open"] and piv and piv.get("conf", 0) >= PIVOT_CONF_FASTPATH:
-            if piv["type"] == "bottom":
-                entry = {"side":"buy","reason":f"PIVOT_HUNTER_BOTTOM conf={piv['conf']:.2f} [{';'.join(piv['why'])}]"}
-                return {"entry":entry, "exit":None, "log": self._last_log + " | PIVOT_FASTPATH↑"}
-            if piv["type"] == "top":
-                entry = {"side":"sell","reason":f"PIVOT_HUNTER_TOP conf={piv['conf']:.2f} [{';'.join(piv['why'])}]"}
-                return {"entry":entry, "exit":None, "log": self._last_log + " | PIVOT_FASTPATH↓"}
-
-        # 1) Strong-Vote Fast-Path
-        if not self.state["open"] and adx >= STRONG_ADX:
-            if b >= STRONG_VOTES and score >= STRONG_SCORE:
-                entry = {"side":"buy","reason": self._last_log + " | STRONG_FASTPATH"}
-                return {"entry":entry, "exit":None, "log": self._last_log}
-            if s >= STRONG_VOTES and score >= STRONG_SCORE:
-                entry = {"side":"sell","reason": self._last_log + " | STRONG_FASTPATH"}
-                return {"entry":entry, "exit":None, "log": self._last_log}
-
-        # 2) Thresholds متكيّفة حسب الريجيم
-        need_votes, need_score, need_adx = tuned_entry_thresholds(ind)
+        b,s,score = self.votes(df, ind, rf)
+        adx=float(ind.get("adx") or 0.0)
+        entry=None
+        
+        # Turbo trend (اختياري)
         if not self.state["open"]:
+            trend = structure_trend(df)
+            hist = float(ind.get("macd_hist") or 0.0)
+            if adx >= 25 and score >= (ENTRY_SCORE_MIN - 0.5):
+                if trend == "bull" and b >= (ENTRY_VOTES_MIN - 1) and hist >= 0:
+                    entry = {"side":"buy","reason":self._last_log + " | TREND_TURBO_BULL"}
+                    return {"entry":entry,"exit":None,"log":self._last_log}
+                if trend == "bear" and s >= (ENTRY_VOTES_MIN - 1) and hist <= 0:
+                    entry = {"side":"sell","reason":self._last_log + " | TREND_TURBO_BEAR"}
+                    return {"entry":entry,"exit":None,"log":self._last_log}
+        
+        if not self.state["open"]:
+            # Pause عام للسوق الهادي
             if adx < PAUSE_ADX_THRESHOLD:
-                return {"entry":None,"exit":None,"log": self._last_log + " | PAUSE_ADX"}
-
-            if b >= need_votes and score >= need_score and adx >= need_adx:
-                entry = {"side":"buy","reason": self._last_log + f" | NORMAL(v{need_votes},s{need_score:.1f},a{need_adx:.1f})"}
-            elif s >= need_votes and score >= need_score and adx >= need_adx:
-                entry = {"side":"sell","reason": self._last_log + f" | NORMAL(v{need_votes},s{need_score:.1f},a{need_adx:.1f})"}
-
-        return {"entry":entry, "exit":None, "log": self._last_log}
+                return {"entry":None,"exit":None,"log":self._last_log+" | PAUSE_ADX"}
+            # شروط المجلس (مع قوة)
+            if b>=ENTRY_VOTES_MIN and score>=ENTRY_SCORE_MIN and adx>=ENTRY_ADX_MIN:
+                bucket=self.strength_bucket(b,s,score,ind)
+                entry={"side":"buy","reason":self._last_log+f" | {bucket}"}
+            elif s>=ENTRY_VOTES_MIN and score>=ENTRY_SCORE_MIN and adx>=ENTRY_ADX_MIN:
+                bucket=self.strength_bucket(b,s,score,ind)
+                entry={"side":"sell","reason":self._last_log+f" | {bucket}"}
+        return {"entry":entry,"exit":None,"log":self._last_log}
 
     def impulse_flip(self, df, ind, state_side):
         imp = self._last_impulse or detect_impulse(df, ind)
@@ -845,6 +889,38 @@ def compute_size(balance, price):
     raw=max(0.0, cap/max(float(price or 0.0),1e-9))
     return safe_qty(raw)
 
+_last_add_bar = {"ts": 0}
+def maybe_scale_in(df, ind):
+    if not STATE["open"] or STATE["qty"]<=0: return
+    # تبريد زمن الشموع
+    cur_bar = int(df["time"].iloc[-1])
+    if _last_add_bar["ts"] and (STATE["bars"] < ADD_COOLDOWN_BARS or cur_bar == _last_add_bar["ts"]):
+        return
+
+    adx = float(ind.get("adx") or 0.0)
+    if adx < 25: return  # تعزيز فقط في ترند واضح
+
+    inflow = liquidity_inflow_metric(df)
+    side = STATE["side"]
+    good_flow = (inflow>0.8 and side=="long") or (inflow<-0.8 and side=="short")
+    if not good_flow: return
+
+    # لا نتجاوز MAX_ADDS (نُخزّن عدد التعزيزات داخل STATE)
+    adds = int(STATE.get("_adds",0))
+    if adds >= MAX_ADDS: return
+
+    bal = balance_usdt(); px = price_now() or float(df["close"].iloc[-1])
+    if not px or not bal: return
+    # حجم التعزيز = نسبة من القدرة المتبقية
+    base_qty = compute_size(bal, px)
+    add_qty  = safe_qty(base_qty * ADD_FRAC_OF_REMAIN)
+    if add_qty <= 0: return
+
+    ok = open_market("buy" if side=="long" else "sell", add_qty, px, tag="[SCALE_IN:liquidity]")
+    if ok:
+        STATE["_adds"] = adds+1
+        _last_add_bar["ts"] = cur_bar
+
 def open_market(side, qty, price, tag=""):
     if qty<=0: print(colored("❌ skip open (qty<=0)","red")); return False
     
@@ -878,6 +954,7 @@ def open_market(side, qty, price, tag=""):
         "tp1_done":False, "highest_profit_pct":0.0, "profit_targets_achieved":0,
         "opp_votes":0, "_last_entry_ts": int(time.time())
     })
+    STATE["_adds"] = 0
     _mark_trade_timestamp()
     print(colored(f"🚀 OPEN {('🟩 LONG' if side=='buy' else '🟥 SHORT')} qty={fmt(qty,4)} @ {fmt(price)} {tag}","green" if side=='buy' else 'red'))
     if AUTOSAVE_ON_ORDER: save_state(tag="open")
@@ -1040,18 +1117,13 @@ def smart_position_management(df, ind, info):
     if reason:
         close_market_strict(reason); return
 
-    # 2) جني أرباح ديناميكي + Wick/Long Candle - إصدار سكالب
+    # 2) جني أرباح ديناميكي + Wick/Long Candle
     adx=float(ind.get("adx") or 0.0)
     trend_strength = min(adx / 50.0, 1.0)
-    base_tp = SCALP_TP_PCT * (1 + trend_strength)  # استخدام SCALP_TP_PCT
-
+    base_tp = TP1_PCT_BASE * (1 + trend_strength)
     if not STATE["tp1_done"] and pnl_pct >= base_tp:
         close_partial(TP1_CLOSE_FRAC, f"SMART_TP1@{base_tp:.2f}%"); STATE["tp1_done"]=True
         if pnl_pct>=BREAKEVEN_AFTER: STATE["breakeven"]=entry_price
-        
-        # إضافة ربح إضافي للصفقات الصغيرة في السكالب
-        if STATE["qty"] <= FINAL_CHUNK_QTY * 1.5 and pnl_pct >= base_tp + AGGR_SMART_EXTRA_TP:
-            close_partial(0.30, f"SCALP_EXTRA_TP@{pnl_pct:.2f}%")
 
     dyn_tps,dyn_fracs=_tp_ladder(info, ind, side)
     k=int(STATE.get("profit_targets_achieved",0))
@@ -1063,11 +1135,6 @@ def smart_position_management(df, ind, info):
     if should_take_reversal_profit(df, ind, side, pnl_pct) and pnl_pct>=EXH_MIN_PROFIT:
         print(colored(f"🔄 Reversal risk → lock profit {pnl_pct:.2f}%","yellow"))
         close_market_strict("REVERSAL_LOCK"); STATE["_reversal_guard_bars"]=4
-
-    # خروج سكالب بعد عدد معين من الشموع
-    if STATE["bars"] >= SCALP_MAX_HOLD_BARS and pnl_pct > 0:
-        close_market_strict(f"SCALP_MAX_HOLD_BARS_{STATE['bars']}")
-        return
 
     # Ratchet / Trail
     if pnl_pct>STATE["highest_profit_pct"]: STATE["highest_profit_pct"]=pnl_pct
@@ -1108,29 +1175,24 @@ def pretty_snapshot(bal, info, ind, spread_bps, reason=None, df=None, council_lo
     print(f"   💲 Price {fmt(info.get('price'))} | filt={fmt(info.get('filter'))} hi={fmt(info.get('hi'))} lo={fmt(info.get('lo'))} | spread={fmt(spread_bps,2)}bps")
     print(f"   🧮 RSI={fmt(ind.get('rsi'))} +DI={fmt(ind.get('plus_di'))} -DI={fmt(ind.get('minus_di'))} ADX={fmt(ind.get('adx'))} ATR={fmt(ind.get('atr'))} VEI~{fmt(ind.get('vei'),2)} MACD_hist={fmt(ind.get('macd_hist'),4)}")
     
-    # 📊 MARKET ANALYSIS PANEL
-    try:
-        vol_current = float(df["volume"].iloc[-1])
-        vol_avg = float(df["volume"].tail(20).mean())
-        vol_boost = "🚀 strong" if vol_current > vol_avg * 1.6 else "✅ normal" if vol_current > vol_avg * 0.8 else "⚠️ low"
-    except:
-        vol_boost = "❓ unknown"
-
+    # 🕯️ CANDLE SUITE
     cfeat = candle_features(df)
-    c_strength = "strong" if cfeat['body_ratio'] > 0.7 else "medium" if cfeat['body_ratio'] > 0.3 else "weak"
-    momentum_dir = "↑" if float(ind.get("macd_hist") or 0.0) > 0 else "↓"
-    momentum_str = "strong" if abs(float(ind.get("macd_hist") or 0.0)) > 0.001 else "light"
+    pats = cfeat.get("patterns", [])
+    pat_str = ", ".join(pats) if pats else "—"
+    print(colored("🕯️ CANDLE SUITE", "white"))
+    print(f"   body={fmt(cfeat['body_ratio'],2)} up_wick={fmt(cfeat['up_wick'],2)} dn_wick={fmt(cfeat['dn_wick'],2)}")
+    if pats: 
+        print(colored(f"   🎭 patterns: {pat_str}", "magenta"))
+    print(f"   power_bull={cfeat['power_bull']:.2f} | power_bear={cfeat['power_bear']:.2f}")
 
-    regime = market_regime(ind)
-    regime_color = {"trend": "green", "medium": "yellow", "quiet": "red"}.get(regime, "white")
-
-    print(colored("📊 MARKET ANALYSIS", "white"))
-    print(colored(f"   📈 Regime: {regime.upper()} | Volume: {vol_boost} | Candle: {c_strength} | Momentum: {momentum_dir}{momentum_str}", regime_color))
-
-    # 🎯 TREND RIDE SIGNAL عند العزم القوي
-    if float(ind.get("adx") or 0.0) > 25 and abs(float(ind.get("macd_hist") or 0.0)) > 0.002:
-        ride_dir = "LONG" if float(ind.get("macd_hist") or 0.0) > 0 else "SHORT" 
-        print(colored(f"   🚀 TREND-RIDE: {ride_dir} | ADX={fmt(ind.get('adx'))} | MACD_hist={fmt(ind.get('macd_hist'),4)}", "cyan"))
+    # 💧 LIQUIDITY
+    sw = detect_sweep(df); acc = liquidity_accumulation(df); inflow = liquidity_inflow_metric(df)
+    liq_tags=[]
+    if sw: liq_tags.append("sweep_low" if sw["type"]=="sweep_low" else "sweep_high")
+    if acc: liq_tags.append(acc["type"])
+    liq_tags.append(f"inflow~{inflow:+.2f}")
+    print(colored("💧 LIQUIDITY", "white"))
+    print(colored(f"   signals: {', '.join(liq_tags)}", "cyan"))
     
     if council_log: print(colored(council_log,"white"))
     if council._last_pivot and council._last_pivot.get("retest_zone"):
@@ -1146,6 +1208,7 @@ def pretty_snapshot(bal, info, ind, spread_bps, reason=None, df=None, council_lo
         lamp='🟩 LONG' if STATE['side']=='long' else '🟥 SHORT'
         print(f"   {lamp} Entry={fmt(STATE['entry'])} Qty={fmt(STATE['qty'],4)} Bars={STATE['bars']} Trail={fmt(STATE['trail'])} BE={fmt(STATE['breakeven'])}")
         print(f"   🎯 TP_done={STATE['profit_targets_achieved']} HP={fmt(STATE['highest_profit_pct'],2)}% OppVotes={STATE.get('opp_votes',0)} GuardBars={STATE.get('_reversal_guard_bars',0)}")
+        print(f"   🔋 Scale-Ins: {STATE.get('_adds', 0)}/{MAX_ADDS}")
     else:
         print("   ⚪ FLAT")
         if wait_for_next_signal_side: print(colored(f"   ⏳ Waiting same-side RF: {wait_for_next_signal_side.upper()}", "cyan"))
@@ -1185,27 +1248,24 @@ def trade_loop():
                     print(colored(f"⚪ Chop → light profit {rr:.2f}%","yellow"))
                     close_market_strict("CHOP_EXIT"); STATE["_reversal_guard_bars"]=4
                 flip = council.impulse_flip(df, ind, STATE["side"])
-                hist_now = float(ind.get("macd_hist") or 0.0)
-                # تحسين: إضافة شرط قطع الـMACD للزيرو كإشارة انعكاس مبكرة
-                macd_cross = (STATE["side"]=="long" and hist_now<0) or (STATE["side"]=="short" and hist_now>0)
-
-                if (flip or macd_cross) and (time.time()-STATE.get("_last_flip_ts",0) >= FLIP_COOLDOWN_S):
+                if flip and (time.time()-STATE.get("_last_flip_ts",0) >= FLIP_COOLDOWN_S):
                     if spread is None or (spread <= MAX_SPREAD_BPS and spread <= HARD_SPREAD_BPS):
+                        # [UPGRADE] block double-open on same bar for flip as well
                         if can_open_this_bar(rf["time"]):
-                            reason = flip['reason'] if flip else f"MACD_cross_{hist_now:.4f}"
-                            print(colored(f"⚡ IMPULSE/MACD FLIP → {flip['flip'].upper() if flip else ('sell' if STATE['side']=='long' else 'buy')} ({reason})","magenta"))
+                            print(colored(f"⚡ IMPULSE FLIP → {flip['flip'].upper()} ({flip['reason']})","magenta"))
                             close_market_strict("IMPULSE_FLIP")
                             STATE["_last_flip_ts"] = int(time.time())
                             qty=compute_size(bal, px)
                             if qty>0: 
-                                side = flip["flip"] if flip else ("sell" if STATE["side"]=="long" else "buy")
-                                open_market(side, qty, px, tag="[IMPULSE]"); wait_for_next_signal_side=None
+                                open_market(flip["flip"], qty, px, tag="[IMPULSE]"); wait_for_next_signal_side=None
                         else:
                             print(colored("⏸️ flip blocked: same-bar rate-limit","yellow"))
                     else:
                         print(colored(f"⏸️ IMPULSE flip blocked by spread {fmt(spread,2)}bps","yellow"))
                 # إدارة أرباح ذكية
                 smart_position_management(df, ind, {"price":px, **rf})
+                # بعد الإدارة، جرّب تعزيز ذكي إذا الترند قوي وتدفّق السيولة في صالحنا
+                maybe_scale_in(df, ind)
 
             # منع مبكر عام
             reason=None
@@ -1290,18 +1350,6 @@ def trade_loop():
                                         if open_market(sig, qty, px or rf["price"], tag):
                                             wait_for_next_signal_side=None
                                             if ZONE_PLAN.active: ZONE_PLAN.clear()
-                                            
-                                            # بعد فتح من هنتر - خطط لإعادة الاختبار تلقائياً
-                                            if "[PIVOT_HUNTER" in tag or "PIVOT_FASTPATH" in tag:
-                                                try:
-                                                    piv = council._last_pivot
-                                                    if piv and piv.get("retest_zone"):
-                                                        lo, hi = piv["retest_zone"]
-                                                        z_side = "buy" if piv["type"]=="bottom" else "sell"
-                                                        ZONE_PLAN.set(z_side, lo, hi, f"[PIVOT_RETEST] conf={piv.get('conf',0):.2f}")
-                                                        print(colored(f"🧭 Auto-Zone: {z_side.upper()} [{fmt(lo)}, {fmt(hi)}] • Pivot Hunter Retest", "cyan"))
-                                                except Exception as e:
-                                                    logging.debug(f"pivot hunter zone: {e}")
                                     else:
                                         reason="qty<=0 or price=None"
 
@@ -1319,7 +1367,7 @@ def trade_loop():
 @app.route("/")
 def home():
     mode='LIVE' if MODE_LIVE else 'PAPER'
-    return f"✅ Council-Only Pro Trader TURBO — {SYMBOL} {INTERVAL} — {mode} — IOC/Slippage — Restart-safe"
+    return f"✅ Council-Only Pro Trader — {SYMBOL} {INTERVAL} — {mode} — IOC/Slippage — Restart-safe"
 
 @app.route("/metrics")
 def metrics():
@@ -1330,8 +1378,7 @@ def metrics():
         "council_log": council._last_log,
         "last_pivot": council._last_pivot,
         "zone_plan": {"active":ZONE_PLAN.active,"side":ZONE_PLAN.side,"lo":ZONE_PLAN.lo,"hi":ZONE_PLAN.hi,"bars_left":ZONE_PLAN.bars_left,"reason":ZONE_PLAN.reason},
-        "guards":{"max_spread_bps":MAX_SPREAD_BPS,"hard_spread_bps":HARD_SPREAD_BPS,"pause_adx":PAUSE_ADX_THRESHOLD,"vei_k":VEI_K},
-        "turbo": {"strong_votes": STRONG_VOTES, "strong_score": STRONG_SCORE, "strong_adx": STRONG_ADX, "pivot_conf_fastpath": PIVOT_CONF_FASTPATH}
+        "guards":{"max_spread_bps":MAX_SPREAD_BPS,"hard_spread_bps":HARD_SPREAD_BPS,"pause_adx":PAUSE_ADX_THRESHOLD,"vei_k":VEI_K}
     })
 
 @app.route("/health")
@@ -1367,7 +1414,7 @@ def keepalive_loop():
 if __name__=="__main__":
     print(colored(f"MODE: {'LIVE' if MODE_LIVE else 'PAPER'} • {SYMBOL} • {INTERVAL}","yellow"))
     print(colored(f"RISK: {int(RISK_ALLOC*100)}%×{LEVERAGE}x • ENTRY: Council-Only (RF as context)","yellow"))
-    print(colored("🎯 TURBO: Smart Council + Pivot Hunter + Dynamic Thresholds + Scalp-Smart + Trend Rider + Strict Close","green"))
+    print(colored("🎯 Smart Council + Candle System + Zone Planner + Trend Rider + Strict Close (+VEI_K/bar-limit/min_unit)","green"))
     logging.info("service starting…")
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
     signal.signal(signal.SIGINT,  lambda *_: sys.exit(0))
