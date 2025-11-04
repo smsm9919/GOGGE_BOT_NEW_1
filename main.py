@@ -486,12 +486,19 @@ def emit_snapshots(exchange, symbol, df, balance_fn=None, pnl_fn=None):
             print(f"📊 {dash}{gz_note}", flush=True)
             print(f"{strat}{(' | ' + wallet) if wallet else ''}", flush=True)
             
-            # سنابشوت إضافي مختصر
+            # سنابشوت إضافي مختصر - مصحح
+            gz_snap_note = ""
+            if gz and gz.get("ok"):
+                zone_type = gz["zone"]["type"]
+                zone_score = gz["score"]
+                gz_snap_note = f" | 🟡{zone_type} s={zone_score:.1f}"
+            
+            flow_z = flow['delta_z'] if flow and flow.get('ok') else 0.0
+            bm_imb = bm['imbalance'] if bm and bm.get('ok') else 1.0
+            
             print(f"🧠 SNAP | {side_hint} | votes={cv['b']}/{cv['s']} score={cv['score_b']:.1f}/{cv['score_s']:.1f} "
                   f"| ADX={cv['ind'].get('adx',0):.1f} DI={cv['ind'].get('di_spread',0):.1f} | "
-                  f"z={flow['delta_z']:.2f if flow and flow.get('ok') else 0:.2f} "
-                  f"| imb={bm['imbalance']:.2f if bm and bm.get('ok') else 1.0:.2f}"
-                  f"{(' | 🟡'+gz['zone']['type']+f' s={gz['score']:.1f}') if gz and gz.get('ok') else ''}", 
+                  f"z={flow_z:.2f} | imb={bm_imb:.2f}{gz_snap_note}", 
                   flush=True)
             
             print("✅ ADDONS LIVE", flush=True)
@@ -541,8 +548,9 @@ def shadow_dashboard(side_hint, council, bm, flow, extras=None):
     gz = (extras or {}).get("gz", {})
     gz_tag = ""
     if gz and gz.get("ok"):
-        z = gz["zone"]["type"]; sc = gz["score"]
-        gz_tag = f" | 🟡 {z} s={sc:.1f}"
+        zone_type = gz["zone"]["type"]
+        zone_score = gz["score"]
+        gz_tag = f" | 🟡 {zone_type} s={zone_score:.1f}"
     print(
         f"📊 DASH — hint={side_hint} | Council BUY({b},{sb}) SELL({s},{ss}) | "
         f"RSI={rsi:.1f} ADX={adx:.1f} DI={di:.1f} EVX={evx:.2f} | "
