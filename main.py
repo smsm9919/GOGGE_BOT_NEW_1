@@ -8,6 +8,7 @@ RF Futures Bot — RF-LIVE ONLY (BingX Perp via CCXT)
 • Dust guard: force close if remaining ≤ FINAL_CHUNK_QTY (default 40 DOGE)
 • Flask /metrics + /health + rotated logging
 • [ADDON] SMC كامل + Golden Zones + RSI+MA Boost + EVX + وضعين تداول
+• [ADDON] Bookmap-Lite + Volume Flow + Shadow Dashboard
 """
 
 import os, time, math, random, signal, sys, traceback, logging
@@ -115,6 +116,18 @@ TREND_DI_SPREAD = 8.0    # فرق DI+ و DI-
 SCALP_TP1 = 0.35         # % افتراضي للسكالب
 SCALP_BE = 0.25
 SCALP_TRAIL_ACTIVATE = 0.9
+
+# ==== [ADDON] Orderbook & Flow & Dashboard ====
+BOOKMAP_DEPTH = 50
+BOOKMAP_TOPWALLS = 3
+IMBALANCE_ALERT = 1.40        # >=1.40 ضغط شراء، <=1/1.40 ضغط بيع
+
+FLOW_WINDOW = 20              # نوافذ قياس دلتا الحجم
+FLOW_SPIKE_Z = 1.8            # Spike اذا |z|>=1.8
+CVD_SMOOTH = 8                # تنعيم CVD لقراءة الاتجاه
+
+SHADOW_MODE_DASHBOARD = True  # Scoreboard فقط (لا يغيّر أي قرار)
+DASH_REPEAT_SECS = 30         # إن أردت تطبعه دوريًا أثناء الإدارة
 # ================================
 
 # =================== LOGGING ===================
@@ -263,6 +276,135 @@ def time_to_candle_close(df: pd.DataFrame) -> int:
         next_close_ms += tf*1000
     left = max(0, next_close_ms - now_ms)
     return int(left/1000)
+
+# =================== [ADDON] BOOKMAP-LITE ===================
+def bookmap_snapshot(exchange, symbol: str, depth: int = BOOKMAP_DEPTH):
+    """
+    يلخّص دفتر الأوامر: أكبر 3 حوائط شراء/بيع + Imbalance نسبة أحجام.
+    return: {"ok":bool, "buy_walls":[(price,qty)..], "sell_walls":[...], "imbalance":float}
+    """
+    try:
+        ob = exchange.fetch_order_book(symbol, depth)
+        bids = ob.get("bids", [])[:depth]; asks = ob.get("asks", [])[:depth]
+        if not bids or not asks:
+            return {"ok": False, "why": "empty_orderbook"}
+        b_sizes = np.array([b[1] for b in bids]); b_prices = np.array([b[0] for b in bids])
+        a_sizes = np.array([a[1] for a in asks]); a_prices = np.array([a[0] for a in asks])
+        b_idx = b_sizes.argsort()[::-1][:BOOKMAP_TOPWALLS]
+        a_idx = a_sizes.argsort()[::-1][:BOOKMAP_TOPWALLS]
+        buy_walls  = [(float(b_prices[i]), float(b_sizes[i])) for i in b_idx]
+        sell_walls = [(float(a_prices[i]), float(a_sizes[i])) for i in a_idx]
+        imb = b_sizes.sum() / max(a_sizes.sum(), 1e-12)
+        return {"ok": True, "buy_walls": buy_walls, "sell_walls": sell_walls, "imbalance": float(imb)}
+    except Exception as e:
+        return {"ok": False, "why": f"{e}"}
+
+def log_bookmap(bm):
+    if not bm.get("ok"):
+        print(f"🧱 Bookmap: N/A ({bm.get('why')})"); return
+    bw = ", ".join([f"{p:.4f}@{q:.0f}" for p,q in bm["buy_walls"]])
+    sw = ", ".join([f"{p:.4f}@{q:.0f}" for p,q in bm["sell_walls"]])
+    tag = "🟢" if bm["imbalance"]>=IMBALANCE_ALERT else ("🔴" if bm["imbalance"]<=1/IMBALANCE_ALERT else "⚖️")
+    print(f"🧱 Bookmap: {tag} Imb={bm['imbalance']:.2f} | BuyWalls[{bw}] | SellWalls[{sw}]")
+
+# =================== [ADDON] VOLUME FLOW / DELTA & CVD ===================
+def compute_flow_metrics(df):
+    """
+    Delta per bar (تقريبي): لو close>prev → upVol وإلا downVol.
+    CVD: cumulative volume delta (بالتنعيم).
+    Spike: z-score على نافذة FLOW_WINDOW.
+    """
+    if len(df) < max(30, FLOW_WINDOW+2):
+        return {"ok": False, "why": "short_df"}
+    close = df["close"].astype(float).copy()
+    vol   = df["volume"].astype(float).copy()
+    up_mask = close.diff().fillna(0) > 0
+    up_vol  = (vol * up_mask).astype(float)
+    dn_vol  = (vol * (~up_mask)).astype(float)
+    delta   = up_vol - dn_vol
+    cvd     = delta.cumsum()
+    cvd_ma  = cvd.rolling(CVD_SMOOTH).mean()
+    wnd = delta.tail(FLOW_WINDOW)
+    mu  = float(wnd.mean()); sd = float(wnd.std() or 1e-12)
+    z   = float((wnd.iloc[-1] - mu) / sd)
+    info = {
+        "ok": True,
+        "delta_last": float(delta.iloc[-1]),
+        "delta_mean": mu,
+        "delta_z": z,
+        "cvd_last": float(cvd.iloc[-1]),
+        "cvd_trend": "up" if (cvd_ma.iloc[-1] - cvd_ma.iloc[-min(CVD_SMOOTH, len(cvd_ma))]) >= 0 else "down",
+        "spike": abs(z) >= FLOW_SPIKE_Z
+    }
+    return info
+
+def log_flow(info):
+    if not info.get("ok"):
+        print(f"📦 Flow: N/A ({info.get('why')})"); return
+    dir_  = "🟢Buy" if info["delta_last"]>0 else ("🔴Sell" if info["delta_last"]<0 else "⚖️Flat")
+    spike = " ⚡Spike" if info["spike"] else ""
+    cvd_tr= "↗️" if info["cvd_trend"]=="up" else "↘️"
+    print(f"📦 Flow: {dir_} Δ={info['delta_last']:.0f} z={info['delta_z']:.2f}{spike} | CVD {cvd_tr} {info['cvd_last']:.0f}")
+
+# =================== [ADDON] SHADOW DASHBOARD ===================
+def shadow_dashboard(side_hint, council, bm, flow, extras=None):
+    """
+    Scoreboard مُوحّد — لا يغير قرار؛ لوج فقط.
+    council: dict من council_votes_pro => b,s,score_b,score_s,ind{rsi,adx,di_spread,evx}
+    extras: {"mode":"scalp/trend", "gz":{...}} اختياري
+    """
+    if not SHADOW_MODE_DASHBOARD: return
+    b = council.get("b",0); s=council.get("s",0)
+    sb=council.get("score_b",0.0); ss=council.get("score_s",0.0)
+    ind = council.get("ind", {})
+    rsi = ind.get("rsi", 50.0); adx=ind.get("adx", 0.0)
+    di  = ind.get("di_spread", 0.0); evx=ind.get("evx", 1.0)
+    imb_str="N/A"; imb_tag="❔"
+    if bm and bm.get("ok"):
+        imb = bm["imbalance"]; imb_str=f"{imb:.2f}"
+        imb_tag = "🟢" if imb>=IMBALANCE_ALERT else ("🔴" if imb<=1/IMBALANCE_ALERT else "⚖️")
+    fl_dir="N/A"; fl_z="N/A"; fl_spk=""
+    if flow and flow.get("ok"):
+        fl_dir = "🟢" if flow["delta_last"]>0 else ("🔴" if flow["delta_last"]<0 else "⚖️")
+        fl_z   = f"{flow['delta_z']:.2f}"
+        fl_spk = "⚡" if flow["spike"] else ""
+    mode = (extras or {}).get("mode", "n/a")
+    gz   = (extras or {}).get("gz", {})
+    gz_tag = ""
+    if gz and gz.get("ok"):
+        z = gz["zone"]["type"]; sc = gz["score"]
+        gz_tag = f" | 🟡 {z} s={sc:.1f}"
+    print(
+        f"📊 DASH — hint={side_hint} | Council BUY({b},{sb}) SELL({s},{ss}) | "
+        f"RSI={rsi:.1f} ADX={adx:.1f} DI={di:.1f} EVX={evx:.2f} | "
+        f"OB Imb={imb_tag}{imb_str} | Flow={fl_dir} z={fl_z}{fl_spk} | mode={mode}{gz_tag}"
+    )
+
+# =================== [ADDON] STRATEGY BANNER ===================
+def log_strategy_banner(mode_dict):
+    m = mode_dict.get("mode","n/a"); why = mode_dict.get("why","")
+    icon = "⚡" if m=="scalp" else "📈" if m=="trend" else "ℹ️"
+    print(f"{icon} Strategy: {m.upper()} ({why})")
+
+# =================== [ADDON] TRADE OPEN SHEET ===================
+def log_open_trade_details(side, price, qty, lev, mode, votes, golden=None, bm=None, flow=None):
+    gz_note = ""
+    if golden and golden.get("ok"):
+        gz_note = f" | 🟡 {golden['zone']['type']} s={golden['score']:.1f}"
+    bm_note = ""
+    if bm and bm.get("ok"):
+        tag = "🟢" if bm["imbalance"]>=IMBALANCE_ALERT else ("🔴" if bm["imbalance"]<=1/IMBALANCE_ALERT else "⚖️")
+        bm_note = f" | 🧱 {tag} Imb={bm['imbalance']:.2f}"
+    fl_note = ""
+    if flow and flow.get("ok"):
+        fl_dir = "🟢" if flow["delta_last"]>0 else ("🔴" if flow["delta_last"]<0 else "⚖️")
+        spike  = "⚡" if flow["spike"] else ""
+        fl_note = f" | 📦 {fl_dir} Δ={flow['delta_last']:.0f}{spike}"
+    print(
+        f"🚀 OPEN {side} @ {price:.6f}  qty={qty:.3f}  lev={lev}x  mode={mode}"
+        f" | council: BUY({votes.get('b',0)},{votes.get('score_b',0.0)}) SELL({votes.get('s',0)},{votes.get('score_s',0.0)})"
+        f"{gz_note}{bm_note}{fl_note}"
+    )
 
 # =================== INDICATORS ===================
 def wilder_ema(s: pd.Series, n: int): 
@@ -553,14 +695,6 @@ def entry_confirmation_guard(df, side_to_open: str, votes: dict, ind: dict):
             return {"ok":False,"why":["need_stronger_council_or_golden_zone"]}
     return {"ok":True,"why":["confirmed"]}
 
-# =================== [ADDON] TRADE LOGGING ===================
-def log_open_trade_details(side, price, qty, lev, mode, votes, golden=None):
-    note_gz = ""
-    if golden and golden.get("ok"):
-        note_gz = f" | 🟡 {golden['zone']['type']} score={golden['score']:.1f}"
-    print(f"🚀 OPEN {side} @ {price:.6f}  qty={qty:.3f}  lev={lev}x  mode={mode}"
-          f" | council: BUY({votes.get('b',0)},{votes.get('score_b',0.0)}) SELL({votes.get('s',0)},{votes.get('score_s',0.0)}){note_gz}")
-
 # =================== [ADDON] TRADE MANAGEMENT HINTS ===================
 def rsi_ma_trade_management_hint(df, side, state, tighten_fn, breakeven_fn, partial_fn):
     rsi = ind_rsi(df['close'].astype(float)); rsi_ma = _sma(rsi, RSI_MA_LEN)
@@ -681,11 +815,24 @@ def open_market(side, qty, price):
     mode = decide_strategy_mode(df)
     gz   = golden_zone_check(df, {"adx": cv["ind"]["adx"]}, "buy" if side.upper().startswith("B") else "sell")
 
+    # === [ADDON] BOOKMAP & FLOW INTEGRATION ===
+    bm = bookmap_snapshot(ex, SYMBOL, depth=BOOKMAP_DEPTH)
+    log_bookmap(bm)
+    
+    flow = compute_flow_metrics(df)
+    log_flow(flow)
+    
     votes = {"b":cv["b"],"s":cv["s"],"score_b":cv["score_b"],"score_s":cv["score_s"]}
     g = entry_confirmation_guard(df, side, votes, {"rsi":cv["ind"]["rsi"]})
     if not g["ok"]:
         print(colored(f"🟨 Entry Guard: BLOCK {side} → {g['why']}", "yellow"))
         return False
+
+    # === [ADDON] SHADOW DASHBOARD & STRATEGY BANNER ===
+    extras = {"mode": mode['mode'], "gz": gz}
+    side_hint = side if 'side' in locals() else ('BUY' if cv['b']>=cv['s'] else 'SELL')
+    shadow_dashboard(side_hint, cv, bm, flow, extras=extras)
+    log_strategy_banner(mode)
 
     print(colored(f"🧭 PLAN → council={votes} | mode={mode['mode']}({mode['why']})", "cyan"))
     if gz.get("ok"):
@@ -709,7 +856,7 @@ def open_market(side, qty, price):
     })
     
     # === [ADDON] ENHANCED LOGGING ===
-    log_open_trade_details(side, price, qty, LEVERAGE, mode['mode'], votes, golden=gz)
+    log_open_trade_details(side, price, qty, LEVERAGE, mode['mode'], votes, golden=gz, bm=bm, flow=flow)
     print(colored(f"📊 Decision Summary → {side} | reasons: {','.join([r for r in cv['logs'] if not r.startswith('🟨')])}", "green"))
     logging.info(f"OPEN {side} qty={qty} price={price} mode={mode['mode']} council={votes}")
     
