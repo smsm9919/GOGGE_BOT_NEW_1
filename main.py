@@ -8,10 +8,10 @@ RF Futures Bot — RF-LIVE ONLY (BingX Perp via CCXT)
 • Dust guard: force close if remaining ≤ FINAL_CHUNK_QTY (default 40 DOGE)
 • Flask /metrics + /health + rotated logging
 • [ADDON] SMC كامل + Golden Zones + RSI+MA Boost + EVX + وضعين تداول
-• [ADDON] Bookmap-Lite + Volume Flow + Shadow Dashboard
+• [ADDON] Bookmap-Lite + Volume Flow + Shadow Dashboard + Recovery System
 """
 
-import os, time, math, random, signal, sys, traceback, logging
+import os, time, math, random, signal, sys, traceback, logging, json
 from logging.handlers import RotatingFileHandler
 from datetime import datetime
 import pandas as pd
@@ -33,29 +33,43 @@ MODE_LIVE = bool(API_KEY and API_SECRET)
 SELF_URL = os.getenv("SELF_URL", "") or os.getenv("RENDER_EXTERNAL_URL", "")
 PORT = int(os.getenv("PORT", 5000))
 
+# ==== Addon: Logging + Recovery Settings ====
+BOT_VERSION = "DOGE SmartMoney Fusion v1.4 — Bookmap+Flow+Dash+Recovery"
+print("🔁 Booting:", BOT_VERSION, flush=True)
+
+SHADOW_MODE_DASHBOARD = True
+STATE_PATH = "./bot_state.json"
+RESUME_ON_RESTART = True
+RESUME_LOOKBACK_SECS = 60 * 60
+
+# Bookmap/Flow defaults
+BOOKMAP_DEPTH = 50
+BOOKMAP_TOPWALLS = 3
+IMBALANCE_ALERT = 1.40
+FLOW_WINDOW = 20
+FLOW_SPIKE_Z = 1.8
+CVD_SMOOTH = 8
+
 # =================== SETTINGS ===================
 SYMBOL     = os.getenv("SYMBOL", "DOGE/USDT:USDT")
 INTERVAL   = os.getenv("INTERVAL", "15m")
 LEVERAGE   = int(os.getenv("LEVERAGE", 10))
-RISK_ALLOC = float(os.getenv("RISK_ALLOC", 0.60))   # 60% من الرصيد
-POSITION_MODE = os.getenv("BINGX_POSITION_MODE", "oneway")  # oneway/hedge
+RISK_ALLOC = float(os.getenv("RISK_ALLOC", 0.60))
+POSITION_MODE = os.getenv("BINGX_POSITION_MODE", "oneway")
 
-# RF (TradingView-like) — live candle only
+# RF Settings
 RF_SOURCE = "close"
 RF_PERIOD = int(os.getenv("RF_PERIOD", 20))
 RF_MULT   = float(os.getenv("RF_MULT", 3.5))
 RF_LIVE_ONLY = True
-RF_HYST_BPS  = 6.0  # كسر واضح عن الفلتر لتقليل الفليكر على الشمعة الحيّة
+RF_HYST_BPS  = 6.0
 
 # Indicators
 RSI_LEN = 14
 ADX_LEN = 14
 ATR_LEN = 14
 
-# دخول فقط من RF (لا أي مدخلات أخرى)
 ENTRY_RF_ONLY = True
-
-# Spread guard
 MAX_SPREAD_BPS = float(os.getenv("MAX_SPREAD_BPS", 6.0))
 
 # Dynamic TP / trail
@@ -65,13 +79,12 @@ BREAKEVEN_AFTER    = 0.30
 TRAIL_ACTIVATE_PCT = 1.20
 ATR_TRAIL_MULT     = 1.6
 
-# سلّم الأهداف الافتراضي
 TREND_TPS       = [0.50, 1.00, 1.80]
 TREND_TP_FRACS  = [0.30, 0.30, 0.20]
 
-# Dust guard / final chunk
-FINAL_CHUNK_QTY = float(os.getenv("FINAL_CHUNK_QTY", 40.0))  # <= 40 DOGE → strict close
-RESIDUAL_MIN_QTY = float(os.getenv("RESIDUAL_MIN_QTY", 9.0)) # أقل كمية بعد الجزئي (min lot)
+# Dust guard
+FINAL_CHUNK_QTY = float(os.getenv("FINAL_CHUNK_QTY", 40.0))
+RESIDUAL_MIN_QTY = float(os.getenv("RESIDUAL_MIN_QTY", 9.0))
 
 # Strict close
 CLOSE_RETRY_ATTEMPTS = 6
@@ -82,7 +95,6 @@ BASE_SLEEP   = 5
 NEAR_CLOSE_S = 1
 
 # ==== [ADDON] Smart Settings ====
-# RSI-MA
 RSI_LEN = 14
 RSI_MA_LEN = 9
 RSI_CHOP_BAND = (45.0, 55.0)
@@ -90,12 +102,10 @@ RSI_CROSS_VOTES = 2;   RSI_CROSS_SCORE = 1.0
 RSI_TRENDZ_PERSIST = 3
 RSI_TRENDZ_VOTES = 3;  RSI_TRENDZ_SCORE = 1.5
 
-# EVX (volatility explosion)
 EVX_ATR_LEN = 14
 EVX_BASE_LEN = 50
 EVX_STRONG = 1.8
 
-# Golden Zones
 GZ_MIN_SCORE  = 6.0
 GZ_ADX_MIN    = 20.0
 GZ_REQ_VOL_MA = 20
@@ -103,34 +113,109 @@ GZ_FIB_LOW    = 0.618
 GZ_FIB_HIGH   = 0.786
 GZ_CAN_LEAD_ENTRY = True
 
-# Entry Guard
 ENTRY_CONFIRM_GUARD = True
 ENTRY_MIN_VOTES   = 8
 ENTRY_MIN_SCORE   = 2.5
 RSI_CROSS_REQUIRED  = True
 RSI_NEUTRAL_BAND    = (45.0, 55.0)
 
-# Strategy modes
-TREND_ADX_MIN = 28.0     # أقله ترند قوي
-TREND_DI_SPREAD = 8.0    # فرق DI+ و DI-
-SCALP_TP1 = 0.35         # % افتراضي للسكالب
+TREND_ADX_MIN = 28.0
+TREND_DI_SPREAD = 8.0
+SCALP_TP1 = 0.35
 SCALP_BE = 0.25
 SCALP_TRAIL_ACTIVATE = 0.9
 
-# ==== [ADDON] Orderbook & Flow & Dashboard ====
-BOOKMAP_DEPTH = 50
-BOOKMAP_TOPWALLS = 3
-IMBALANCE_ALERT = 1.40        # >=1.40 ضغط شراء، <=1/1.40 ضغط بيع
+# =================== PROFESSIONAL LOGGING ===================
+def log_i(msg): print(f"ℹ️ {msg}", flush=True)
+def log_g(msg): print(f"✅ {msg}", flush=True)
+def log_w(msg): print(f"🟨 {msg}", flush=True)
+def log_e(msg): print(f"❌ {msg}", flush=True)
 
-FLOW_WINDOW = 20              # نوافذ قياس دلتا الحجم
-FLOW_SPIKE_Z = 1.8            # Spike اذا |z|>=1.8
-CVD_SMOOTH = 8                # تنعيم CVD لقراءة الاتجاه
+def log_banner(text): print(f"\n{'—'*12} {text} {'—'*12}\n", flush=True)
 
-SHADOW_MODE_DASHBOARD = True  # Scoreboard فقط (لا يغيّر أي قرار)
-DASH_REPEAT_SECS = 30         # إن أردت تطبعه دوريًا أثناء الإدارة
-# ================================
+def save_state(state: dict):
+    try:
+        state["ts"] = int(time.time())
+        with open(STATE_PATH, "w", encoding="utf-8") as f:
+            json.dump(state, f, ensure_ascii=False, indent=2)
+        log_i(f"state saved → {STATE_PATH}")
+    except Exception as e:
+        log_w(f"state save failed: {e}")
 
-# =================== LOGGING ===================
+def load_state() -> dict:
+    try:
+        if not os.path.exists(STATE_PATH): return {}
+        with open(STATE_PATH, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception as e:
+        log_w(f"state load failed: {e}")
+    return {}
+
+# =================== POSITION RECOVERY ===================
+def _normalize_side(pos):
+    side = pos.get("side") or pos.get("positionSide") or ""
+    if side: return side.upper()
+    qty = float(pos.get("contracts") or pos.get("positionAmt") or pos.get("size") or 0)
+    return "LONG" if qty > 0 else ("SHORT" if qty < 0 else "")
+
+def fetch_live_position(exchange, symbol: str):
+    try:
+        if hasattr(exchange, "fetch_positions"):
+            arr = exchange.fetch_positions([symbol])
+            for p in arr or []:
+                sym = p.get("symbol") or p.get("info", {}).get("symbol")
+                if sym and symbol.replace(":","") in sym.replace(":",""):
+                    side = _normalize_side(p)
+                    qty = abs(float(p.get("contracts") or p.get("positionAmt") or p.get("info",{}).get("size",0) or 0))
+                    if qty > 0:
+                        entry = float(p.get("entryPrice") or p.get("info",{}).get("entryPrice") or 0.0)
+                        lev = float(p.get("leverage") or p.get("info",{}).get("leverage") or 0.0)
+                        unr = float(p.get("unrealizedPnl") or 0.0)
+                        return {"ok": True, "side": side, "qty": qty, "entry": entry, "unrealized": unr, "leverage": lev, "raw": p}
+        if hasattr(exchange, "fetch_position"):
+            p = exchange.fetch_position(symbol)
+            side = _normalize_side(p); qty = abs(float(p.get("size") or 0))
+            if qty > 0:
+                entry = float(p.get("entryPrice") or 0.0)
+                lev   = float(p.get("leverage") or 0.0)
+                unr   = float(p.get("unrealizedPnl") or 0.0)
+                return {"ok": True, "side": side, "qty": qty, "entry": entry, "unrealized": unr, "leverage": lev, "raw": p}
+    except Exception as e:
+        log_w(f"fetch_live_position error: {e}")
+    return {"ok": False, "why": "no_open_position"}
+
+def resume_open_position(exchange, symbol: str, state: dict) -> dict:
+    if not RESUME_ON_RESTART:
+        log_i("resume disabled"); return state
+
+    live = fetch_live_position(exchange, symbol)
+    if not live.get("ok"):
+        log_i("no live position to resume"); return state
+
+    ts = int(time.time())
+    prev = load_state()
+    if prev.get("ts") and (ts - int(prev["ts"])) > RESUME_LOOKBACK_SECS:
+        log_w("found old local state — will override with exchange live snapshot")
+
+    state.update({
+        "in_position": True,
+        "side": live["side"],
+        "entry_price": live["entry"],
+        "position_qty": live["qty"],
+        "leverage": live.get("leverage") or state.get("leverage") or 10,
+        "partial_taken": prev.get("partial_taken", False),
+        "breakeven_armed": prev.get("breakeven_armed", False),
+        "trail_active": prev.get("trail_active", False),
+        "mode": prev.get("mode", "trend"),
+        "gz_snapshot": prev.get("gz_snapshot", {}),
+        "cv_snapshot": prev.get("cv_snapshot", {}),
+        "opened_at": prev.get("opened_at", ts),
+    })
+    save_state(state)
+    log_g(f"RESUME: {state['side']} qty={state['position_qty']} @ {state['entry_price']:.6f} lev={state['leverage']}x")
+    return state
+
+# =================== LOGGING SETUP ===================
 def setup_file_logging():
     logger = logging.getLogger()
     logger.setLevel(logging.INFO)
@@ -140,7 +225,7 @@ def setup_file_logging():
         fh.setFormatter(logging.Formatter("%(asctime)s %(levelname)s: %(message)s"))
         logger.addHandler(fh)
     logging.getLogger('werkzeug').setLevel(logging.ERROR)
-    print(colored("🗂️ log rotation ready", "cyan"))
+    log_i("log rotation ready")
 
 setup_file_logging()
 
@@ -168,26 +253,26 @@ def load_market_specs():
         AMT_PREC = int((MARKET.get("precision", {}) or {}).get("amount", 0) or 0)
         LOT_STEP = (MARKET.get("limits", {}) or {}).get("amount", {}).get("step", None)
         LOT_MIN  = (MARKET.get("limits", {}) or {}).get("amount", {}).get("min",  None)
-        print(colored(f"🔧 precision={AMT_PREC}, step={LOT_STEP}, min={LOT_MIN}", "cyan"))
+        log_i(f"precision={AMT_PREC}, step={LOT_STEP}, min={LOT_MIN}")
     except Exception as e:
-        print(colored(f"⚠️ load_market_specs: {e}", "yellow"))
+        log_w(f"load_market_specs: {e}")
 
 def ensure_leverage_mode():
     try:
         try:
             ex.set_leverage(LEVERAGE, SYMBOL, params={"side": "BOTH"})
-            print(colored(f"✅ leverage set: {LEVERAGE}x", "green"))
+            log_g(f"leverage set: {LEVERAGE}x")
         except Exception as e:
-            print(colored(f"⚠️ set_leverage warn: {e}", "yellow"))
-        print(colored(f"📌 position mode: {POSITION_MODE}", "cyan"))
+            log_w(f"set_leverage warn: {e}")
+        log_i(f"position mode: {POSITION_MODE}")
     except Exception as e:
-        print(colored(f"⚠️ ensure_leverage_mode: {e}", "yellow"))
+        log_w(f"ensure_leverage_mode: {e}")
 
 try:
     load_market_specs()
     ensure_leverage_mode()
 except Exception as e:
-    print(colored(f"⚠️ exchange init: {e}", "yellow"))
+    log_w(f"exchange init: {e}")
 
 # =================== HELPERS ===================
 _consec_err = 0
@@ -209,7 +294,7 @@ def _round_amt(q):
 
 def safe_qty(q): 
     q = _round_amt(q)
-    if q<=0: print(colored(f"⚠️ qty invalid after normalize → {q}", "yellow"))
+    if q<=0: log_w(f"qty invalid after normalize → {q}")
     return q
 
 def fmt(v, d=6, na="—"):
@@ -277,12 +362,8 @@ def time_to_candle_close(df: pd.DataFrame) -> int:
     left = max(0, next_close_ms - now_ms)
     return int(left/1000)
 
-# =================== [ADDON] BOOKMAP-LITE ===================
+# =================== BOOKMAP-LITE ===================
 def bookmap_snapshot(exchange, symbol: str, depth: int = BOOKMAP_DEPTH):
-    """
-    يلخّص دفتر الأوامر: أكبر 3 حوائط شراء/بيع + Imbalance نسبة أحجام.
-    return: {"ok":bool, "buy_walls":[(price,qty)..], "sell_walls":[...], "imbalance":float}
-    """
     try:
         ob = exchange.fetch_order_book(symbol, depth)
         bids = ob.get("bids", [])[:depth]; asks = ob.get("asks", [])[:depth]
@@ -301,19 +382,14 @@ def bookmap_snapshot(exchange, symbol: str, depth: int = BOOKMAP_DEPTH):
 
 def log_bookmap(bm):
     if not bm.get("ok"):
-        print(f"🧱 Bookmap: N/A ({bm.get('why')})"); return
+        print(f"🧱 Bookmap: N/A ({bm.get('why')})", flush=True); return
     bw = ", ".join([f"{p:.4f}@{q:.0f}" for p,q in bm["buy_walls"]])
     sw = ", ".join([f"{p:.4f}@{q:.0f}" for p,q in bm["sell_walls"]])
     tag = "🟢" if bm["imbalance"]>=IMBALANCE_ALERT else ("🔴" if bm["imbalance"]<=1/IMBALANCE_ALERT else "⚖️")
-    print(f"🧱 Bookmap: {tag} Imb={bm['imbalance']:.2f} | BuyWalls[{bw}] | SellWalls[{sw}]")
+    print(f"🧱 Bookmap: {tag} Imb={bm['imbalance']:.2f} | BuyWalls[{bw}] | SellWalls[{sw}]", flush=True)
 
-# =================== [ADDON] VOLUME FLOW / DELTA & CVD ===================
+# =================== VOLUME FLOW ===================
 def compute_flow_metrics(df):
-    """
-    Delta per bar (تقريبي): لو close>prev → upVol وإلا downVol.
-    CVD: cumulative volume delta (بالتنعيم).
-    Spike: z-score على نافذة FLOW_WINDOW.
-    """
     if len(df) < max(30, FLOW_WINDOW+2):
         return {"ok": False, "why": "short_df"}
     close = df["close"].astype(float).copy()
@@ -340,19 +416,14 @@ def compute_flow_metrics(df):
 
 def log_flow(info):
     if not info.get("ok"):
-        print(f"📦 Flow: N/A ({info.get('why')})"); return
+        print(f"📦 Flow: N/A ({info.get('why')})", flush=True); return
     dir_  = "🟢Buy" if info["delta_last"]>0 else ("🔴Sell" if info["delta_last"]<0 else "⚖️Flat")
     spike = " ⚡Spike" if info["spike"] else ""
     cvd_tr= "↗️" if info["cvd_trend"]=="up" else "↘️"
-    print(f"📦 Flow: {dir_} Δ={info['delta_last']:.0f} z={info['delta_z']:.2f}{spike} | CVD {cvd_tr} {info['cvd_last']:.0f}")
+    print(f"📦 Flow: {dir_} Δ={info['delta_last']:.0f} z={info['delta_z']:.2f}{spike} | CVD {cvd_tr} {info['cvd_last']:.0f}", flush=True)
 
-# =================== [ADDON] SHADOW DASHBOARD ===================
+# =================== SHADOW DASHBOARD ===================
 def shadow_dashboard(side_hint, council, bm, flow, extras=None):
-    """
-    Scoreboard مُوحّد — لا يغير قرار؛ لوج فقط.
-    council: dict من council_votes_pro => b,s,score_b,score_s,ind{rsi,adx,di_spread,evx}
-    extras: {"mode":"scalp/trend", "gz":{...}} اختياري
-    """
     if not SHADOW_MODE_DASHBOARD: return
     b = council.get("b",0); s=council.get("s",0)
     sb=council.get("score_b",0.0); ss=council.get("score_s",0.0)
@@ -377,16 +448,16 @@ def shadow_dashboard(side_hint, council, bm, flow, extras=None):
     print(
         f"📊 DASH — hint={side_hint} | Council BUY({b},{sb}) SELL({s},{ss}) | "
         f"RSI={rsi:.1f} ADX={adx:.1f} DI={di:.1f} EVX={evx:.2f} | "
-        f"OB Imb={imb_tag}{imb_str} | Flow={fl_dir} z={fl_z}{fl_spk} | mode={mode}{gz_tag}"
+        f"OB Imb={imb_tag}{imb_str} | Flow={fl_dir} z={fl_z}{fl_spk} | mode={mode}{gz_tag}", flush=True
     )
 
-# =================== [ADDON] STRATEGY BANNER ===================
+# =================== STRATEGY BANNER ===================
 def log_strategy_banner(mode_dict):
     m = mode_dict.get("mode","n/a"); why = mode_dict.get("why","")
     icon = "⚡" if m=="scalp" else "📈" if m=="trend" else "ℹ️"
-    print(f"{icon} Strategy: {m.upper()} ({why})")
+    print(f"{icon} Strategy: {m.upper()} ({why})", flush=True)
 
-# =================== [ADDON] TRADE OPEN SHEET ===================
+# =================== TRADE OPEN SHEET ===================
 def log_open_trade_details(side, price, qty, lev, mode, votes, golden=None, bm=None, flow=None):
     gz_note = ""
     if golden and golden.get("ok"):
@@ -403,7 +474,7 @@ def log_open_trade_details(side, price, qty, lev, mode, votes, golden=None, bm=N
     print(
         f"🚀 OPEN {side} @ {price:.6f}  qty={qty:.3f}  lev={lev}x  mode={mode}"
         f" | council: BUY({votes.get('b',0)},{votes.get('score_b',0.0)}) SELL({votes.get('s',0)},{votes.get('score_s',0.0)})"
-        f"{gz_note}{bm_note}{fl_note}"
+        f"{gz_note}{bm_note}{fl_note}", flush=True
     )
 
 # =================== INDICATORS ===================
@@ -436,7 +507,7 @@ def compute_indicators(df: pd.DataFrame):
         "adx": float(adx.iloc[i]), "atr": float(atr.iloc[i])
     }
 
-# =================== [ADDON] SMART INDICATORS ===================
+# =================== SMART INDICATORS ===================
 def _ema(s, n):   return s.ewm(span=n, adjust=False).mean()
 def _sma(series, n): return series.rolling(n).mean()
 
@@ -480,7 +551,7 @@ def ind_evx(df, atr_len=EVX_ATR_LEN, base_len=EVX_BASE_LEN):
     base= tr.rolling(base_len).mean()
     return atr / base.replace(0,1e-12)
 
-# =================== [ADDON] CANDLE PATTERNS ===================
+# =================== CANDLE PATTERNS ===================
 def candle_signals(df):
     o,c = df['open'].astype(float), df['close'].astype(float)
     h,l = df['high'].astype(float), df['low'].astype(float)
@@ -495,7 +566,7 @@ def candle_signals(df):
         "bearish_engulf":  bool((c.shift(1)<o.shift(1)) & (o>c.shift(1)) & (c<o.shift(1)) & (c<o)).iloc[-1] if len(df)>2 else False,
     }
 
-# =================== [ADDON] SMC FUNCTIONS ===================
+# =================== SMC FUNCTIONS ===================
 def find_eqh_eql(df, lookback=50):
     highs = df['high'].astype(float).rolling(3).max()
     lows  = df['low'].astype(float).rolling(3).min()
@@ -550,11 +621,10 @@ def detect_bos_choch(df):
     bos_dn = c.iloc[-2] < swing_lo.iloc[-4]
     return {"bos_up":bool(bos_up),"bos_dn":bool(bos_dn),"choch":bool(bos_up and bos_dn)}
 
-# =================== [ADDON] GOLDEN ZONES ===================
+# =================== GOLDEN ZONES ===================
 def golden_zone_check(df, ind, side: str):
     if len(df)<40:
         return {"ok":False,"score":0.0,"reasons":[],"zone":None}
-    # swings (بسيطة)
     d = df.iloc[-51:-1]
     hi_idx = d['high'].astype(float).idxmax()
     lo_idx = d['low'].astype(float).idxmin()
@@ -565,7 +635,6 @@ def golden_zone_check(df, ind, side: str):
     score = 0.0; reasons=[]
     if min(fib618,fib786) <= lastc <= max(fib618,fib786):
         score+=2.0; reasons.append("fib_0.618_0.786_ok")
-    # شمعة انعكاس (wick)
     o,c = df['open'].astype(float), df['close'].astype(float)
     h,l = df['high'].astype(float), df['low'].astype(float)
     body = abs(c.iloc[-2]-o.iloc[-2])
@@ -573,11 +642,9 @@ def golden_zone_check(df, ind, side: str):
     wick_l = min(c.iloc[-2],o.iloc[-2]) - l.iloc[-2]
     if side=="buy"  and wick_l>body*0.8: score+=1.0; reasons.append("long_lower_wick")
     if side=="sell" and wick_u>body*0.8: score+=1.0; reasons.append("long_upper_wick")
-    # حجم
     vol_ma = _sma(df['volume'].astype(float), GZ_REQ_VOL_MA)
     if float(df['volume'].iloc[-2]) > float(vol_ma.iloc[-2] if vol_ma is not None else 0.0):
         score+=1.0; reasons.append("volume>ma20")
-    # RSI-MA توافق
     rsi = ind_rsi(df['close'].astype(float))
     rsi_ma = _sma(rsi, RSI_MA_LEN)
     sig="neutral"
@@ -586,14 +653,13 @@ def golden_zone_check(df, ind, side: str):
         if rsi.iloc[-2]>rsi_ma.iloc[-2] and rsi.iloc[-1]<rsi_ma.iloc[-1]: sig="bear"
     if side=="buy"  and (sig=="bull"): score+=1.5; reasons.append("rsi_ma_bullish")
     if side=="sell" and (sig=="bear"): score+=1.5; reasons.append("rsi_ma_bearish")
-    # ADX
     adx = float(ind.get("adx", 0.0)) if isinstance(ind, dict) else 0.0
     if adx>=GZ_ADX_MIN: score+=0.5; reasons.append("adx_ok")
     ok = score>=GZ_MIN_SCORE
     zone={"type":"golden_bottom" if side=="buy" else "golden_top","lo":float(min(fib618,fib786)),"hi":float(max(fib618,fib786))}
     return {"ok":ok,"score":score,"reasons":reasons,"zone":zone}
 
-# =================== [ADDON] COUNCIL VOTING ===================
+# =================== COUNCIL VOTING ===================
 def council_votes_pro(df):
     close = df['close'].astype(float)
     rsi  = ind_rsi(close); rsi_ma = _sma(rsi, RSI_MA_LEN)
@@ -608,7 +674,6 @@ def council_votes_pro(df):
     bos  = detect_bos_choch(df)
 
     b=s=0; sb=ss=0.0; logs=[]; reasons_b=[]; reasons_s=[]
-    # RSI-MA
     sig="neutral"
     if len(rsi)>=2 and len(rsi_ma)>=2:
         if rsi.iloc[-2]<rsi_ma.iloc[-2] and rsi.iloc[-1]>rsi_ma.iloc[-1]: sig="bullish_cross"
@@ -617,21 +682,17 @@ def council_votes_pro(df):
     if sig=="bullish_cross" and rsi_now<70:  b+=RSI_CROSS_VOTES; sb+=RSI_CROSS_SCORE; logs.append(f"🔎 RSI-MA bull_cross rsi={rsi_now:.1f} → +{RSI_CROSS_VOTES}(+{RSI_CROSS_SCORE})"); reasons_b.append("rsi_bull_cross")
     if sig=="bearish_cross" and rsi_now>30: s+=RSI_CROSS_VOTES; ss+=RSI_CROSS_SCORE; logs.append(f"🔎 RSI-MA bear_cross rsi={rsi_now:.1f} → +{RSI_CROSS_VOTES}(+{RSI_CROSS_SCORE})"); reasons_s.append("rsi_bear_cross")
 
-    # Trend-Z
     di_spread = float((di_plus - di_minus).iloc[-2]) if len(di_plus) else 0.0
     macd_slope = float(hist.iloc[-2]-hist.iloc[-3]) if len(hist)>=3 else 0.0
     if di_spread>8 and macd_slope>0:  b+=3; sb+=1.5; logs.append("📈 TrendZ up → +3(+1.5)"); reasons_b.append("trendZ_up")
     if di_spread<-8 and macd_slope<0: s+=3; ss+=1.5; logs.append("📉 TrendZ down → +3(+1.5)"); reasons_s.append("trendZ_dn")
 
-    # شموع
     if cs["bullish_engulf"] or cs["hammer"]:  b+=1; sb+=0.5; logs.append("🟢 Bullish candle → +1(+0.5)"); reasons_b.append("bullish_candle")
     if cs["bearish_engulf"] or cs["shooting_star"]: s+=1; ss+=0.5; logs.append("🔴 Bearish candle → +1(+0.5)"); reasons_s.append("bearish_candle")
 
-    # Sweeps
     if sw["sweep_down"]: b+=1; sb+=1.0; logs.append("💧 Sweep-down → +1(+1.0)"); reasons_b.append("sweep_down")
     if sw["sweep_up"]:   s+=1; ss+=1.0; logs.append("💧 Sweep-up → +1(+1.0)"); reasons_s.append("sweep_up")
 
-    # OB/FVG
     if any(x["type"]=="demand" for x in obs[-5:]): b+=1; sb+=0.5; logs.append("📦 Demand OB → +1(+0.5)"); reasons_b.append("demand_ob")
     if any(x["type"]=="supply" for x in obs[-5:]):  s+=1; ss+=0.5; logs.append("📦 Supply OB → +1(+0.5)"); reasons_s.append("supply_ob")
     if fvg:
@@ -639,12 +700,10 @@ def council_votes_pro(df):
         if last[0]=="bull": b+=1; sb+=0.5; logs.append("🟩 Bullish FVG → +1(+0.5)"); reasons_b.append("bull_fvg")
         else:                s+=1; ss+=0.5; logs.append("🟥 Bearish FVG → +1(+0.5)"); reasons_s.append("bear_fvg")
 
-    # BOS/CHOCH
     if bos["bos_up"]: b+=1; sb+=0.5; logs.append("🔼 BOS up → +1(+0.5)"); reasons_b.append("BOS_up")
     if bos["bos_dn"]: s+=1; ss+=0.5; logs.append("🔽 BOS down → +1(+0.5)"); reasons_s.append("BOS_dn")
     if bos["choch"]:  logs.append("♻️ CHoCH detected")
 
-    # EVX + Chop
     ev = float(ind_evx(df).iloc[-2]) if len(df)>3 else 1.0
     if ev>=EVX_STRONG: logs.append(f"💥 EVX {ev:.2f} explosion")
     bw = ind_bb_width(close)
@@ -654,7 +713,7 @@ def council_votes_pro(df):
     return {"b":b,"s":s,"score_b":round(sb,2),"score_s":round(ss,2),"logs":logs,
             "ind":{"rsi":rsi_now,"adx":float(adx.iloc[-2]) if len(adx) else 0.0,"di_spread":di_spread,"evx":ev}}
 
-# =================== [ADDON] STRATEGY SELECTOR ===================
+# =================== STRATEGY SELECTOR ===================
 def decide_strategy_mode(df):
     adx, di_plus, di_minus = ind_adx_di(df)
     if len(adx)<3: return {"mode":"scalp","why":"insufficient_data"}
@@ -664,7 +723,7 @@ def decide_strategy_mode(df):
         return {"mode":"trend","why":f"adx={adx_now:.1f} di_spread={di_spread:.1f}"}
     return {"mode":"scalp","why":f"adx={adx_now:.1f} di_spread={di_spread:.1f}"}
 
-# =================== [ADDON] ENTRY GUARD ===================
+# =================== ENTRY GUARD ===================
 def entry_confirmation_guard(df, side_to_open: str, votes: dict, ind: dict):
     if not ENTRY_CONFIRM_GUARD: return {"ok":True,"why":["guard_off"]}
     b,s   = int(votes.get("b",0)), int(votes.get("s",0))
@@ -678,7 +737,6 @@ def entry_confirmation_guard(df, side_to_open: str, votes: dict, ind: dict):
     rsi_now = float(ind.get("rsi",50.0))
     if RSI_NEUTRAL_BAND[0]<=rsi_now<=RSI_NEUTRAL_BAND[1]:
         return {"ok":False,"why":[f"rsi_neutral_band {RSI_NEUTRAL_BAND}"]}
-    # Cross check سريع
     rsi = ind_rsi(df['close'].astype(float)); rsi_ma = _sma(rsi, RSI_MA_LEN)
     sig="neutral"
     if len(rsi)>=2 and len(rsi_ma)>=2:
@@ -688,33 +746,30 @@ def entry_confirmation_guard(df, side_to_open: str, votes: dict, ind: dict):
         return {"ok":False,"why":["need_bullish_cross"]}
     if side_to_open.upper().startswith("S") and RSI_CROSS_REQUIRED and sig!="bear":
         return {"ok":False,"why":["need_bearish_cross"]}
-    # Golden assist
     if GZ_CAN_LEAD_ENTRY:
         g = golden_zone_check(df, ind, "buy" if side_to_open.upper().startswith("B") else "sell")
         if not g.get("ok") and ((side_to_open.upper().startswith("B") and (b<ENTRY_MIN_VOTES+2 or sb<ENTRY_MIN_SCORE+0.5)) or (side_to_open.upper().startswith("S") and (s<ENTRY_MIN_VOTES+2 or ss<ENTRY_MIN_SCORE+0.5))):
             return {"ok":False,"why":["need_stronger_council_or_golden_zone"]}
     return {"ok":True,"why":["confirmed"]}
 
-# =================== [ADDON] TRADE MANAGEMENT HINTS ===================
+# =================== TRADE MANAGEMENT HINTS ===================
 def rsi_ma_trade_management_hint(df, side, state, tighten_fn, breakeven_fn, partial_fn):
     rsi = ind_rsi(df['close'].astype(float)); rsi_ma = _sma(rsi, RSI_MA_LEN)
     if len(rsi)<2 or len(rsi_ma)<2: return
     bull = (rsi.iloc[-2]<rsi_ma.iloc[-2] and rsi.iloc[-1]>rsi_ma.iloc[-1])
     bear = (rsi.iloc[-2]>rsi_ma.iloc[-2] and rsi.iloc[-1]<rsi_ma.iloc[-1])
-    # ضد الاتجاه → Tighten + BE + Partial 25%
     if side.lower().startswith("l") and bear:
         tighten_fn(); breakeven_fn()
         if not state.get("partial_taken"): partial_fn(0.25, "RSI-MA warning vs LONG")
-        print("🛡️ RSI-MA ضد LONG → tighten/BE/partial")
+        print("🛡️ RSI-MA ضد LONG → tighten/BE/partial", flush=True)
     if side.lower().startswith("s") and bull:
         tighten_fn(); breakeven_fn()
         if not state.get("partial_taken"): partial_fn(0.25, "RSI-MA warning vs SHORT")
-        print("🛡️ RSI-MA ضد SHORT → tighten/BE/partial")
-    # مع الاتجاه → Hold-TP
-    if side.lower().startswith("l") and bull:  print("⏳ RSI-MA مع LONG → Hold-TP")
-    if side.lower().startswith("s") and bear:  print("⏳ RSI-MA مع SHORT → Hold-TP")
+        print("🛡️ RSI-MA ضد SHORT → tighten/BE/partial", flush=True)
+    if side.lower().startswith("l") and bull:  print("⏳ RSI-MA مع LONG → Hold-TP", flush=True)
+    if side.lower().startswith("s") and bear:  print("⏳ RSI-MA مع SHORT → Hold-TP", flush=True)
 
-# =================== RANGE FILTER (TV-like) ===================
+# =================== RANGE FILTER ===================
 def _rng_size(src: pd.Series, qty: float, n: int) -> pd.Series:
     avrng = _ema((src - src.shift(1)).abs(), n); wper = (n*2)-1
     return _ema(avrng, wper) * qty
@@ -730,11 +785,6 @@ def _rng_filter(src: pd.Series, rsize: pd.Series):
     return filt + rsize, filt - rsize, filt
 
 def rf_signal_live(df: pd.DataFrame):
-    """
-    إشارة RF على الشمعة الحيّة:
-      - flip فوق/تحت الفلتر مع هيستريسس بسيط بالـbps
-      - لا نعتمد على إغلاق الشمعة
-    """
     if len(df) < RF_PERIOD + 3:
         i = -1
         price = float(df["close"].iloc[i]) if len(df) else None
@@ -743,13 +793,11 @@ def rf_signal_live(df: pd.DataFrame):
                 "filter": price or 0.0, "hi": price or 0.0, "lo": price or 0.0}
     src = df[RF_SOURCE].astype(float)
     hi, lo, filt = _rng_filter(src, _rng_size(src, RF_MULT, RF_PERIOD))
-    # هيستريسس بسيط
     def _bps(a,b):
         try: return abs((a-b)/b)*10000.0
         except Exception: return 0.0
     p_now = float(src.iloc[-1]); p_prev = float(src.iloc[-2])
     f_now = float(filt.iloc[-1]); f_prev = float(filt.iloc[-2])
-    # flip
     long_flip  = (p_prev <= f_prev and p_now > f_now and _bps(p_now, f_now) >= RF_HYST_BPS)
     short_flip = (p_prev >= f_prev and p_now < f_now and _bps(p_now, f_now) >= RF_HYST_BPS)
     return {
@@ -766,7 +814,7 @@ STATE = {
     "profit_targets_achieved": 0,
 }
 compound_pnl = 0.0
-wait_for_next_signal_side = None  # "buy" or "sell" (ننتظر الإشارة العكسية بعد الإغلاق)
+wait_for_next_signal_side = None
 
 # =================== ORDERS ===================
 def _params_open(side):
@@ -803,10 +851,10 @@ def compute_size(balance, price):
 
 def open_market(side, qty, price):
     if qty<=0: 
-        print(colored("❌ skip open (qty<=0)", "red"))
+        log_e("skip open (qty<=0)")
         return False
     
-    # === [ADDON] SMART COUNCIL INTEGRATION ===
+    # === SMART COUNCIL INTEGRATION ===
     df = fetch_ohlcv()
     cv = council_votes_pro(df)
     for line in cv["logs"]: 
@@ -815,7 +863,7 @@ def open_market(side, qty, price):
     mode = decide_strategy_mode(df)
     gz   = golden_zone_check(df, {"adx": cv["ind"]["adx"]}, "buy" if side.upper().startswith("B") else "sell")
 
-    # === [ADDON] BOOKMAP & FLOW INTEGRATION ===
+    # === BOOKMAP & FLOW INTEGRATION ===
     bm = bookmap_snapshot(ex, SYMBOL, depth=BOOKMAP_DEPTH)
     log_bookmap(bm)
     
@@ -825,19 +873,18 @@ def open_market(side, qty, price):
     votes = {"b":cv["b"],"s":cv["s"],"score_b":cv["score_b"],"score_s":cv["score_s"]}
     g = entry_confirmation_guard(df, side, votes, {"rsi":cv["ind"]["rsi"]})
     if not g["ok"]:
-        print(colored(f"🟨 Entry Guard: BLOCK {side} → {g['why']}", "yellow"))
+        log_w(f"Entry Guard: BLOCK {side} → {g['why']}")
         return False
 
-    # === [ADDON] SHADOW DASHBOARD & STRATEGY BANNER ===
+    # === SHADOW DASHBOARD & STRATEGY BANNER ===
     extras = {"mode": mode['mode'], "gz": gz}
     side_hint = side if 'side' in locals() else ('BUY' if cv['b']>=cv['s'] else 'SELL')
     shadow_dashboard(side_hint, cv, bm, flow, extras=extras)
     log_strategy_banner(mode)
 
-    print(colored(f"🧭 PLAN → council={votes} | mode={mode['mode']}({mode['why']})", "cyan"))
+    log_i(f"PLAN → council={votes} | mode={mode['mode']}({mode['why']})")
     if gz.get("ok"):
-        print(colored(f"🟡 نقطة ذهبية: {gz['zone']['type']} | score={gz['score']:.1f} | {gz['reasons']}", "yellow"))
-    # === END ADDON ===
+        log_i(f"نقطة ذهبية: {gz['zone']['type']} | score={gz['score']:.1f} | {gz['reasons']}")
     
     if MODE_LIVE:
         try:
@@ -845,7 +892,7 @@ def open_market(side, qty, price):
             except Exception: pass
             ex.create_order(SYMBOL, "market", side, qty, None, _params_open(side))
         except Exception as e:
-            print(colored(f"❌ open: {e}", "red"))
+            log_e(f"open: {e}")
             logging.error(f"open_market error: {e}")
             return False
     
@@ -855,10 +902,26 @@ def open_market(side, qty, price):
         "tp1_done": False, "highest_profit_pct": 0.0, "profit_targets_achieved": 0
     })
     
-    # === [ADDON] ENHANCED LOGGING ===
+    # === ENHANCED LOGGING ===
     log_open_trade_details(side, price, qty, LEVERAGE, mode['mode'], votes, golden=gz, bm=bm, flow=flow)
-    print(colored(f"📊 Decision Summary → {side} | reasons: {','.join([r for r in cv['logs'] if not r.startswith('🟨')])}", "green"))
+    log_i(f"Decision Summary → {side} | reasons: {','.join([r for r in cv['logs'] if not r.startswith('🟨')])}")
     logging.info(f"OPEN {side} qty={qty} price={price} mode={mode['mode']} council={votes}")
+    
+    # === SAVE STATE FOR RECOVERY ===
+    save_state({
+        "in_position": True,
+        "side": "LONG" if side.upper().startswith("B") else "SHORT",
+        "entry_price": price,
+        "position_qty": qty,
+        "leverage": LEVERAGE,
+        "mode": mode['mode'],
+        "gz_snapshot": gz if isinstance(gz, dict) else {},
+        "cv_snapshot": votes if isinstance(votes, dict) else {},
+        "opened_at": int(time.time()),
+        "partial_taken": False,
+        "breakeven_armed": False,
+        "trail_active": False,
+    })
     
     return True
 
@@ -886,17 +949,17 @@ def close_market_strict(reason="STRICT"):
                 qty  = exch_qty
                 pnl  = (px - entry_px) * qty * (1 if side=="long" else -1)
                 compound_pnl += pnl
-                print(colored(f"🔚 STRICT CLOSE {side} reason={reason} pnl={fmt(pnl)} total={fmt(compound_pnl)}","magenta"))
+                log_i(f"STRICT CLOSE {side} reason={reason} pnl={fmt(pnl)} total={fmt(compound_pnl)}")
                 logging.info(f"STRICT_CLOSE {side} pnl={pnl} total={compound_pnl}")
                 _reset_after_close(reason, prev_side=side)
                 return
             qty_to_close = safe_qty(left_qty)
             attempts += 1
-            print(colored(f"⚠️ strict close retry {attempts}/{CLOSE_RETRY_ATTEMPTS} — residual={fmt(left_qty,4)}","yellow"))
+            log_w(f"strict close retry {attempts}/{CLOSE_RETRY_ATTEMPTS} — residual={fmt(left_qty,4)}")
             time.sleep(CLOSE_VERIFY_WAIT_S)
         except Exception as e:
             last_error = e; logging.error(f"close_market_strict attempt {attempts+1}: {e}"); attempts += 1; time.sleep(CLOSE_VERIFY_WAIT_S)
-    print(colored(f"❌ STRICT CLOSE FAILED after {CLOSE_RETRY_ATTEMPTS} attempts — last error: {last_error}", "red"))
+    log_e(f"STRICT CLOSE FAILED after {CLOSE_RETRY_ATTEMPTS} attempts — last error: {last_error}")
     logging.critical(f"STRICT CLOSE FAILED — last_error={last_error}")
 
 def _reset_after_close(reason, prev_side=None):
@@ -907,33 +970,32 @@ def _reset_after_close(reason, prev_side=None):
         "pnl": 0.0, "bars": 0, "trail": None, "breakeven": None,
         "tp1_done": False, "highest_profit_pct": 0.0, "profit_targets_achieved": 0
     })
-    # انتظر الإشارة العكسية من RF
+    # SAVE CLOSED STATE
+    save_state({"in_position": False, "position_qty": 0})
+    
     if prev_side == "long":  wait_for_next_signal_side = "sell"
     elif prev_side == "short": wait_for_next_signal_side = "buy"
     else: wait_for_next_signal_side = None
     logging.info(f"AFTER_CLOSE waiting_for={wait_for_next_signal_side}")
 
 def close_partial(frac, reason):
-    """إغلاق جزئي + حارس البواقي + قفل نهائي لو الباقي ≤ FINAL_CHUNK_QTY"""
     if not STATE["open"] or STATE["qty"]<=0: return
     qty_close = safe_qty(max(0.0, STATE["qty"] * min(max(frac,0.0),1.0)))
     px = price_now() or STATE["entry"]
-    # احترام أقل كمية
     min_unit = max(RESIDUAL_MIN_QTY, LOT_MIN or RESIDUAL_MIN_QTY)
     if qty_close < min_unit:
-        print(colored(f"⏸️ skip partial (amount={fmt(qty_close,4)} < min_unit={fmt(min_unit,4)})", "yellow"))
+        log_w(f"skip partial (amount={fmt(qty_close,4)} < min_unit={fmt(min_unit,4)})")
         return
     side = "sell" if STATE["side"]=="long" else "buy"
     if MODE_LIVE:
         try: ex.create_order(SYMBOL,"market",side,qty_close,None,_params_close())
-        except Exception as e: print(colored(f"❌ partial close: {e}", "red")); return
+        except Exception as e: log_e(f"partial close: {e}"); return
     pnl = (px - STATE["entry"]) * qty_close * (1 if STATE["side"]=="long" else -1)
     STATE["qty"] = safe_qty(STATE["qty"] - qty_close)
     logging.info(f"PARTIAL_CLOSE {reason} qty={qty_close} pnl={pnl} rem={STATE['qty']}")
-    print(colored(f"🔻 PARTIAL {reason} closed={fmt(qty_close,4)} pnl={fmt(pnl)} rem={fmt(STATE['qty'],4)}","magenta"))
-    # Dust / Final chunk rule
+    log_i(f"PARTIAL {reason} closed={fmt(qty_close,4)} pnl={fmt(pnl)} rem={fmt(STATE['qty'],4)}")
     if STATE["qty"] <= FINAL_CHUNK_QTY and STATE["qty"]>0:
-        print(colored(f"🧹 Final chunk ≤ {FINAL_CHUNK_QTY} DOGE → strict close", "yellow"))
+        log_w(f"Final chunk ≤ {FINAL_CHUNK_QTY} DOGE → strict close")
         close_market_strict("FINAL_CHUNK_RULE")
 
 # =================== DYNAMIC TP ===================
@@ -961,29 +1023,23 @@ def _tp_ladder(info, ind, side):
     return tps, frs
 
 def manage_after_entry(df, ind, info):
-    """Breakeven + Dynamic TP + ATR trail + تحديث أعلى ربح"""
     if not STATE["open"] or STATE["qty"]<=0: return
     px = info["price"]; entry=STATE["entry"]; side=STATE["side"]
     rr = (px - entry)/entry*100*(1 if side=="long" else -1)
-    # سلّم ديناميكي
     dyn_tps, dyn_fracs = _tp_ladder(info, ind, side)
     STATE.setdefault("_tp_cache", dyn_tps); STATE["_tp_cache"]=dyn_tps
     STATE.setdefault("_tp_fracs", dyn_fracs); STATE["_tp_fracs"]=dyn_fracs
     k = int(STATE.get("profit_targets_achieved", 0))
-    # TP1 ثابتة القاعدة (لكن تتعدل بالـADX لاحقًا)
     tp1_now = TP1_PCT_BASE*(2.2 if ind.get("adx",0)>=35 else 1.8 if ind.get("adx",0)>=28 else 1.0)
     if (not STATE["tp1_done"]) and rr >= tp1_now:
         close_partial(TP1_CLOSE_FRAC, f"TP1@{tp1_now:.2f}%")
         STATE["tp1_done"]=True
         if rr >= BREAKEVEN_AFTER: STATE["breakeven"]=entry
-    # بقية الأهداف الديناميكية
     if k < len(dyn_tps) and rr >= dyn_tps[k]:
         frac = dyn_fracs[k] if k < len(dyn_fracs) else 0.25
         close_partial(frac, f"TP_dyn@{dyn_tps[k]:.2f}%")
         STATE["profit_targets_achieved"] = k + 1
-    # أعلى ربح
     if rr > STATE["highest_profit_pct"]: STATE["highest_profit_pct"]=rr
-    # تريل ATR بعد تفعيل حد الربح
     if rr >= TRAIL_ACTIVATE_PCT and ind.get("atr",0)>0:
         gap = ind["atr"] * ATR_TRAIL_MULT
         if side=="long":
@@ -997,7 +1053,6 @@ def manage_after_entry(df, ind, info):
             if STATE["breakeven"] is not None: STATE["trail"] = min(STATE["trail"], STATE["breakeven"])
             if px > STATE["trail"]: close_market_strict(f"TRAIL_ATR({ATR_TRAIL_MULT}x)")
     
-    # === [ADDON] SMART TRADE MANAGEMENT ===
     def tighten_fn():
         if STATE["trail"] is not None:
             current_price = price_now() or STATE["entry"]
@@ -1005,11 +1060,11 @@ def manage_after_entry(df, ind, info):
                 STATE["trail"] = current_price - (gap * 0.5)
             else:
                 STATE["trail"] = current_price + (gap * 0.5)
-            print("🔧 tightened trail")
+            log_i("tightened trail")
 
     def breakeven_fn():
         STATE["breakeven"] = STATE["entry"]
-        print("🎯 breakeven activated")
+        log_i("breakeven activated")
 
     def partial_fn(frac, reason):
         close_partial(frac, reason)
@@ -1049,21 +1104,16 @@ def trade_loop():
             bal = balance_usdt()
             px  = price_now()
             df  = fetch_ohlcv()
-            info = rf_signal_live(df)             # ⚡ RF على الشمعة الحيّة
+            info = rf_signal_live(df)
             ind  = compute_indicators(df)
             spread_bps = orderbook_spread_bps()
-            # PnL snapshot
             if STATE["open"] and px:
                 STATE["pnl"] = (px-STATE["entry"])*STATE["qty"] if STATE["side"]=="long" else (STATE["entry"]-px)*STATE["qty"]
-            # إدارة بعد الدخول
             manage_after_entry(df, ind, {"price": px or info["price"], **info})
-            # تأخير الدخول لو السبريد كبير
             reason=None
             if spread_bps is not None and spread_bps > MAX_SPREAD_BPS:
                 reason=f"spread too high ({fmt(spread_bps,2)}bps > {MAX_SPREAD_BPS})"
-            # الدخول من RF فقط
             sig = "buy" if (ENTRY_RF_ONLY and info["long"]) else ("sell" if (ENTRY_RF_ONLY and info["short"]) else None)
-            # سياسة الانتظار العكسية
             if not STATE["open"] and sig and reason is None:
                 if wait_for_next_signal_side and sig != wait_for_next_signal_side:
                     reason=f"waiting opposite RF: need {wait_for_next_signal_side.upper()}"
@@ -1080,7 +1130,7 @@ def trade_loop():
             sleep_s = NEAR_CLOSE_S if time_to_candle_close(df)<=10 else BASE_SLEEP
             time.sleep(sleep_s)
         except Exception as e:
-            print(colored(f"❌ loop error: {e}\n{traceback.format_exc()}", "red"))
+            log_e(f"loop error: {e}\n{traceback.format_exc()}")
             logging.error(f"trade_loop error: {e}\n{traceback.format_exc()}")
             time.sleep(BASE_SLEEP)
 
@@ -1113,11 +1163,11 @@ def health():
 def keepalive_loop():
     url=(SELF_URL or "").strip().rstrip("/")
     if not url:
-        print(colored("⛔ keepalive disabled (SELF_URL not set)", "yellow"))
+        log_w("keepalive disabled (SELF_URL not set)")
         return
     import requests
     sess=requests.Session(); sess.headers.update({"User-Agent":"rf-live-bot/keepalive"})
-    print(colored(f"KEEPALIVE every 50s → {url}", "cyan"))
+    log_i(f"KEEPALIVE every 50s → {url}")
     while True:
         try: sess.get(url, timeout=8)
         except Exception: pass
@@ -1125,13 +1175,23 @@ def keepalive_loop():
 
 # =================== BOOT ===================
 if __name__ == "__main__":
+    log_banner("INIT")
+    state = load_state() or {}
+    state.setdefault("in_position", False)
+
+    if RESUME_ON_RESTART:
+        try:
+            state = resume_open_position(ex, SYMBOL, state)
+        except Exception as e:
+            log_w(f"resume error: {e}\n{traceback.format_exc()}")
+
     print(colored(f"MODE: {'LIVE' if MODE_LIVE else 'PAPER'}  •  {SYMBOL}  •  {INTERVAL}", "yellow"))
     print(colored(f"RISK: {int(RISK_ALLOC*100)}% × {LEVERAGE}x  •  RF_LIVE={RF_LIVE_ONLY}", "yellow"))
     print(colored(f"ENTRY: RF ONLY  •  FINAL_CHUNK_QTY={FINAL_CHUNK_QTY}", "yellow"))
     logging.info("service starting…")
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
     signal.signal(signal.SIGINT,  lambda *_: sys.exit(0))
-    # Threads
+    
     import threading
     threading.Thread(target=trade_loop, daemon=True).start()
     threading.Thread(target=keepalive_loop, daemon=True).start()
