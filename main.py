@@ -1,106 +1,7 @@
-# -*- coding: utf-8 -*-
-"""
-RF Futures Bot — RF-LIVE ONLY (BingX Perp via CCXT)
-• Entry: Range Filter (TradingView-like) — LIVE CANDLE ONLY
-• Post-entry: Dynamic TP ladder + Breakeven + ATR-trailing
-• Strict close with exchange verification
-• Opposite-signal wait policy after a close
-• Dust guard: force close if remaining ≤ FINAL_CHUNK_QTY (default 40 DOGE)
-• Flask /metrics + /health + rotated logging
-"""
 
-import os, time, math, random, signal, sys, traceback, logging
-from logging.handlers import RotatingFileHandler
-from datetime import datetime
-import pandas as pd
 import ccxt
-from flask import Flask, jsonify
-from decimal import Decimal, ROUND_DOWN, InvalidOperation
 
-try:
-    from termcolor import colored
-except Exception:
-    def colored(t,*a,**k): return t
-
-# =================== ENV / MODE ===================
-API_KEY = os.getenv("BINGX_API_KEY", "")
-API_SECRET = os.getenv("BINGX_API_SECRET", "")
-MODE_LIVE = bool(API_KEY and API_SECRET)
-
-SELF_URL = os.getenv("SELF_URL", "") or os.getenv("RENDER_EXTERNAL_URL", "")
-PORT = int(os.getenv("PORT", 5000))
-
-# =================== SETTINGS ===================
-SYMBOL     = os.getenv("SYMBOL", "DOGE/USDT:USDT")
-INTERVAL   = os.getenv("INTERVAL", "15m")
-LEVERAGE   = int(os.getenv("LEVERAGE", 10))
-RISK_ALLOC = float(os.getenv("RISK_ALLOC", 0.60))   # 60% من الرصيد
-POSITION_MODE = os.getenv("BINGX_POSITION_MODE", "oneway")  # oneway/hedge
-
-# RF (TradingView-like) — live candle only
-RF_SOURCE = "close"
-RF_PERIOD = int(os.getenv("RF_PERIOD", 20))
-RF_MULT   = float(os.getenv("RF_MULT", 3.5))
-RF_LIVE_ONLY = True
-RF_HYST_BPS  = 6.0  # كسر واضح عن الفلتر لتقليل الفليكر على الشمعة الحيّة
-
-# Indicators
-RSI_LEN = 14
-ADX_LEN = 14
-ATR_LEN = 14
-
-# دخول فقط من RF (لا أي مدخلات أخرى)
-ENTRY_RF_ONLY = True
-
-# Spread guard
-MAX_SPREAD_BPS = float(os.getenv("MAX_SPREAD_BPS", 6.0))
-
-# Dynamic TP / trail
-TP1_PCT_BASE       = 0.40
-TP1_CLOSE_FRAC     = 0.50
-BREAKEVEN_AFTER    = 0.30
-TRAIL_ACTIVATE_PCT = 1.20
-ATR_TRAIL_MULT     = 1.6
-
-# سلّم الأهداف الافتراضي
-TREND_TPS       = [0.50, 1.00, 1.80]
-TREND_TP_FRACS  = [0.30, 0.30, 0.20]
-
-# Dust guard / final chunk
-FINAL_CHUNK_QTY = float(os.getenv("FINAL_CHUNK_QTY", 40.0))  # <= 40 DOGE → strict close
-RESIDUAL_MIN_QTY = float(os.getenv("RESIDUAL_MIN_QTY", 9.0)) # أقل كمية بعد الجزئي (min lot)
-
-# Strict close
-CLOSE_RETRY_ATTEMPTS = 6
-CLOSE_VERIFY_WAIT_S  = 2.0
-
-# Pacing
-BASE_SLEEP   = 5
-NEAR_CLOSE_S = 1
-
-# =================== LOGGING ===================
-def setup_file_logging():
-    logger = logging.getLogger()
-    logger.setLevel(logging.INFO)
-    if not any(isinstance(h, RotatingFileHandler) and getattr(h, "baseFilename", "").endswith("bot.log")
-               for h in logger.handlers):
-        fh = RotatingFileHandler("bot.log", maxBytes=5_000_000, backupCount=7, encoding="utf-8")
-        fh.setFormatter(logging.Formatter("%(asctime)s %(levelname)s: %(message)s"))
-        logger.addHandler(fh)
-    logging.getLogger('werkzeug').setLevel(logging.ERROR)
-    print(colored("🗂️ log rotation ready", "cyan"))
-
-setup_file_logging()
-
-# =================== EXCHANGE ===================
-def make_ex():
-    return ccxt.bingx({
-        "apiKey": API_KEY,
-        "secret": API_SECRET,
-        "enableRateLimit": True,
-        "timeout": 20000,
-        "options": {"defaultType": "swap"}
-    })
+# ===============
 
 ex = make_ex()
 MARKET = {}
@@ -572,51 +473,7 @@ def trade_loop():
 app = Flask(__name__)
 @app.route("/")
 def home():
-    mode='LIVE' if MODE_LIVE else 'PAPER'
-    return f"✅ RF-LIVE Bot — {SYMBOL} {INTERVAL} — {mode} — Entry: RF LIVE only — Dynamic TP — Strict Close"
-
-@app.route("/metrics")
-def metrics():
-    return jsonify({
-        "symbol": SYMBOL, "interval": INTERVAL, "mode": "live" if MODE_LIVE else "paper",
-        "leverage": LEVERAGE, "risk_alloc": RISK_ALLOC, "price": price_now(),
-        "state": STATE, "compound_pnl": compound_pnl,
-        "entry_mode": "RF_LIVE_ONLY", "wait_for_next_signal": wait_for_next_signal_side,
-        "guards": {"max_spread_bps": MAX_SPREAD_BPS, "final_chunk_qty": FINAL_CHUNK_QTY}
-    })
-
-@app.route("/health")
-def health():
-    return jsonify({
-        "ok": True, "mode": "live" if MODE_LIVE else "paper",
-        "open": STATE["open"], "side": STATE["side"], "qty": STATE["qty"],
-        "compound_pnl": compound_pnl, "timestamp": datetime.utcnow().isoformat(),
         "entry_mode": "RF_LIVE_ONLY", "wait_for_next_signal": wait_for_next_signal_side
     }), 200
 
-def keepalive_loop():
-    url=(SELF_URL or "").strip().rstrip("/")
-    if not url:
-        print(colored("⛔ keepalive disabled (SELF_URL not set)", "yellow"))
-        return
-    import requests
-    sess=requests.Session(); sess.headers.update({"User-Agent":"rf-live-bot/keepalive"})
-    print(colored(f"KEEPALIVE every 50s → {url}", "cyan"))
-    while True:
-        try: sess.get(url, timeout=8)
-        except Exception: pass
-        time.sleep(50)
-
-# =================== BOOT ===================
-if __name__ == "__main__":
-    print(colored(f"MODE: {'LIVE' if MODE_LIVE else 'PAPER'}  •  {SYMBOL}  •  {INTERVAL}", "yellow"))
-    print(colored(f"RISK: {int(RISK_ALLOC*100)}% × {LEVERAGE}x  •  RF_LIVE={RF_LIVE_ONLY}", "yellow"))
-    print(colored(f"ENTRY: RF ONLY  •  FINAL_CHUNK_QTY={FINAL_CHUNK_QTY}", "yellow"))
-    logging.info("service starting…")
-    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
-    signal.signal(signal.SIGINT,  lambda *_: sys.exit(0))
-    # Threads
-    import threading
-    threading.Thread(target=trade_loop, daemon=True).start()
-    threading.Thread(target=keepalive_loop, daemon=True).start()
     app.run(host="0.0.0.0", port=PORT, debug=False, use_reloader=False)
