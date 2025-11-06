@@ -9,7 +9,7 @@ RF Futures Bot — RF-LIVE ONLY (BingX Perp via CCXT)
 • Flask /metrics + /health + rotated logging
 • [ADDON] SMC كامل + Golden Zones + RSI+MA Boost + EVX + وضعين تداول
 • [ADDON] Bookmap-Lite + Volume Flow + Shadow Dashboard + Recovery System
-• [NEW] Flow-Pressure + Golden Entry + Smart Source Labeling
+• [NEW] State Persistence + Safe-Reconcile Mode + Manual Control Endpoints
 """
 
 import os, time, math, random, signal, sys, traceback, logging, json
@@ -44,7 +44,7 @@ SHADOW_MODE_DASHBOARD = False
 DRY_RUN = False
 
 # ==== Addon: Logging + Recovery Settings ====
-BOT_VERSION = "DOGE SmartMoney Fusion v2.1 — Flow-Pressure + Golden Entry + Smart Source"
+BOT_VERSION = "DOGE SmartMoney Fusion v2.3 — State Persistence + Safe-Reconcile"
 print("🔁 Booting:", BOT_VERSION, flush=True)
 
 STATE_PATH = "./bot_state.json"
@@ -66,6 +66,14 @@ DELTA_EDGE = 1.5
 WALL_PROX_BPS = 8.0
 FLOW_VOTE  = 2
 FLOW_SCORE = 1.2
+
+# =================== FVG SETTINGS ===================
+FVG_MIN_BPS        = 8.0     # أقل فجوة معتبرة (bps)
+FVG_MIN_DISPLACE   = 0.60    # قوة الاندفاع قبل الفجوة
+FVG_MAX_LOOKBACK   = 60      # عدد الشموع القصوى للفحص
+FVG_RETEST_OK_BPS  = 4.0     # قرب إعادة الاختبار لاتخاذ tighten
+FVG_VOTE           = 2
+FVG_SCORE          = 1.1
 
 # =================== SETTINGS ===================
 SYMBOL     = os.getenv("SYMBOL", "DOGE/USDT:USDT")
@@ -173,6 +181,125 @@ def load_state() -> dict:
         log_w(f"state load failed: {e}")
     return {}
 
+# =================== STATE PERSISTENCE & RECONCILE ===================
+STATE_FILE = "STATE.json"
+
+def save_state_snapshot(extra=None):
+    """حفظ لقطة للحالة الحالية مع طابع زمني"""
+    snap = {
+        "ts": int(time.time()),
+        "in_position": bool(STATE.get("open")),
+        "side": STATE.get("side"),
+        "entry": STATE.get("entry"),
+        "qty": STATE.get("qty"),
+        "leverage": LEVERAGE,
+        "tp1_done": STATE.get("tp1_done", False),
+        "breakeven_armed": STATE.get("breakeven_armed", False),
+        "trail_active": STATE.get("trail_active", False),
+        "trail": STATE.get("trail"),
+        "source": STATE.get("source"),
+        "symbol": SYMBOL,
+        "last_order_id": STATE.get("last_order_id"),
+        "safe_reconcile": STATE.get("safe_reconcile", False),
+        "compound_pnl": compound_pnl
+    }
+    if extra:
+        snap.update(extra)
+    try:
+        with open(STATE_FILE, "w", encoding="utf-8") as f:
+            json.dump(snap, f, ensure_ascii=False, indent=2)
+        if LOG_ADDONS:
+            log_i(f"STATE SNAPSHOT: {STATE_FILE}")
+    except Exception as e:
+        log_w(f"save_state_snapshot error: {e}")
+
+def load_state_snapshot():
+    """تحميل الحالة المحفوظة"""
+    try:
+        with open(STATE_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception as e:
+        log_w(f"load_state_snapshot: {e}")
+        return None
+
+def resume_or_reconcile_on_start():
+    """استئناف الحالة من الملف المحلي مع وضع المصالحة الآمن"""
+    global compound_pnl
+    
+    snap = load_state_snapshot()
+    if not snap:
+        log_i("RESUME: no local state, starting fresh")
+        STATE.update({"safe_reconcile": False})
+        return
+
+    # تحقق من عمر الحالة (لا نستعيد حالة قديمة أكثر من 24 ساعة)
+    state_age = time.time() - snap.get("ts", 0)
+    if state_age > 24 * 3600:  # 24 ساعة
+        log_w(f"RESUME: ignoring old state ({state_age/3600:.1f}h)")
+        STATE.update({"safe_reconcile": False})
+        return
+
+    # استعادة الـ compound_pnl
+    compound_pnl = snap.get("compound_pnl", 0.0)
+
+    # لو كان في صفقة بحسب الملف المحلي
+    if snap.get("in_position"):
+        STATE.update({
+            "open": True,
+            "side": snap.get("side"),
+            "entry": snap.get("entry"),
+            "qty": snap.get("qty", 0.0),
+            "tp1_done": snap.get("tp1_done", False),
+            "breakeven_armed": snap.get("breakeven_armed", False),
+            "trail_active": snap.get("trail_active", False),
+            "trail": snap.get("trail"),
+            "source": snap.get("source", "resume"),
+            "safe_reconcile": True  # ← تفعيل وضع المصالحة الآمن
+        })
+        
+        log_w(f"🔄 RESUME: local position restored - {STATE['side'].upper()} {STATE['qty']} @ {STATE['entry']}")
+        log_w("🔒 SAFE-RECONCILE MODE activated - verifying position...")
+        
+        # محاولة التحقق من المنصة (BingX محدود ولكن نحاول)
+        try:
+            # طريقة بديلة للتحقق: جلب الرصيد وأوامر مفتوحة
+            balance = balance_usdt()
+            log_i(f"RESUME: current balance = {balance}")
+        except Exception as e:
+            log_w(f"RESUME: platform check limited - {e}")
+            
+    else:
+        STATE.update({"safe_reconcile": False})
+        log_i("RESUME: local state shows flat position")
+
+def log_resume_banner():
+    """لوج واضح لحالة الاستئناف"""
+    if STATE.get("safe_reconcile"):
+        log_w("🔒 SAFE-RECONCILE MODE ACTIVE")
+        log_w("📋 No new entries until position is confirmed/manually resolved")
+        log_w("💡 Use /reconcile/confirm endpoint after verifying position on exchange")
+    else:
+        log_g("✅ NORMAL MODE - entries allowed")
+
+# دالة مساعدة للتحقق من وجود صفقات مفتوحة (محاولة مع BingX)
+def attempt_position_verification():
+    """محاولة التحقق من الصفقات المفتوحة مع منصة BingX"""
+    try:
+        # طريقة بديلة: جلب الأوامر المفتوحة
+        open_orders = ex.fetch_open_orders(SYMBOL)
+        if open_orders:
+            log_i(f"RESUME: found {len(open_orders)} open orders")
+        
+        # جلب الرصيد للتحقق غير المباشر
+        balance = balance_usdt()
+        if balance:
+            log_i(f"RESUME: account balance = {balance:.2f} USDT")
+            
+        return True
+    except Exception as e:
+        log_w(f"RESUME: position verification limited - {e}")
+        return False
+
 # =================== EXECUTION VERIFICATION ===================
 def verify_execution_environment():
     """التحقق من بيئة التنفيذ عند الإقلاع"""
@@ -185,6 +312,19 @@ def verify_execution_environment():
         print("🟡 WARNING: EXECUTE_ORDERS=False - البوت في وضع التحليل فقط!", flush=True)
     if DRY_RUN:
         print("🟡 WARNING: DRY_RUN=True - البوت في وضع المحاكاة!", flush=True)
+
+# =================== SAFE CASTING HELPERS ===================
+def _to_float(x):
+    """يحوّل أي pandas/numpy scalar/Series لقيمة float نظيفة"""
+    try:
+        if hasattr(x, "item"):
+            return float(x.item())
+        return float(np.asarray(x).astype("float64"))
+    except Exception:
+        try:
+            return float(x)
+        except Exception:
+            return None
 
 # =================== ENHANCED INDICATORS ===================
 def sma(series, n: int):
@@ -338,36 +478,94 @@ def decide_strategy_mode(df, adx=None, di_plus=None, di_minus=None, rsi_ctx=None
     
     return {"mode": mode, "why": why}
 
-# =================== FLOW-PRESSURE INDICATOR ===================
+# =================== FLOW-PRESSURE INDICATOR (FIXED) ===================
 def compute_flow_pressure(ex, symbol, now_px, lookback_sec=120):
-    """مؤشر ضغط التداول الحقيقي من Order Book + Trade Flow"""
+    """مؤشر ضغط التداول الحقيقي من Order Book + Trade Flow - الإصدار المصحح"""
     try:
+        now_px = _to_float(now_px)
+        if now_px is None:
+            return {"ok": False}
+
         ob = ex.fetch_order_book(symbol, limit=50)
         bids = ob.get("bids", [])[:30]; asks = ob.get("asks", [])[:30]
-        w = lambda p: 1.0/max(1e-9, abs(p-now_px))
-        bpow = sum(q*w(p) for p,q in bids); apow = sum(q*w(p) for p,q in asks)
-        obi = (apow - bpow) / max(1e-9,(apow+bpow))  # + = sellers
 
-        since = int((time.time()-lookback_sec)*1000)
-        try: trades = ex.fetch_trades(symbol, since=since, limit=200)
-        except: trades = []
-        buyv = sum(t["amount"] for t in trades if str(t.get("side","")).lower()=="buy")
-        sellv= sum(t["amount"] for t in trades if str(t.get("side","")).lower()=="sell")
-        delta = (buyv - sellv)
+        def _w(p): 
+            p = _to_float(p)
+            return 0.0 if p is None else 1.0 / max(1e-9, abs(p - now_px))
 
-        ask_p = min(asks, key=lambda x:x[0])[0] if asks else None
-        bid_p = max(bids, key=lambda x:x[0])[0] if bids else None
-        ask_bps = abs((ask_p-now_px)/now_px)*10000.0 if ask_p else None
-        bid_bps = abs((bid_p-now_px)/now_px)*10000.0 if bid_p else None
-        wall_close = (ask_bps and ask_bps<=WALL_PROX_BPS) or (bid_bps and bid_bps<=WALL_PROX_BPS)
+        def _q(q):
+            try:
+                return float(q)
+            except Exception:
+                return 0.0
 
-        return {"ok":True,"obi":obi,"delta":delta,
-                "big_sellers": (obi>=OBI_EDGE) or (delta<-DELTA_EDGE),
-                "big_buyers":  (obi<=-OBI_EDGE) or (delta> DELTA_EDGE),
-                "wall_close": bool(wall_close)}
+        b_power = sum(_q(q)*_w(p) for p, q in bids)
+        a_power = sum(_q(q)*_w(p) for p, q in asks)
+        denom = max(1e-9, (a_power + b_power))
+        obi = (a_power - b_power) / denom  # +ve = sellers pressure
+
+        since = int((time.time() - lookback_sec) * 1000)
+        try:
+            trades = ex.fetch_trades(symbol, since=since, limit=200)
+        except Exception:
+            trades = []
+        buyv = sum(_q(t.get("amount")) for t in trades if str(t.get("side","")).lower()=="buy")
+        sellv= sum(_q(t.get("amount")) for t in trades if str(t.get("side","")).lower()=="sell")
+        delta = buyv - sellv
+
+        ask_p = min(asks, key=lambda x: _to_float(x[0]) or 9e18)[0] if asks else None
+        bid_p = max(bids, key=lambda x: _to_float(x[0]) or -9e18)[0] if bids else None
+        ask_bps = abs((_to_float(ask_p)-now_px)/now_px)*10000.0 if ask_p is not None else None
+        bid_bps = abs((now_px-_to_float(bid_p))/now_px)*10000.0 if bid_p is not None else None
+        wall_close = (ask_bps is not None and ask_bps<=WALL_PROX_BPS) or (bid_bps is not None and bid_bps<=WALL_PROX_BPS)
+
+        return {
+            "ok": True, "obi": obi, "delta": delta,
+            "big_sellers": (obi>=OBI_EDGE) or (delta<-DELTA_EDGE),
+            "big_buyers":  (obi<=-OBI_EDGE) or (delta> DELTA_EDGE),
+            "wall_close": bool(wall_close)
+        }
     except Exception as e:
-        log_w(f"flowx err: {e}")
-        return {"ok":False}
+        log_w(f"compute_flow_pressure error: {e}")
+        return {"ok": False}
+
+# =================== FVG DETECTION ===================
+def detect_fvg(df):
+    """يرصد فجوة عادلة صاعدة/هابطة مع مستوياتها."""
+    try:
+        n = min(len(df), FVG_MAX_LOOKBACK)
+        if n < 5:
+            return {"ok": False}
+        d = df.iloc[-n:].copy()
+
+        def _f(x): 
+            try: return float(x)
+            except: return None
+
+        bull = bear = None
+        # قاعدة كلاسيك: candle(i-2) و candle(i) لا تتلامس أجسامها/ذيولها
+        for i in range(2, len(d)):
+            h2 = _f(d["high"].iloc[i-2]); l2 = _f(d["low"].iloc[i-2])
+            o1 = _f(d["open"].iloc[i-1]); c1 = _f(d["close"].iloc[i-1])
+            h0 = _f(d["high"].iloc[i]);  l0 = _f(d["low"].iloc[i])
+            if None in (h2,l2,o1,c1,h0,l0): 
+                continue
+
+            disp = abs((c1 - o1) / max(1e-9, o1))  # اندفاع سابق
+            # فجوة صاعدة: low الحالية أعلى من high قبل شمعتين
+            gap_up_bps = (l0 - h2) / max(1e-9, h2) * 10000.0
+            if gap_up_bps >= FVG_MIN_BPS and disp >= FVG_MIN_DISPLACE:
+                bull = {"type":"bull","gap_bps":gap_up_bps,"level_bot":h2,"level_top":l0}
+
+            # فجوة هابطة: low قبل شمعتين أعلى من high الحالية
+            gap_dn_bps = (l2 - h0) / max(1e-9, h0) * 10000.0
+            if gap_dn_bps >= FVG_MIN_BPS and disp >= FVG_MIN_DISPLACE:
+                bear = {"type":"bear","gap_bps":gap_dn_bps,"level_bot":h0,"level_top":l2}
+
+        return {"ok": bool(bull or bear), "bull": bull, "bear": bear}
+    except Exception as e:
+        log_w(f"detect_fvg err: {e}")
+        return {"ok": False}
 
 # =================== POSITION RECOVERY ===================
 def _normalize_side(pos):
@@ -610,7 +808,7 @@ def compute_flow_metrics(df):
         if len(df) < max(30, FLOW_WINDOW+2):
             return {"ok": False, "why": "short_df"}
         close = df["close"].astype(float).copy()
-        vol = df["volume"].astotype(float).copy()
+        vol = df["volume"].astype(float).copy()
         up_mask = close.diff().fillna(0) > 0
         up_vol = (vol * up_mask).astype(float)
         dn_vol = (vol * (~up_mask)).astype(float)
@@ -629,7 +827,7 @@ def compute_flow_metrics(df):
 # ========= Unified snapshot emitter =========
 def emit_snapshots(exchange, symbol, df, balance_fn=None, pnl_fn=None):
     """
-    يطبع Snapshot موحّد: Bookmap + Flow + Council + Strategy + Balance/PnL
+    يطبع Snapshot موحّد: Bookmap + Flow + Council + Strategy + Balance/PnL + FVG
     """
     try:
         bm = bookmap_snapshot(exchange, symbol)
@@ -637,6 +835,12 @@ def emit_snapshots(exchange, symbol, df, balance_fn=None, pnl_fn=None):
         cv = council_votes_pro(df)
         mode = decide_strategy_mode(df)
         gz = golden_zone_check(df, {"adx": cv["ind"]["adx"]}, "buy" if cv["b"]>=cv["s"] else "sell")
+        
+        # --- FVG in snapshots + logs ---
+        fvg = detect_fvg(df)
+        
+        # إضافة FVG للـsnapshots
+        snap_data = {"bm": bm, "flow": flow, "cv": cv, "mode": mode, "gz": gz, "fvg": fvg}
 
         bal = None; cpnl = None
         if callable(balance_fn):
@@ -645,6 +849,15 @@ def emit_snapshots(exchange, symbol, df, balance_fn=None, pnl_fn=None):
         if callable(pnl_fn):
             try: cpnl = pnl_fn()
             except: cpnl = None
+
+        # --- FVG logging ---
+        if fvg.get("ok"):
+            if fvg.get("bull"):
+                log_i(f"FVG: 🟢 bull {fvg['bull']['gap_bps']:.1f}bps "
+                      f"@ {fvg['bull']['level_bot']:.6f}–{fvg['bull']['level_top']:.6f}")
+            if fvg.get("bear"):
+                log_i(f"FVG: 🔴 bear {fvg['bear']['gap_bps']:.1f}bps "
+                      f"@ {fvg['bear']['level_bot']:.6f}–{fvg['bear']['level_top']:.6f}")
 
         if bm.get("ok"):
             imb_tag = "🟢" if bm["imbalance"]>=IMBALANCE_ALERT else ("🔴" if bm["imbalance"]<=1/IMBALANCE_ALERT else "⚖️")
@@ -691,22 +904,31 @@ def emit_snapshots(exchange, symbol, df, balance_fn=None, pnl_fn=None):
             flow_z = flow['delta_z'] if flow and flow.get('ok') else 0.0
             bm_imb = bm['imbalance'] if bm and bm.get('ok') else 1.0
             
+            # إضافة FVG للـsnap
+            fvg_note = ""
+            if fvg and fvg.get("ok"):
+                if fvg.get("bull"): 
+                    fvg_note = f" | 🟢FVG+{fvg['bull']['gap_bps']:.1f}bps"
+                elif fvg.get("bear"):
+                    fvg_note = f" | 🔴FVG-{fvg['bear']['gap_bps']:.1f}bps"
+            
             print(f"🧠 SNAP | {side_hint} | votes={cv['b']}/{cv['s']} score={cv['score_b']:.1f}/{cv['score_s']:.1f} "
                   f"| ADX={cv['ind'].get('adx',0):.1f} DI={cv['ind'].get('di_spread',0):.1f} | "
-                  f"z={flow_z:.2f} | imb={bm_imb:.2f}{gz_snap_note}", 
+                  f"z={flow_z:.2f} | imb={bm_imb:.2f}{gz_snap_note}{fvg_note}", 
                   flush=True)
             
             print("✅ ADDONS LIVE", flush=True)
 
-        return {"bm": bm, "flow": flow, "cv": cv, "mode": mode, "gz": gz, "wallet": wallet}
+        snap_data["wallet"] = wallet
+        return snap_data
     except Exception as e:
         print(f"🟨 AddonLog error: {e}", flush=True)
         return {"bm": None, "flow": None, "cv": {"b":0,"s":0,"score_b":0.0,"score_s":0.0,"ind":{}},
-                "mode": {"mode":"n/a"}, "gz": None, "wallet": ""}
+                "mode": {"mode":"n/a"}, "gz": None, "fvg": {"ok":False}, "wallet": ""}
 
 # =================== ENHANCED COUNCIL VOTING ===================
 def council_votes_pro_enhanced(df):
-    """مجلس تصويت محسّن مع Flow-Pressure + RSI+MA + Golden Zones"""
+    """مجلس تصويت محسّن مع Flow-Pressure + RSI+MA + Golden Zones + FVG"""
     try:
         ind = compute_indicators(df)
         rsi_ctx = rsi_ma_context(df)
@@ -737,6 +959,24 @@ def council_votes_pro_enhanced(df):
                 votes_s += FLOW_VOTE  
                 score_s += FLOW_SCORE
                 logs.append(f"🔴 FlowX BIG SELLERS | obi={flowx['obi']:.2f} Δ={flowx['delta']:.2f}")
+
+        # --- FVG voting boost ---
+        try:
+            # استخدم emit_snapshots الحالي الذي أضفنا له FVG
+            snap = emit_snapshots(ex, SYMBOL, df)
+            fvg = snap.get("fvg", {"ok":False})
+        except Exception:
+            fvg = {"ok": False}
+
+        if fvg.get("ok"):
+            if fvg.get("bull"):
+                votes_b += FVG_VOTE
+                score_b += FVG_SCORE
+                logs.append(f"🟢 FVG bull +{FVG_SCORE}")
+            if fvg.get("bear"):
+                votes_s += FVG_VOTE
+                score_s += FVG_SCORE
+                logs.append(f"🔴 FVG bear +{FVG_SCORE}")
 
         if adx > ADX_TREND_MIN:
             if plus_di > minus_di and di_spread > DI_SPREAD_TREND:
@@ -790,7 +1030,8 @@ def council_votes_pro_enhanced(df):
             "rsi_ma": rsi_ctx["rsi_ma"],
             "rsi_trendz": rsi_ctx["trendZ"],
             "di_spread": di_spread,
-            "gz": gz
+            "gz": gz,
+            "fvg_state": "bull" if fvg.get("bull") else ("bear" if fvg.get("bear") else "none")
         })
 
         return {
@@ -856,7 +1097,13 @@ def setup_trade_management(mode):
 
 # =================== ENHANCED TRADE EXECUTION ===================
 def open_market_enhanced(side, qty, price, source="RF"):
-    """فتح صفقة محسّن مع تسجيل مصدر القرار"""
+    """فتح صفقة محسّن مع التحقق من وضع المصالحة"""
+    
+    # منع فتح صفقات جديدة أثناء وضع المصالحة
+    if STATE.get("safe_reconcile"):
+        log_w(f"🔒 BLOCKED: Cannot open {side} position in SAFE-RECONCILE mode")
+        return False
+        
     if qty <= 0: 
         log_e("skip open (qty<=0)")
         return False
@@ -893,8 +1140,12 @@ def open_market_enhanced(side, qty, price, source="RF"):
             "profit_targets_achieved": 0,
             "mode": mode,
             "management": management_config,
-            "source": source  # ← حفظ مصدر القرار
+            "source": source,
+            "safe_reconcile": False  # تأكيد أننا خارج وضع المصالحة
         })
+        
+        # حفظ الحالة فورًا بعد الفتح
+        save_state_snapshot({"action": "open", "side": side, "price": price, "qty": qty})
         
         # لوج ملون يوضح مصدر القرار
         color = "green" if side == "buy" else "red"
@@ -909,7 +1160,7 @@ def open_market_enhanced(side, qty, price, source="RF"):
             "leverage": LEVERAGE,
             "mode": mode,
             "management": management_config,
-            "source": source,  # ← حفظ في الاستيت
+            "source": source,
             "gz_snapshot": gz if isinstance(gz, dict) else {},
             "cv_snapshot": votes if isinstance(votes, dict) else {},
             "opened_at": int(time.time()),
@@ -1000,7 +1251,8 @@ STATE = {
     "open": False, "side": None, "entry": None, "qty": 0.0,
     "pnl": 0.0, "bars": 0, "trail": None, "breakeven": None,
     "tp1_done": False, "highest_profit_pct": 0.0,
-    "profit_targets_achieved": 0, "source": "Unknown"
+    "profit_targets_achieved": 0, "source": "Unknown",
+    "safe_reconcile": False
 }
 compound_pnl = 0.0
 wait_for_next_signal_side = None
@@ -1065,6 +1317,16 @@ def close_market_strict(reason="STRICT"):
                 source = STATE.get("source", "Unknown")
                 log_i(f"STRICT CLOSE {side} reason={reason} pnl={fmt(pnl)} total={fmt(compound_pnl)} source={source}")
                 logging.info(f"STRICT_CLOSE {side} pnl={pnl} total={compound_pnl} source={source}")
+                
+                # حفظ الحالة قبل الإعادة
+                save_state_snapshot({
+                    "action": "close", 
+                    "reason": reason, 
+                    "pnl": pnl,
+                    "compound_pnl": compound_pnl,
+                    "reconciled": True
+                })
+                
                 _reset_after_close(reason, prev_side=side)
                 return
             qty_to_close = safe_qty(left_qty)
@@ -1083,9 +1345,13 @@ def _reset_after_close(reason, prev_side=None):
         "open": False, "side": None, "entry": None, "qty": 0.0,
         "pnl": 0.0, "bars": 0, "trail": None, "breakeven": None,
         "tp1_done": False, "highest_profit_pct": 0.0, "profit_targets_achieved": 0,
-        "trail_tightened": False, "partial_taken": False, "source": "Unknown"
+        "trail_tightened": False, "partial_taken": False, "source": "Unknown",
+        "safe_reconcile": False  # ← إلغاء وضع المصالحة بعد الإغلاق
     })
     save_state({"in_position": False, "position_qty": 0})
+    
+    # حفظ الحالة النهائية
+    save_state_snapshot({"action": "reset", "reason": reason, "prev_side": prev_side})
     
     if prev_side == "long":  wait_for_next_signal_side = "sell"
     elif prev_side == "short": wait_for_next_signal_side = "buy"
@@ -1094,7 +1360,7 @@ def _reset_after_close(reason, prev_side=None):
 
 # =================== ENHANCED TRADE MANAGEMENT ===================
 def manage_after_entry_enhanced(df, ind, info):
-    """إدارة محسنة للمركز مع خروج ذكي حسب النمط"""
+    """إدارة محسنة للمركز مع حفظ الحالة"""
     if not STATE["open"] or STATE["qty"] <= 0:
         return
 
@@ -1113,10 +1379,14 @@ def manage_after_entry_enhanced(df, ind, info):
 
     snap = emit_snapshots(ex, SYMBOL, df)
     exit_signal = smart_exit_guard(STATE, df, ind, snap["flow"], snap["bm"], 
-                                 px, pnl_pct/100, mode, side, entry)
+                                 px, pnl_pct/100, mode, side, entry, 
+                                 gz=snap.get("gz"), flowx=snap.get("flowx"), fvg=snap.get("fvg"))
     
     if exit_signal["log"]:
         print(f"🔔 {exit_signal['log']}", flush=True)
+
+    # حفظ الحالة عند أي تغيير مهم
+    state_changed = False
 
     if exit_signal["action"] == "partial" and not STATE.get("partial_taken"):
         partial_qty = safe_qty(qty * exit_signal.get("qty_pct", 0.3))
@@ -1128,6 +1398,7 @@ def manage_after_entry_enhanced(df, ind, info):
                     log_g(f"✅ PARTIAL CLOSE: {partial_qty:.4f} | {exit_signal['why']}")
                     STATE["partial_taken"] = True
                     STATE["qty"] = safe_qty(qty - partial_qty)
+                    state_changed = True
                 except Exception as e:
                     log_e(f"❌ Partial close failed: {e}")
             else:
@@ -1137,11 +1408,16 @@ def manage_after_entry_enhanced(df, ind, info):
         STATE["trail_tightened"] = True
         STATE["trail"] = None
         log_i(f"🔄 TRAIL TIGHTENED: {exit_signal['why']}")
+        state_changed = True
     
     elif exit_signal["action"] == "close":
         log_w(f"🚨 SMART EXIT: {exit_signal['why']}")
         close_market_strict(f"smart_exit_{exit_signal['why']}")
         return
+
+    # حفظ الحالة إذا كانت هناك تغييرات
+    if state_changed:
+        save_state_snapshot({"action": "manage_update", "exit_signal": exit_signal["why"]})
 
     current_atr = ind.get("atr", 0.0)
     tp1_pct = management.get("tp1_pct", TP1_PCT_BASE/100.0)
@@ -1158,6 +1434,7 @@ def manage_after_entry_enhanced(df, ind, info):
                 try:
                     ex.create_order(SYMBOL, "market", close_side, close_qty, None, _params_close())
                     log_g(f"✅ TP1 HIT: closed {close_fraction*100}%")
+                    state_changed = True
                 except Exception as e:
                     log_e(f"❌ TP1 close failed: {e}")
             STATE["qty"] = safe_qty(STATE["qty"] - close_qty)
@@ -1168,10 +1445,12 @@ def manage_after_entry_enhanced(df, ind, info):
         STATE["breakeven_armed"] = True
         STATE["breakeven"] = entry
         log_i("BREAKEVEN ARMED")
+        state_changed = True
 
     if not STATE.get("trail_active") and pnl_pct/100 >= trail_activate_pct:
         STATE["trail_active"] = True
         log_i("TRAIL ACTIVATED")
+        state_changed = True
 
     if STATE.get("trail_active"):
         trail_mult = TRAIL_TIGHT_MULT if STATE.get("trail_tightened") else atr_trail_mult
@@ -1179,10 +1458,12 @@ def manage_after_entry_enhanced(df, ind, info):
             new_trail = px - (current_atr * trail_mult)
             if STATE.get("trail") is None or new_trail > STATE["trail"]:
                 STATE["trail"] = new_trail
+                state_changed = True
         else:
             new_trail = px + (current_atr * trail_mult)
             if STATE.get("trail") is None or new_trail < STATE["trail"]:
                 STATE["trail"] = new_trail
+                state_changed = True
 
     if STATE.get("trail"):
         if (side == "long" and px <= STATE["trail"]) or (side == "short" and px >= STATE["trail"]):
@@ -1198,10 +1479,14 @@ def manage_after_entry_enhanced(df, ind, info):
         log_w(f"DUST GUARD: qty {STATE['qty']} <= {FINAL_CHUNK_QTY}, closing...")
         close_market_strict("dust_guard")
 
+    # حفظ الحالة النهائية إذا كانت هناك تغييرات
+    if state_changed:
+        save_state_snapshot({"action": "periodic_manage"})
+
 manage_after_entry = manage_after_entry_enhanced
 
-def smart_exit_guard(state, df, ind, flow, bm, now_price, pnl_pct, mode, side, entry_price):
-    """يقرر: Partial / Tighten / Strict Close مع حماية ربح ذكية"""
+def smart_exit_guard(state, df, ind, flow, bm, now_price, pnl_pct, mode, side, entry_price, gz=None, flowx=None, fvg=None):
+    """يقرر: Partial / Tighten / Strict Close مع حماية ربح ذكية + FVG"""
     atr = ind.get('atr', 0.0)
     adx = ind.get('adx', 0.0)
     rsi = ind.get('rsi', 50.0)
@@ -1240,11 +1525,9 @@ def smart_exit_guard(state, df, ind, flow, bm, now_price, pnl_pct, mode, side, e
                 bm_wall_close = (bps <= BM_WALL_PROX_BPS)
 
     # === حماية ربح ذكية باستخدام Flow-Pressure ===
-    flowx = compute_flow_pressure(ex, SYMBOL, now_price) if now_price else {"ok":False}
+    if flowx is None:
+        flowx = compute_flow_pressure(ex, SYMBOL, now_price) if now_price else {"ok":False}
     
-    # احصل على المناطق الذهبية الحالية
-    gz = golden_zone_check(df, ind)
-
     # Tighten لو ضغط معاكس أو جدار قريب
     if pnl_pct > 0 and flowx and flowx.get("ok"):
         if (side == "long" and flowx["big_sellers"]) or (side == "short" and flowx["big_buyers"]) or flowx["wall_close"]:
@@ -1255,8 +1538,19 @@ def smart_exit_guard(state, df, ind, flow, bm, now_price, pnl_pct, mode, side, e
                 "log": f"🛡️ Tighten by FlowX | sellers={flowx['big_sellers']} buyers={flowx['big_buyers']} wall={flowx['wall_close']}"
             }
 
+    # === FVG retest protection ===
+    if fvg and fvg.get("ok") and pnl_pct > 0:
+        if side == "long" and fvg.get("bear"):
+            top = fvg["bear"]["level_top"]
+            if abs((now_price - top)/top)*10000.0 <= FVG_RETEST_OK_BPS:
+                return {"action":"tighten","why":"bear FVG retest","log":"🛡️ Tighten at bear FVG"}
+        if side == "short" and fvg.get("bull"):
+            bot = fvg["bull"]["level_bot"]
+            if abs((now_price - bot)/bot)*10000.0 <= FVG_RETEST_OK_BPS:
+                return {"action":"tighten","why":"bull FVG retest","log":"🛡️ Tighten at bull FVG"}
+
     # Close قوي لو ظهرت منطقة ذهبية معاكسة بعد TP1
-    if state.get("tp1_done") and gz and gz.get("ok"):
+    if gz and gz.get("ok") and state.get("tp1_done"):
         opp = (gz["zone"]["type"] == "golden_top" and side == "long") or (gz["zone"]["type"] == "golden_bottom" and side == "short")
         if opp and gz.get("score", 0) >= 6.5:
             return {
@@ -1326,7 +1620,8 @@ def pretty_snapshot(bal, info, ind, spread_bps, reason=None, df=None):
         if STATE["open"]:
             lamp='🟩 LONG' if STATE['side']=='long' else '🟥 SHORT'
             source_info = f" | Source={STATE.get('source', 'Unknown')}" if STATE.get('source') else ""
-            print(f"   {lamp}  Entry={fmt(STATE['entry'])}  Qty={fmt(STATE['qty'],4)}  Bars={STATE['bars']}  Trail={fmt(STATE['trail'])}  BE={fmt(STATE['breakeven'])}{source_info}")
+            reconcile_info = " | 🔒SAFE-RECONCILE" if STATE.get('safe_reconcile') else ""
+            print(f"   {lamp}  Entry={fmt(STATE['entry'])}  Qty={fmt(STATE['qty'],4)}  Bars={STATE['bars']}  Trail={fmt(STATE['trail'])}  BE={fmt(STATE['breakeven'])}{source_info}{reconcile_info}")
             print(f"   🎯 TP_done={STATE['profit_targets_achieved']}  HP={fmt(STATE['highest_profit_pct'],2)}%")
         else:
             print("   ⚪ FLAT")
@@ -1337,7 +1632,11 @@ def pretty_snapshot(bal, info, ind, spread_bps, reason=None, df=None):
 
 def trade_loop():
     global wait_for_next_signal_side
-    loop_i=0
+    loop_i = 0
+    
+    # حفظ الحالة الأولية
+    save_state_snapshot({"action": "loop_start"})
+    
     while True:
         try:
             bal = balance_usdt()
@@ -1346,6 +1645,29 @@ def trade_loop():
             info = rf_signal_live(df)
             ind  = compute_indicators(df)
             spread_bps = orderbook_spread_bps()
+            
+            # === منطق المصالحة الآمن ===
+            if STATE.get("safe_reconcile"):
+                # في وضع المصالحة: لا نفتح صفقات جديدة، فقط ندير الموجود
+                reason = f"🔒 SAFE-RECONCILE: managing existing {STATE.get('side', 'unknown')} position"
+                
+                # التحقق الذكي: إذا كان السعر يهدد بخسارة كبيرة، نغلق تلقائيًا
+                if STATE.get("open") and px:
+                    entry = STATE.get("entry", px)
+                    current_pnl_pct = (px - entry) / entry * 100 * (1 if STATE["side"] == "long" else -1)
+                    
+                    # إغلاق تلقائي إذا كانت الخسارة كبيرة (حماية)
+                    if current_pnl_pct <= -3.0:  # خسارة 3%
+                        log_w(f"🛡️ AUTO-CLOSE in reconcile: -{abs(current_pnl_pct):.2f}% loss")
+                        close_market_strict("reconcile_auto_protection")
+                        reason = "AUTO-CLOSED due to protection"
+                
+                # حفظ حالة المصالحة دوريًا
+                if loop_i % 12 == 0:  # كل دقيقة تقريباً
+                    save_state_snapshot({"reconcile_check": True, "price": px})
+                    
+            else:
+                reason = None
             
             # احصل على بيانات المجلس والمناطق الذهبية
             council = council_votes_pro_enhanced(df)
@@ -1357,30 +1679,36 @@ def trade_loop():
                                     balance_fn=lambda: float(bal) if bal else None,
                                     pnl_fn=lambda: float(compound_pnl))
             
-            # === تحديد إشارة الدخول مع الأولوية للقاع/القمة الذهبية ===
+            # === تحديد إشارة الدخول مع منع المصالحة ===
             sig = None
             source = "RF"  # افتراضي
             
-            # Golden Entry override - الأولوية الأولى
-            if gz and gz.get("ok") and ind_council.get("adx",0) >= 20.0:
-                if gz["zone"]["type"] == "golden_bottom" and gz["score"] >= 6.0:
-                    sig, source = "buy", "Golden"
-                elif gz["zone"]["type"] == "golden_top" and gz["score"] >= 6.0:
-                    sig, source = "sell", "Golden"
-            
-            # fallback للسكور العادي من المجلس
-            if sig is None:
-                if council["score_b"] > council["score_s"] and council["score_b"] >= 8.0:
-                    sig, source = "buy", "Council"
-                elif council["score_s"] > council["score_b"] and council["score_s"] >= 8.0:
-                    sig, source = "sell", "Council"
-            
-            # fallback للإشارة التقليدية
-            if sig is None and ENTRY_RF_ONLY:
-                if info["long"]:
-                    sig, source = "buy", "RF"
-                elif info["short"]:
-                    sig, source = "sell", "RF"
+            if not STATE.get("safe_reconcile"):
+                # Golden Entry override - الأولوية الأولى
+                if gz and gz.get("ok") and ind_council.get("adx",0) >= 20.0:
+                    if gz["zone"]["type"] == "golden_bottom" and gz["score"] >= 6.0:
+                        sig, source = "buy", "Golden"
+                    elif gz["zone"]["type"] == "golden_top" and gz["score"] >= 6.0:
+                        sig, source = "sell", "Golden"
+                
+                # fallback للسكور العادي من المجلس
+                if sig is None:
+                    if council["score_b"] > council["score_s"] and council["score_b"] >= 8.0:
+                        sig, source = "buy", "Council"
+                    elif council["score_s"] > council["score_b"] and council["score_s"] >= 8.0:
+                        sig, source = "sell", "Council"
+                
+                # fallback للإشارة التقليدية
+                if sig is None and ENTRY_RF_ONLY:
+                    if info["long"]:
+                        sig, source = "buy", "RF"
+                    elif info["short"]:
+                        sig, source = "sell", "RF"
+            else:
+                # في وضع المصالحة: تسجيل الإشارات المحظورة
+                if (gz and gz.get("ok")) or (council["score_b"] >= 8.0) or (council["score_s"] >= 8.0):
+                    blocked_signal = "BUY" if council["score_b"] >= council["score_s"] else "SELL"
+                    log_i(f"🔒 BLOCKED SIGNAL: {blocked_signal} (safe-reconcile active)")
 
             if STATE["open"] and px:
                 STATE["pnl"] = (px-STATE["entry"])*STATE["qty"] if STATE["side"]=="long" else (STATE["entry"]-px)*STATE["qty"]
@@ -1399,16 +1727,16 @@ def trade_loop():
                 if STATE.get("breakeven_armed"): flags.append("BE")
                 if STATE.get("trail_active"): flags.append("TRAIL")
                 if STATE.get("trail_tightened"): flags.append("TIGHT")
+                if STATE.get("safe_reconcile"): flags.append("RECONCILE🔒")
                 
                 color = "green" if STATE["side"] == "long" else "red"
                 live_log = f"📊 LIVE | {STATE['side'].upper()} | entry={STATE['entry']:.5f} px={px:.5f} qty={STATE['qty']:.4f} uPnL={STATE['pnl']:.4f}% | {('/'.join(flags) if flags else '-')} | strategy={STATE.get('source','-')}"
                 print(colored(live_log, color))
             
-            reason=None
             if spread_bps is not None and spread_bps > MAX_SPREAD_BPS:
                 reason=f"spread too high ({fmt(spread_bps,2)}bps > {MAX_SPREAD_BPS})"
             
-            if not STATE["open"] and sig and reason is None:
+            if not STATE["open"] and sig and reason is None and not STATE.get("safe_reconcile"):
                 if wait_for_next_signal_side and sig != wait_for_next_signal_side:
                     reason=f"waiting opposite RF: need {wait_for_next_signal_side.upper()}"
                 else:
@@ -1420,6 +1748,11 @@ def trade_loop():
                             wait_for_next_signal_side = None
                     else:
                         reason="qty<=0"
+            
+            # حفظ الحالة الدورية (كل 30 ثانية)
+            if loop_i % 6 == 0:  # كل 30 ثانية تقريباً
+                save_state_snapshot({"periodic": True, "loop_i": loop_i})
+                
             if LOG_LEGACY:
                 pretty_snapshot(bal, {"price": px or info["price"], **info}, ind, spread_bps, reason, df)
             loop_i += 1
@@ -1428,14 +1761,18 @@ def trade_loop():
         except Exception as e:
             log_e(f"loop error: {e}\n{traceback.format_exc()}")
             logging.error(f"trade_loop error: {e}\n{traceback.format_exc()}")
+            # حفظ حالة الخطأ
+            save_state_snapshot({"error": str(e), "traceback": traceback.format_exc()})
             time.sleep(BASE_SLEEP)
 
 # =================== API / KEEPALIVE ===================
 app = Flask(__name__)
+
 @app.route("/")
 def home():
     mode='LIVE' if MODE_LIVE else 'PAPER'
-    return f"✅ RF-LIVE Bot — {SYMBOL} {INTERVAL} — {mode} — Entry: RF LIVE only — Dynamic TP — Strict Close"
+    reconcile_status = "🔒 SAFE-RECONCILE" if STATE.get("safe_reconcile") else "✅ NORMAL"
+    return f"✅ RF-LIVE Bot — {SYMBOL} {INTERVAL} — {mode} — {reconcile_status} — State Persistence Active"
 
 @app.route("/metrics")
 def metrics():
@@ -1444,6 +1781,7 @@ def metrics():
         "leverage": LEVERAGE, "risk_alloc": RISK_ALLOC, "price": price_now(),
         "state": STATE, "compound_pnl": compound_pnl,
         "entry_mode": "RF_LIVE_ONLY", "wait_for_next_signal": wait_for_next_signal_side,
+        "safe_reconcile": STATE.get("safe_reconcile", False),
         "guards": {"max_spread_bps": MAX_SPREAD_BPS, "final_chunk_qty": FINAL_CHUNK_QTY}
     })
 
@@ -1454,8 +1792,64 @@ def health():
         "open": STATE["open"], "side": STATE["side"], "qty": STATE["qty"],
         "compound_pnl": compound_pnl, "timestamp": datetime.utcnow().isoformat(),
         "entry_mode": "RF_LIVE_ONLY", "wait_for_next_signal": wait_for_next_signal_side,
-        "source": STATE.get("source", "Unknown")
+        "source": STATE.get("source", "Unknown"),
+        "safe_reconcile": STATE.get("safe_reconcile", False)
     }), 200
+
+@app.route("/reconcile/confirm", methods=["POST"])
+def reconcile_confirm():
+    """تأكيد المصالحة يدويًا وإلغاء الوضع الآمن"""
+    if not STATE.get("safe_reconcile"):
+        return jsonify({"ok": True, "msg": "Not in safe-reconcile mode"})
+    
+    STATE["safe_reconcile"] = False
+    save_state_snapshot({"reconciled": True, "action": "manual_confirm"})
+    
+    log_g("🔓 SAFE-RECONCILE manually confirmed - returning to NORMAL MODE")
+    return jsonify({
+        "ok": True, 
+        "msg": "SAFE-RECONCILE mode disabled", 
+        "position": {
+            "side": STATE.get("side"),
+            "qty": STATE.get("qty"),
+            "entry": STATE.get("entry")
+        }
+    })
+
+@app.route("/reconcile/force_flat", methods=["POST"])
+def reconcile_force_flat():
+    """إجبار الوضع المسطح يدويًا (لحالات الطوارئ)"""
+    if STATE.get("open"):
+        close_market_strict("manual_force_flat")
+        msg = "Position force-closed, returning to flat"
+    else:
+        STATE["safe_reconcile"] = False
+        msg = "Already flat, safe-reconcile disabled"
+    
+    save_state_snapshot({"action": "manual_force_flat"})
+    log_g(f"🔄 MANUAL INTERVENTION: {msg}")
+    
+    return jsonify({"ok": True, "msg": msg})
+
+@app.route("/state/current")
+def get_current_state():
+    """جلب الحالة الحالية للبوت"""
+    return jsonify({
+        "state": STATE,
+        "compound_pnl": compound_pnl,
+        "safe_reconcile": STATE.get("safe_reconcile", False),
+        "waiting_signal": wait_for_next_signal_side,
+        "timestamp": datetime.utcnow().isoformat()
+    })
+
+@app.route("/state/snapshot")
+def get_state_snapshot():
+    """جلب لقطة الحالة المحفوظة"""
+    snap = load_state_snapshot()
+    return jsonify({
+        "snapshot": snap,
+        "file_exists": snap is not None
+    })
 
 def keepalive_loop():
     url=(SELF_URL or "").strip().rstrip("/")
@@ -1473,6 +1867,14 @@ def keepalive_loop():
 # =================== BOOT ===================
 if __name__ == "__main__":
     log_banner("INIT")
+    
+    # تحميل واستئناف الحالة
+    resume_or_reconcile_on_start()
+    log_resume_banner()
+    
+    # التحقق من المنصة
+    attempt_position_verification()
+    
     state = load_state() or {}
     state.setdefault("in_position", False)
 
@@ -1488,7 +1890,8 @@ if __name__ == "__main__":
     print(colored(f"RISK: {int(RISK_ALLOC*100)}% × {LEVERAGE}x  •  RF_LIVE={RF_LIVE_ONLY}", "yellow"))
     print(colored(f"ENTRY: RF ONLY  •  FINAL_CHUNK_QTY={FINAL_CHUNK_QTY}", "yellow"))
     print(colored(f"SMART MODE: {SMART_MODE}  •  EXECUTION: {'ACTIVE' if EXECUTE_ORDERS and not DRY_RUN else 'SIMULATION'}", "yellow"))
-    print(colored(f"FLOW-PRESSURE: ACTIVE  •  GOLDEN ENTRY: ACTIVE", "yellow"))
+    print(colored(f"STATE RECOVERY: {'ACTIVE (SAFE-RECONCILE)' if STATE.get('safe_reconcile') else 'ACTIVE (NORMAL)'}", "yellow"))
+    
     logging.info("service starting…")
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
     signal.signal(signal.SIGINT,  lambda *_: sys.exit(0))
