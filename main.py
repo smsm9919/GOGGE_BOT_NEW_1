@@ -9,6 +9,7 @@ RF Futures Bot — RF-LIVE ONLY (BingX Perp via CCXT)
 • Flask /metrics + /health + rotated logging
 • [ADDON] SMC كامل + Golden Zones + RSI+MA Boost + EVX + وضعين تداول
 • [ADDON] Bookmap-Lite + Volume Flow + Shadow Dashboard + Recovery System
+• [NEW] Flow-Pressure + Golden Entry + Smart Source Labeling
 """
 
 import os, time, math, random, signal, sys, traceback, logging, json
@@ -43,7 +44,7 @@ SHADOW_MODE_DASHBOARD = False
 DRY_RUN = False
 
 # ==== Addon: Logging + Recovery Settings ====
-BOT_VERSION = "DOGE SmartMoney Fusion v2.0 — SmartExit Pro + Execution Engine"
+BOT_VERSION = "DOGE SmartMoney Fusion v2.1 — Flow-Pressure + Golden Entry + Smart Source"
 print("🔁 Booting:", BOT_VERSION, flush=True)
 
 STATE_PATH = "./bot_state.json"
@@ -58,6 +59,13 @@ IMBALANCE_ALERT = 1.30
 FLOW_WINDOW = 20
 FLOW_SPIKE_Z = 1.60
 CVD_SMOOTH = 8
+
+# =================== FLOW-PRESSURE SETTINGS ===================
+OBI_EDGE = 0.18
+DELTA_EDGE = 1.5
+WALL_PROX_BPS = 8.0
+FLOW_VOTE  = 2
+FLOW_SCORE = 1.2
 
 # =================== SETTINGS ===================
 SYMBOL     = os.getenv("SYMBOL", "DOGE/USDT:USDT")
@@ -330,6 +338,37 @@ def decide_strategy_mode(df, adx=None, di_plus=None, di_minus=None, rsi_ctx=None
     
     return {"mode": mode, "why": why}
 
+# =================== FLOW-PRESSURE INDICATOR ===================
+def compute_flow_pressure(ex, symbol, now_px, lookback_sec=120):
+    """مؤشر ضغط التداول الحقيقي من Order Book + Trade Flow"""
+    try:
+        ob = ex.fetch_order_book(symbol, limit=50)
+        bids = ob.get("bids", [])[:30]; asks = ob.get("asks", [])[:30]
+        w = lambda p: 1.0/max(1e-9, abs(p-now_px))
+        bpow = sum(q*w(p) for p,q in bids); apow = sum(q*w(p) for p,q in asks)
+        obi = (apow - bpow) / max(1e-9,(apow+bpow))  # + = sellers
+
+        since = int((time.time()-lookback_sec)*1000)
+        try: trades = ex.fetch_trades(symbol, since=since, limit=200)
+        except: trades = []
+        buyv = sum(t["amount"] for t in trades if str(t.get("side","")).lower()=="buy")
+        sellv= sum(t["amount"] for t in trades if str(t.get("side","")).lower()=="sell")
+        delta = (buyv - sellv)
+
+        ask_p = min(asks, key=lambda x:x[0])[0] if asks else None
+        bid_p = max(bids, key=lambda x:x[0])[0] if bids else None
+        ask_bps = abs((ask_p-now_px)/now_px)*10000.0 if ask_p else None
+        bid_bps = abs((bid_p-now_px)/now_px)*10000.0 if bid_p else None
+        wall_close = (ask_bps and ask_bps<=WALL_PROX_BPS) or (bid_bps and bid_bps<=WALL_PROX_BPS)
+
+        return {"ok":True,"obi":obi,"delta":delta,
+                "big_sellers": (obi>=OBI_EDGE) or (delta<-DELTA_EDGE),
+                "big_buyers":  (obi<=-OBI_EDGE) or (delta> DELTA_EDGE),
+                "wall_close": bool(wall_close)}
+    except Exception as e:
+        log_w(f"flowx err: {e}")
+        return {"ok":False}
+
 # =================== POSITION RECOVERY ===================
 def _normalize_side(pos):
     side = pos.get("side") or pos.get("positionSide") or ""
@@ -387,12 +426,13 @@ def resume_open_position(exchange, symbol: str, state: dict) -> dict:
         "trail_active": prev.get("trail_active", False),
         "trail_tightened": prev.get("trail_tightened", False),
         "mode": prev.get("mode", "trend"),
+        "source": prev.get("source", "Unknown"),
         "gz_snapshot": prev.get("gz_snapshot", {}),
         "cv_snapshot": prev.get("cv_snapshot", {}),
         "opened_at": prev.get("opened_at", ts),
     })
     save_state(state)
-    log_g(f"RESUME: {state['side']} qty={state['position_qty']} @ {state['entry_price']:.6f} lev={state['leverage']}x")
+    log_g(f"RESUME: {state['side']} qty={state['position_qty']} @ {state['entry_price']:.6f} lev={state['leverage']}x source={state['source']}")
     return state
 
 # =================== LOGGING SETUP ===================
@@ -570,7 +610,7 @@ def compute_flow_metrics(df):
         if len(df) < max(30, FLOW_WINDOW+2):
             return {"ok": False, "why": "short_df"}
         close = df["close"].astype(float).copy()
-        vol = df["volume"].astype(float).copy()
+        vol = df["volume"].astotype(float).copy()
         up_mask = close.diff().fillna(0) > 0
         up_vol = (vol * up_mask).astype(float)
         dn_vol = (vol * (~up_mask)).astype(float)
@@ -666,11 +706,15 @@ def emit_snapshots(exchange, symbol, df, balance_fn=None, pnl_fn=None):
 
 # =================== ENHANCED COUNCIL VOTING ===================
 def council_votes_pro_enhanced(df):
-    """مجلس تصويت محسّن مع RSI+MA والمناطق الذهبية"""
+    """مجلس تصويت محسّن مع Flow-Pressure + RSI+MA + Golden Zones"""
     try:
         ind = compute_indicators(df)
         rsi_ctx = rsi_ma_context(df)
         gz = golden_zone_check(df, ind)
+        
+        # احصل على السعر الحالي لمؤشر Flow-Pressure
+        px = price_now()
+        flowx = compute_flow_pressure(ex, SYMBOL, px) if px else {"ok":False}
         
         votes_b = 0
         votes_s = 0
@@ -683,6 +727,17 @@ def council_votes_pro_enhanced(df):
         minus_di = ind.get('minus_di', 0)
         di_spread = abs(plus_di - minus_di)
         
+        # === إضافة Flow-Pressure إلى التصويت ===
+        if flowx.get("ok"):
+            if flowx["big_buyers"]:
+                votes_b += FLOW_VOTE
+                score_b += FLOW_SCORE
+                logs.append(f"🟢 FlowX BIG BUYERS | obi={flowx['obi']:.2f} Δ={flowx['delta']:.2f}")
+            if flowx["big_sellers"]:
+                votes_s += FLOW_VOTE  
+                score_s += FLOW_SCORE
+                logs.append(f"🔴 FlowX BIG SELLERS | obi={flowx['obi']:.2f} Δ={flowx['delta']:.2f}")
+
         if adx > ADX_TREND_MIN:
             if plus_di > minus_di and di_spread > DI_SPREAD_TREND:
                 votes_b += 2
@@ -750,10 +805,10 @@ def council_votes_pro_enhanced(df):
 council_votes_pro = council_votes_pro_enhanced
 
 # =================== EXECUTION MANAGER ===================
-def execute_trade_decision(side, price, qty, mode, council_data, gz_data):
+def execute_trade_decision(side, price, qty, mode, council_data, gz_data, source="RF"):
     """تنفيذ قرار التداول مع التسجيل الواضح"""
     if not EXECUTE_ORDERS or DRY_RUN:
-        log_i(f"DRY_RUN: {side} {qty:.4f} @ {price:.6f} | mode={mode}")
+        log_i(f"DRY_RUN: {side} {qty:.4f} @ {price:.6f} | mode={mode} | source={source}")
         return True
     
     if qty <= 0:
@@ -767,14 +822,14 @@ def execute_trade_decision(side, price, qty, mode, council_data, gz_data):
     votes = council_data
     print(f"🎯 EXECUTE: {side.upper()} {qty:.4f} @ {price:.6f} | "
           f"mode={mode} | votes={votes['b']}/{votes['s']} score={votes['score_b']:.1f}/{votes['score_s']:.1f}"
-          f"{gz_note}", flush=True)
+          f"{gz_note} | source={source}", flush=True)
 
     try:
         if MODE_LIVE:
             ex.set_leverage(LEVERAGE, SYMBOL, params={"side": "BOTH"})
             ex.create_order(SYMBOL, "market", side, qty, None, _params_open(side))
         
-        log_g(f"✅ EXECUTED: {side.upper()} {qty:.4f} @ {price:.6f}")
+        log_g(f"✅ EXECUTED: {side.upper()} {qty:.4f} @ {price:.6f} | source={source}")
         return True
     except Exception as e:
         log_e(f"❌ EXECUTION FAILED: {e}")
@@ -800,7 +855,8 @@ def setup_trade_management(mode):
         }
 
 # =================== ENHANCED TRADE EXECUTION ===================
-def open_market_enhanced(side, qty, price):
+def open_market_enhanced(side, qty, price, source="RF"):
+    """فتح صفقة محسّن مع تسجيل مصدر القرار"""
     if qty <= 0: 
         log_e("skip open (qty<=0)")
         return False
@@ -820,7 +876,7 @@ def open_market_enhanced(side, qty, price):
     
     management_config = setup_trade_management(mode)
     
-    success = execute_trade_decision(side, price, qty, mode, votes, gz)
+    success = execute_trade_decision(side, price, qty, mode, votes, gz, source)
     
     if success:
         STATE.update({
@@ -836,17 +892,24 @@ def open_market_enhanced(side, qty, price):
             "highest_profit_pct": 0.0, 
             "profit_targets_achieved": 0,
             "mode": mode,
-            "management": management_config
+            "management": management_config,
+            "source": source  # ← حفظ مصدر القرار
         })
+        
+        # لوج ملون يوضح مصدر القرار
+        color = "green" if side == "buy" else "red"
+        log_entry = f"🎯 OPEN {('LONG' if side=='buy' else 'SHORT')} | px={price:.5f} qty={qty:.4f} | mode={mode} | score={votes['score_b'] if side=='buy' else votes['score_s']:.1f} | votes(b={votes['b']},s={votes['s']}) | strategy={source}"
+        print(colored(log_entry, color))
         
         save_state({
             "in_position": True,
-            "side": "LONG" if side.upper().startswith("B") else "SHORT",
+            "side": "LONG" if side.upper().startswith("B") else "SHORT", 
             "entry_price": price,
             "position_qty": qty,
             "leverage": LEVERAGE,
             "mode": mode,
             "management": management_config,
+            "source": source,  # ← حفظ في الاستيت
             "gz_snapshot": gz if isinstance(gz, dict) else {},
             "cv_snapshot": votes if isinstance(votes, dict) else {},
             "opened_at": int(time.time()),
@@ -856,7 +919,7 @@ def open_market_enhanced(side, qty, price):
             "trail_tightened": False,
         })
         
-        log_g(f"✅ POSITION OPENED: {side.upper()} | mode={mode}")
+        log_g(f"✅ POSITION OPENED: {side.upper()} | mode={mode} | strategy={source}")
         return True
     
     return False
@@ -937,7 +1000,7 @@ STATE = {
     "open": False, "side": None, "entry": None, "qty": 0.0,
     "pnl": 0.0, "bars": 0, "trail": None, "breakeven": None,
     "tp1_done": False, "highest_profit_pct": 0.0,
-    "profit_targets_achieved": 0,
+    "profit_targets_achieved": 0, "source": "Unknown"
 }
 compound_pnl = 0.0
 wait_for_next_signal_side = None
@@ -999,8 +1062,9 @@ def close_market_strict(reason="STRICT"):
                 qty  = exch_qty
                 pnl  = (px - entry_px) * qty * (1 if side=="long" else -1)
                 compound_pnl += pnl
-                log_i(f"STRICT CLOSE {side} reason={reason} pnl={fmt(pnl)} total={fmt(compound_pnl)}")
-                logging.info(f"STRICT_CLOSE {side} pnl={pnl} total={compound_pnl}")
+                source = STATE.get("source", "Unknown")
+                log_i(f"STRICT CLOSE {side} reason={reason} pnl={fmt(pnl)} total={fmt(compound_pnl)} source={source}")
+                logging.info(f"STRICT_CLOSE {side} pnl={pnl} total={compound_pnl} source={source}")
                 _reset_after_close(reason, prev_side=side)
                 return
             qty_to_close = safe_qty(left_qty)
@@ -1019,7 +1083,7 @@ def _reset_after_close(reason, prev_side=None):
         "open": False, "side": None, "entry": None, "qty": 0.0,
         "pnl": 0.0, "bars": 0, "trail": None, "breakeven": None,
         "tp1_done": False, "highest_profit_pct": 0.0, "profit_targets_achieved": 0,
-        "trail_tightened": False, "partial_taken": False
+        "trail_tightened": False, "partial_taken": False, "source": "Unknown"
     })
     save_state({"in_position": False, "position_qty": 0})
     
@@ -1137,7 +1201,7 @@ def manage_after_entry_enhanced(df, ind, info):
 manage_after_entry = manage_after_entry_enhanced
 
 def smart_exit_guard(state, df, ind, flow, bm, now_price, pnl_pct, mode, side, entry_price):
-    """يقرر: Partial / Tighten / Strict Close مع لوج واضح."""
+    """يقرر: Partial / Tighten / Strict Close مع حماية ربح ذكية"""
     atr = ind.get('atr', 0.0)
     adx = ind.get('adx', 0.0)
     rsi = ind.get('rsi', 50.0)
@@ -1174,6 +1238,32 @@ def smart_exit_guard(state, df, ind, flow, bm, now_price, pnl_pct, mode, side, e
                 best_bid = max([p for p, _ in buy_walls])
                 bps = abs((best_bid - now_price) / now_price) * 10000.0
                 bm_wall_close = (bps <= BM_WALL_PROX_BPS)
+
+    # === حماية ربح ذكية باستخدام Flow-Pressure ===
+    flowx = compute_flow_pressure(ex, SYMBOL, now_price) if now_price else {"ok":False}
+    
+    # احصل على المناطق الذهبية الحالية
+    gz = golden_zone_check(df, ind)
+
+    # Tighten لو ضغط معاكس أو جدار قريب
+    if pnl_pct > 0 and flowx and flowx.get("ok"):
+        if (side == "long" and flowx["big_sellers"]) or (side == "short" and flowx["big_buyers"]) or flowx["wall_close"]:
+            return {
+                "action": "tighten", 
+                "why": "flow_pressure/wall",
+                "trail_mult": TRAIL_TIGHT_MULT,
+                "log": f"🛡️ Tighten by FlowX | sellers={flowx['big_sellers']} buyers={flowx['big_buyers']} wall={flowx['wall_close']}"
+            }
+
+    # Close قوي لو ظهرت منطقة ذهبية معاكسة بعد TP1
+    if state.get("tp1_done") and gz and gz.get("ok"):
+        opp = (gz["zone"]["type"] == "golden_top" and side == "long") or (gz["zone"]["type"] == "golden_bottom" and side == "short")
+        if opp and gz.get("score", 0) >= 6.5:
+            return {
+                "action": "close", 
+                "why": "golden_reversal",
+                "log": f"🔴 CLOSE (Golden reversal after TP1) | zone={gz['zone']['type']} score={gz['score']:.1f}"
+            }
 
     tp1_target = TP1_SCALP_PCT if mode == 'scalp' else TP1_TREND_PCT
     if pnl_pct >= tp1_target and not state.get('tp1_done'):
@@ -1235,7 +1325,8 @@ def pretty_snapshot(bal, info, ind, spread_bps, reason=None, df=None):
         print(colored(f"   {bal_line}", "yellow"))
         if STATE["open"]:
             lamp='🟩 LONG' if STATE['side']=='long' else '🟥 SHORT'
-            print(f"   {lamp}  Entry={fmt(STATE['entry'])}  Qty={fmt(STATE['qty'],4)}  Bars={STATE['bars']}  Trail={fmt(STATE['trail'])}  BE={fmt(STATE['breakeven'])}")
+            source_info = f" | Source={STATE.get('source', 'Unknown')}" if STATE.get('source') else ""
+            print(f"   {lamp}  Entry={fmt(STATE['entry'])}  Qty={fmt(STATE['qty'],4)}  Bars={STATE['bars']}  Trail={fmt(STATE['trail'])}  BE={fmt(STATE['breakeven'])}{source_info}")
             print(f"   🎯 TP_done={STATE['profit_targets_achieved']}  HP={fmt(STATE['highest_profit_pct'],2)}%")
         else:
             print("   ⚪ FLAT")
@@ -1256,11 +1347,41 @@ def trade_loop():
             ind  = compute_indicators(df)
             spread_bps = orderbook_spread_bps()
             
+            # احصل على بيانات المجلس والمناطق الذهبية
+            council = council_votes_pro_enhanced(df)
+            gz = council.get("gz")
+            ind_council = council["ind"]
+            
             if LOG_ADDONS:
                 snap = emit_snapshots(ex, SYMBOL, df,
                                     balance_fn=lambda: float(bal) if bal else None,
                                     pnl_fn=lambda: float(compound_pnl))
             
+            # === تحديد إشارة الدخول مع الأولوية للقاع/القمة الذهبية ===
+            sig = None
+            source = "RF"  # افتراضي
+            
+            # Golden Entry override - الأولوية الأولى
+            if gz and gz.get("ok") and ind_council.get("adx",0) >= 20.0:
+                if gz["zone"]["type"] == "golden_bottom" and gz["score"] >= 6.0:
+                    sig, source = "buy", "Golden"
+                elif gz["zone"]["type"] == "golden_top" and gz["score"] >= 6.0:
+                    sig, source = "sell", "Golden"
+            
+            # fallback للسكور العادي من المجلس
+            if sig is None:
+                if council["score_b"] > council["score_s"] and council["score_b"] >= 8.0:
+                    sig, source = "buy", "Council"
+                elif council["score_s"] > council["score_b"] and council["score_s"] >= 8.0:
+                    sig, source = "sell", "Council"
+            
+            # fallback للإشارة التقليدية
+            if sig is None and ENTRY_RF_ONLY:
+                if info["long"]:
+                    sig, source = "buy", "RF"
+                elif info["short"]:
+                    sig, source = "sell", "RF"
+
             if STATE["open"] and px:
                 STATE["pnl"] = (px-STATE["entry"])*STATE["qty"] if STATE["side"]=="long" else (STATE["entry"]-px)*STATE["qty"]
             
@@ -1271,18 +1392,30 @@ def trade_loop():
                     "flow": snap["flow"] if 'snap' in locals() else None,
                     **info
                 })
+                
+                # === لوج مركّز للصفقة المفتوحة ===
+                flags = []
+                if STATE.get("tp1_done"): flags.append("TP1✓")
+                if STATE.get("breakeven_armed"): flags.append("BE")
+                if STATE.get("trail_active"): flags.append("TRAIL")
+                if STATE.get("trail_tightened"): flags.append("TIGHT")
+                
+                color = "green" if STATE["side"] == "long" else "red"
+                live_log = f"📊 LIVE | {STATE['side'].upper()} | entry={STATE['entry']:.5f} px={px:.5f} qty={STATE['qty']:.4f} uPnL={STATE['pnl']:.4f}% | {('/'.join(flags) if flags else '-')} | strategy={STATE.get('source','-')}"
+                print(colored(live_log, color))
             
             reason=None
             if spread_bps is not None and spread_bps > MAX_SPREAD_BPS:
                 reason=f"spread too high ({fmt(spread_bps,2)}bps > {MAX_SPREAD_BPS})"
-            sig = "buy" if (ENTRY_RF_ONLY and info["long"]) else ("sell" if (ENTRY_RF_ONLY and info["short"]) else None)
+            
             if not STATE["open"] and sig and reason is None:
                 if wait_for_next_signal_side and sig != wait_for_next_signal_side:
                     reason=f"waiting opposite RF: need {wait_for_next_signal_side.upper()}"
                 else:
                     qty = compute_size(bal, px or info["price"])
                     if qty>0:
-                        ok = open_market(sig, qty, px or info["price"])
+                        # تمرير مصدر القرار (source) للدالة
+                        ok = open_market_enhanced(sig, qty, px or info["price"], source)
                         if ok:
                             wait_for_next_signal_side = None
                     else:
@@ -1320,7 +1453,8 @@ def health():
         "ok": True, "mode": "live" if MODE_LIVE else "paper",
         "open": STATE["open"], "side": STATE["side"], "qty": STATE["qty"],
         "compound_pnl": compound_pnl, "timestamp": datetime.utcnow().isoformat(),
-        "entry_mode": "RF_LIVE_ONLY", "wait_for_next_signal": wait_for_next_signal_side
+        "entry_mode": "RF_LIVE_ONLY", "wait_for_next_signal": wait_for_next_signal_side,
+        "source": STATE.get("source", "Unknown")
     }), 200
 
 def keepalive_loop():
@@ -1354,6 +1488,7 @@ if __name__ == "__main__":
     print(colored(f"RISK: {int(RISK_ALLOC*100)}% × {LEVERAGE}x  •  RF_LIVE={RF_LIVE_ONLY}", "yellow"))
     print(colored(f"ENTRY: RF ONLY  •  FINAL_CHUNK_QTY={FINAL_CHUNK_QTY}", "yellow"))
     print(colored(f"SMART MODE: {SMART_MODE}  •  EXECUTION: {'ACTIVE' if EXECUTE_ORDERS and not DRY_RUN else 'SIMULATION'}", "yellow"))
+    print(colored(f"FLOW-PRESSURE: ACTIVE  •  GOLDEN ENTRY: ACTIVE", "yellow"))
     logging.info("service starting…")
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
     signal.signal(signal.SIGINT,  lambda *_: sys.exit(0))
