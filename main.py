@@ -39,7 +39,7 @@ SHADOW_MODE_DASHBOARD = False
 DRY_RUN = False
 
 # ==== Addon: Logging + Recovery Settings ====
-BOT_VERSION = "DOGE Council ELITE v5.0 — Smart Management System"
+BOT_VERSION = "DOGE Council ELITE v5.0 — Smart Hybrid System"
 print("🔁 Booting:", BOT_VERSION, flush=True)
 
 STATE_PATH = "./bot_state.json"
@@ -77,6 +77,42 @@ ATR_LEN = 14
 
 ENTRY_RF_ONLY = False
 MAX_SPREAD_BPS = float(os.getenv("MAX_SPREAD_BPS", 6.0))
+
+# =================== HYBRID SMART SYSTEM SETTINGS ===================
+# Fast RF + Council Supervisor
+RF_FAST_TRACK = True
+RF_ADX_MIN = 18.0
+RF_ADX_RISE_DELTA = 0.6
+RF_MAX_SPREAD_BPS = 8
+RF_COOLDOWN_S = 0
+RF_HYST_BPS = 5
+
+COUNCIL_OPPORTUNISTIC_MODE = True
+ALLOW_GZ_ENTRY = True
+GZ_MIN_SCORE = 6.0
+GZ_REQ_ADX = 20.0
+
+# Move Classification
+ADX_TREND_GATE = 22.0
+DI_SPREAD_TREND = 6.0
+SCALP_TP1_PCT = 0.0040
+SCALP_BE_AFTER = 0.0030
+SCALP_TRAIL_ACTIVATE = 0.0080
+
+TREND_TP1_PCT = 0.0060
+TREND_TRAIL_ACTIVATE = 0.0120
+
+# Scale-In (Smart Addition)
+SCALE_IN_ENABLED = True
+SCALE_IN_MAX_ADDS = 2
+SCALE_IN_STEP_PCT = 0.25
+SCALE_IN_MIN_DISTANCE_BPS = 10
+SCALE_IN_MIN_CONFIDENCE = 7.0
+
+# RSI/EMA Golden Context
+RSI_MA_LEN = 9
+RSI_TREND_PERSIST = 3
+RSI_NEUTRAL_BAND = (45, 55)
 
 # =================== COUNCIL ELITE SETTINGS ===================
 # Council Weights & Gates
@@ -131,7 +167,7 @@ TIME_IN_TRADE_MIN = 8
 # ===== Council & RSI defaults (FIX) =====
 RSI_MA_LEN         = globals().get("RSI_MA_LEN", 9)
 RSI_NEUTRAL_BAND   = globals().get("RSI_NEUTRAL_BAND", (45, 55))
-RSI_TREND_PERSIST  = globals().get("RSI_TREND_PERSIST", 3)   # <<< كان مفقود
+RSI_TREND_PERSIST  = globals().get("RSI_TREND_PERSIST", 3)
 
 ADX_TREND_MIN      = globals().get("ADX_TREND_MIN", 20)
 DI_SPREAD_TREND    = globals().get("DI_SPREAD_TREND", 6)
@@ -231,6 +267,137 @@ def load_state() -> dict:
     except Exception as e:
         log_w(f"state load failed: {e}")
     return {}
+
+# =================== HYBRID SMART SYSTEM FUNCTIONS ===================
+def classify_move(ind, rsi_ctx):
+    """تصنيف الحركة: سكالب vs ترند"""
+    adx = ind.get('adx', 0.0)
+    di_spread = abs(ind.get('plus_di', 0) - ind.get('minus_di', 0))
+    
+    # ترند واضح
+    if (adx >= ADX_TREND_GATE and 
+        di_spread >= DI_SPREAD_TREND and 
+        rsi_ctx["trendZ"] in ("bull", "bear")):
+        return "trend"
+    # خلاف ذلك سكالب ذكي
+    return "scalp"
+
+def rf_entry_guard_ok(ind, spread_bps, last_adx_vals):
+    """التحقق من شروط دخول RF"""
+    if spread_bps is not None and spread_bps > RF_MAX_SPREAD_BPS:
+        return False, f"spread {spread_bps:.1f}bps>{RF_MAX_SPREAD_BPS}"
+    
+    adx = ind.get('adx', 0.0)
+    adx_rise = 0.0
+    if len(last_adx_vals) >= 3:
+        adx_rise = last_adx_vals[-1] - last_adx_vals[-3]
+    
+    if adx >= RF_ADX_MIN or adx_rise >= RF_ADX_RISE_DELTA:
+        return True, None
+    
+    return False, f"ADX {adx:.1f}<{RF_ADX_MIN} & ΔADX {adx_rise:.2f}<{RF_ADX_RISE_DELTA}"
+
+def maybe_open_via_rf(df, info, ind, spread_bps, last_adx_vals):
+    """الدخول السريع عبر RF مع تصنيف النمط"""
+    global wait_for_next_signal_side
+    
+    if not RF_FAST_TRACK or STATE["open"]: 
+        return
+    
+    # تحديد الإشارة من RF
+    sig = None
+    if info.get("long"):
+        sig = "buy"
+    elif info.get("short"):
+        sig = "sell"
+    
+    if not sig: 
+        return
+    
+    # التحقق من شروط الدخول
+    ok, reason = rf_entry_guard_ok(ind, spread_bps, last_adx_vals)
+    if not ok:
+        log_i(f"RF_SKIP | {reason}")
+        return
+    
+    px = info["price"]
+    bal = balance_usdt()
+    qty = compute_size(bal, px)
+    
+    if qty <= 0: 
+        return
+    
+    # فتح الصفقة
+    if open_market(sig, qty, px):
+        rsi_ctx = rsi_ma_context(df)
+        mode = classify_move(ind, rsi_ctx)
+        STATE["mode"] = mode
+        STATE["adds"] = 0  # إعادة تعزيزات لصفر
+        log_g(f"🟢 RF ENTRY {sig.upper()} | mode={mode} | ADX={ind.get('adx',0):.1f} DIsp={abs(ind.get('plus_di',0)-ind.get('minus_di',0)):.1f}")
+
+def council_opportunistic_action(df, ind, extras):
+    """المجلس الانتهازي - فتح/تعزيز عند الفرص القوية"""
+    if not COUNCIL_OPPORTUNISTIC_MODE:
+        return
+        
+    cv = council_votes_pro_enhanced(df)
+    gz = cv["ind"].get("gz", {})
+    adx = cv["ind"].get("adx", 0.0)
+    rsi_trend = cv["ind"].get("rsi_trendz", "flat")
+    score_b, score_s = cv["score_b"], cv["score_s"]
+    winner = "buy" if score_b > score_s else "sell"
+    winner_score = max(score_b, score_s)
+    
+    current_price = price_now()
+    if not current_price:
+        return
+
+    # 4.a — تعزيز ذكي للصفقة الحالية
+    if STATE["open"] and SCALE_IN_ENABLED and STATE.get("adds", 0) < SCALE_IN_MAX_ADDS:
+        same_dir = (STATE["side"] == "long" and winner == "buy") or (STATE["side"] == "short" and winner == "sell")
+        enough_conf = winner_score >= SCALE_IN_MIN_CONFIDENCE
+        
+        # اكتشاف الفرص الذهبية/FVG/التدفق
+        golden_ok = gz and gz.get("ok") and (
+            (gz["zone"]["type"] == "golden_bottom" and STATE["side"] == "long") or
+            (gz["zone"]["type"] == "golden_top" and STATE["side"] == "short")
+        )
+        
+        fvg_ok = detect_fvg(df).get("ok", False)
+        flow_ok = extras.get("flow", {}).get("ok") and extras["flow"].get("cvd_trend") == ("up" if STATE["side"] == "long" else "down")
+        dist_ok = abs(current_price - STATE["entry"]) / STATE["entry"] * 10000.0 >= SCALE_IN_MIN_DISTANCE_BPS
+
+        if same_dir and enough_conf and adx >= GZ_REQ_ADX and (golden_ok or fvg_ok or flow_ok) and dist_ok:
+            add_qty = safe_qty(STATE["qty"] * SCALE_IN_STEP_PCT)
+            if add_qty > 0:
+                side = "buy" if STATE["side"] == "long" else "sell"
+                if MODE_LIVE and EXECUTE_ORDERS and not DRY_RUN:
+                    try:
+                        ex.create_order(SYMBOL, "market", side, add_qty, None, _params_open(side))
+                        log_g(f"➕ COUNCIL ADD-ON {side.upper()} | conf={winner_score:.1f} | gz={golden_ok} | fvg={fvg_ok} | flow={flow_ok}")
+                        STATE["qty"] = safe_qty(STATE["qty"] + add_qty)
+                        STATE["adds"] = STATE.get("adds", 0) + 1
+                        save_state(STATE)
+                    except Exception as e:
+                        log_e(f"❌ Scale-in failed: {e}")
+                else:
+                    log_i(f"DRY_RUN: Scale-in {side.upper()} {add_qty:.4f}")
+
+    # 4.b — فتح انتهازي عند الفرص الذهبية
+    if not STATE["open"]:
+        golden_buy = gz and gz.get("ok") and gz["zone"]["type"] == "golden_bottom" and winner == "buy"
+        golden_sell = gz and gz.get("ok") and gz["zone"]["type"] == "golden_top" and winner == "sell"
+        strong_flow = extras.get("flow", {}).get("ok") and extras["flow"].get("cvd_trend") == ("up" if winner == "buy" else "down")
+        
+        if (golden_buy or golden_sell) and adx >= GZ_REQ_ADX and rsi_trend in ("bull", "bear") and winner_score >= GZ_MIN_SCORE:
+            bal = balance_usdt()
+            qty = compute_size(bal, current_price)
+            if qty > 0:
+                if open_market(winner, qty, current_price):
+                    rsi_ctx = rsi_ma_context(df)
+                    STATE["mode"] = classify_move(ind, rsi_ctx)
+                    STATE["adds"] = 0
+                    log_g(f"🏆 COUNCIL ENTRY {winner.upper()} | golden={gz['zone']['type']} | score={winner_score:.1f} | ADX={adx:.1f}")
 
 # =================== SMC/ICT TOOLS ===================
 def _fib_zone(last_impulse_low, last_impulse_high):
@@ -465,8 +632,8 @@ def verify_execution_environment():
     """التحقق من بيئة التنفيذ عند الإقلاع"""
     print(f"⚙️ EXECUTION ENVIRONMENT", flush=True)
     print(f"🔧 EXECUTE_ORDERS: {EXECUTE_ORDERS} | SHADOW_MODE: {SHADOW_MODE_DASHBOARD} | DRY_RUN: {DRY_RUN}", flush=True)
-    print(f"🎯 COUNCIL ELITE: Smart Entry + Smart Management", flush=True)
-    print(f"📈 SMC/ICT: Golden Zones + FVG + BOS + Sweeps", flush=True)
+    print(f"🎯 HYBRID SMART SYSTEM: Fast RF + Council ELITE + Smart Management", flush=True)
+    print(f"📈 SMC/ICT: Golden Zones + FVG + BOS + Sweeps + Scale-In", flush=True)
     
     if not EXECUTE_ORDERS:
         print("🟡 WARNING: EXECUTE_ORDERS=False - البوت في وضع التحليل فقط!", flush=True)
@@ -735,20 +902,20 @@ council_votes_pro = council_votes_pro_enhanced
 
 # =================== SMART TRADE MANAGEMENT ===================
 def setup_trade_management(mode):
-    """تهيئة إدارة الصفقة حسب النمط مع الثوابت الجديدة"""
+    """تهيئة إدارة الصفقة حسب النمط مع الإعدادات الجديدة"""
     if mode == "scalp":
         return {
-            "tp1_pct": TP1_PCT_SCALP,
-            "be_activate_pct": BE_AFTER_SCALP,
-            "trail_activate_pct": TRAIL_ACT_SCALP,
+            "tp1_pct": SCALP_TP1_PCT,
+            "be_activate_pct": SCALP_BE_AFTER,
+            "trail_activate_pct": SCALP_TRAIL_ACTIVATE,
             "atr_trail_mult": ATR_TRAIL_MULT,
             "close_aggression": "high"
         }
-    else:
+    else:  # trend
         return {
-            "tp1_pct": TP1_PCT_TREND,
-            "be_activate_pct": BE_AFTER_TREND,
-            "trail_activate_pct": TRAIL_ACT_TREND,
+            "tp1_pct": TREND_TP1_PCT,
+            "be_activate_pct": SCALP_BE_AFTER,
+            "trail_activate_pct": TREND_TRAIL_ACTIVATE,
             "atr_trail_mult": ATR_TRAIL_MULT,
             "close_aggression": "medium"
         }
@@ -858,7 +1025,6 @@ def fetch_live_position_safe(ex, symbol):
         if getattr(ex, "has", {}).get("fetchPositions"):
             pos = ex.fetch_positions([symbol])
             return pos[0] if pos else None
-        # BingX غالبًا ما تدعم fetch_balance للأصول المفتوحة فقط
         return None
     except Exception as e:
         addon_log_safe(f"fetch_live_position error (ignored): {e}")
@@ -896,6 +1062,7 @@ def resume_open_position_enhanced(exchange, symbol: str, state: dict) -> dict:
             "gz_snapshot": prev.get("gz_snapshot", {}),
             "cv_snapshot": prev.get("cv_snapshot", {}),
             "opened_at": prev.get("opened_at", int(time.time())),
+            "adds": prev.get("adds", 0),
         })
         save_state(state)
         log_g(f"✅ RESUME via EXCHANGE: {state['side']} qty={state['position_qty']} @ {state['entry_price']:.6f}")
@@ -906,7 +1073,6 @@ def resume_open_position_enhanced(exchange, symbol: str, state: dict) -> dict:
         ts = int(time.time())
         state_ts = prev.get("ts", 0)
         
-        # التحقق من حداثة الحالة (أقل من ساعة)
         if ts - state_ts < 3600:
             state.update(prev)
             save_state(state)
@@ -1116,7 +1282,6 @@ def emit_snapshots(exchange, symbol, df, balance_fn=None, pnl_fn=None, council=N
         bm = bookmap_snapshot(exchange, symbol)
         flow = compute_flow_metrics(df)
         
-        # استخدام المجلس الممرّر إذا كان متوفراً، وإلا حساب جديد
         if council is None:
             cv = council_votes_pro_enhanced(df)
         else:
@@ -1230,11 +1395,10 @@ def open_market_enhanced(side, qty, price):
     
     df = fetch_ohlcv()
     
-    # حساب المجلس أولاً لمنع recursion
     cv = council_votes_pro_enhanced(df)
     snap = emit_snapshots(ex, SYMBOL, df, council=cv)
     
-    votes = cv  # استخدام المجلس المحسوب مسبقاً
+    votes = cv
     mode_data = decide_strategy_mode(df, 
                                    adx=votes["ind"].get("adx"),
                                    di_plus=votes["ind"].get("plus_di"),
@@ -1261,6 +1425,7 @@ def open_market_enhanced(side, qty, price):
             "tp1_done": False, 
             "highest_profit_pct": 0.0, 
             "profit_targets_achieved": 0,
+            "adds": 0,
             "mode": mode,
             "management": management_config
         })
@@ -1280,11 +1445,12 @@ def open_market_enhanced(side, qty, price):
             "breakeven_armed": False,
             "trail_active": False,
             "trail_tightened": False,
+            "adds": 0,
         })
         
         log_trade_open(
             side=side, price=price, qty=qty, leverage=LEVERAGE,
-            source="Council ELITE",
+            source="Hybrid Smart System",
             mode=mode,
             risk_alloc=RISK_ALLOC,
             council=votes,
@@ -1373,7 +1539,7 @@ STATE = {
     "open": False, "side": None, "entry": None, "qty": 0.0,
     "pnl": 0.0, "bars": 0, "trail": None, "breakeven": None,
     "tp1_done": False, "highest_profit_pct": 0.0,
-    "profit_targets_achieved": 0,
+    "profit_targets_achieved": 0, "adds": 0,
 }
 compound_pnl = 0.0
 wait_for_next_signal_side = None
@@ -1449,11 +1615,10 @@ def _reset_after_close(reason, prev_side=None):
         "open": False, "side": None, "entry": None, "qty": 0.0,
         "pnl": 0.0, "bars": 0, "trail": None, "breakeven": None,
         "tp1_done": False, "highest_profit_pct": 0.0, "profit_targets_achieved": 0,
-        "trail_tightened": False, "partial_taken": False
+        "trail_tightened": False, "partial_taken": False, "adds": 0
     })
     save_state({"in_position": False, "position_qty": 0})
     
-    # تفعيل انتظار الإشارة التالية
     _arm_wait_after_close(prev_side)
     logging.info(f"AFTER_CLOSE waiting_for={wait_for_next_signal_side}")
 
@@ -1476,7 +1641,6 @@ def manage_after_entry_enhanced(df, ind, info):
     if pnl_pct > STATE["highest_profit_pct"]:
         STATE["highest_profit_pct"] = pnl_pct
 
-    # حساب المجلس أولاً لمنع recursion
     cv = council_votes_pro_enhanced(df)
     snap = emit_snapshots(ex, SYMBOL, df, council=cv)
     
@@ -1520,7 +1684,7 @@ def manage_after_entry_enhanced(df, ind, info):
     atr_trail_mult = management.get("atr_trail_mult", ATR_TRAIL_MULT)
 
     if not STATE.get("tp1_done") and pnl_pct/100 >= tp1_pct:
-        close_fraction = 0.5  # Close 50% at TP1
+        close_fraction = 0.5
         close_qty = safe_qty(STATE["qty"] * close_fraction)
         if close_qty > 0:
             close_side = "sell" if STATE["side"] == "long" else "buy"
@@ -1572,13 +1736,13 @@ manage_after_entry = manage_after_entry_enhanced
 
 # =================== ENHANCED TRADE LOOP ===================
 def trade_loop_enhanced():
-    """حلقة تداول محسنة مع Council ELITE وSmart Management"""
+    """حلقة تداول محسنة مع النظام الهجيني الذكي"""
     global wait_for_next_signal_side
     loop_i = 0
+    last_adx_vals = []
     
     while True:
         try:
-            # جمع البيانات الأساسية
             bal = balance_usdt()
             px = price_now()
             df = fetch_ohlcv()
@@ -1586,20 +1750,25 @@ def trade_loop_enhanced():
             ind = compute_indicators(df)
             spread_bps = orderbook_spread_bps()
             
-            # حساب المجلس أولاً لمنع recursion
+            current_adx = ind.get('adx', 0.0)
+            last_adx_vals.append(current_adx)
+            if len(last_adx_vals) > 5:
+                last_adx_vals.pop(0)
+            
             council_data = council_votes_pro_enhanced(df)
             
-            # تحديث الـ Snapshots مع تمرير المجلس المحسوب
             snap = emit_snapshots(ex, SYMBOL, df,
                                 balance_fn=lambda: float(bal) if bal else None,
                                 pnl_fn=lambda: float(compound_pnl),
                                 council=council_data)
             
-            # تحديث حالة الربح/الخسارة
             if STATE["open"] and px:
-                STATE["pnl"] = (px-STATE["entry"])*STATE["qty"] if STATE["side"]=="long" else (STATE["entry"]-px)*STATE["qty"]
+                STATE["pnl"] = (px - STATE["entry"]) * STATE["qty"] if STATE["side"] == "long" else (STATE["entry"] - px) * STATE["qty"]
             
-            # إدارة الصفقة المفتوحة
+            # 1- الدخول السريع عبر RF
+            maybe_open_via_rf(df, info, ind, spread_bps, last_adx_vals)
+            
+            # 2- إدارة الصفقة المفتوحة
             if STATE["open"]:
                 manage_after_entry(df, ind, {
                     "price": px or info["price"], 
@@ -1608,57 +1777,11 @@ def trade_loop_enhanced():
                     **info
                 })
             
-            # قرار الدخول باستخدام مجلس الإدارة المحسن
-            reason = None
-            if spread_bps is not None and spread_bps > MAX_SPREAD_BPS:
-                reason = f"spread too high ({fmt(spread_bps,2)}bps > {MAX_SPREAD_BPS})"
-
-            sig = None
-
-            # قرار المجلس المحسن
-            if council_data["score_b"] >= max(COUNCIL_STRONG_TH, council_data["score_s"] + 2.0):
-                sig = "buy"
-            elif council_data["score_s"] >= max(COUNCIL_STRONG_TH, council_data["score_b"] + 2.0):
-                sig = "sell"
-            else:
-                # مرونة أخف للدخول
-                if council_data["score_b"] >= COUNCIL_OK_TH and council_data["b"] > council_data["s"]:
-                    sig = "buy"
-                elif council_data["score_s"] >= COUNCIL_OK_TH and council_data["s"] > council_data["b"]:
-                    sig = "sell"
-
-            if not STATE["open"] and sig and reason is None:
-                # التحقق من سياسة الانتظار
-                allow_wait, wait_reason = wait_gate_allow(df, info)
-                if not allow_wait:
-                    reason = wait_reason
-                else:
-                    qty = compute_size(bal, px or info["price"])
-                    if qty > 0:
-                        # تحديد نمط التداول
-                        mode_data = decide_strategy_mode(df, 
-                            council_data["ind"].get("adx"),
-                            council_data["ind"].get("plus_di"), 
-                            council_data["ind"].get("minus_di"),
-                            {"trendZ": council_data["ind"].get("rsi_trendz")}
-                        )
-                        
-                        ok = open_market(sig, qty, px or info["price"])
-                        if ok:
-                            wait_for_next_signal_side = None
-                            # تسجيل قرار المجلس
-                            log_i(f"🎯 COUNCIL ELITE DECISION: {sig.upper()} | "
-                                  f"Score B/S: {council_data['score_b']:.1f}/{council_data['score_s']:.1f} | "
-                                  f"Votes B/S: {council_data['b']}/{council_data['s']} | "
-                                  f"Mode: {mode_data['mode']}")
-                            for log_msg in council_data.get("logs", []):
-                                log_i(f"   - {log_msg}")
-                    else:
-                        reason = "qty<=0"
+            # 3- المجلس الانتهازي (فتح/تعزيز)
+            council_opportunistic_action(df, ind, snap)
             
-            # اللوج الاحترافي
             if LOG_LEGACY:
-                pretty_snapshot(bal, {"price": px or info["price"], **info}, ind, spread_bps, reason, df)
+                pretty_snapshot(bal, {"price": px or info["price"], **info}, ind, spread_bps, None, df)
             
             loop_i += 1
             sleep_s = NEAR_CLOSE_S if time_to_candle_close(df) <= 10 else BASE_SLEEP
@@ -1681,7 +1804,7 @@ def pretty_snapshot(bal, info, ind, spread_bps, reason=None, df=None):
         print("📈 INDICATORS & RF")
         print(f"   💲 Price {fmt(info.get('price'))} | RF filt={fmt(info.get('filter'))}  hi={fmt(info.get('hi'))} lo={fmt(info.get('lo'))}")
         print(f"   🧮 RSI={fmt(ind.get('rsi'))}  +DI={fmt(ind.get('plus_di'))}  -DI={fmt(ind.get('minus_di'))}  ADX={fmt(ind.get('adx'))}  ATR={fmt(ind.get('atr'))}")
-        print(f"   🎯 ENTRY: COUNCIL ELITE + SMART MANAGEMENT  |  spread_bps={fmt(spread_bps,2)}")
+        print(f"   🎯 ENTRY: HYBRID SMART SYSTEM (Fast RF + Council ELITE)  |  spread_bps={fmt(spread_bps,2)}")
         print(f"   ⏱️ closes_in ≈ {left_s}s")
         print("\n🧭 POSITION")
         bal_line = f"Balance={fmt(bal,2)}  Risk={int(RISK_ALLOC*100)}%×{LEVERAGE}x  CompoundPnL={fmt(compound_pnl)}  Eq~{fmt((bal or 0)+compound_pnl,2)}"
@@ -1689,7 +1812,7 @@ def pretty_snapshot(bal, info, ind, spread_bps, reason=None, df=None):
         if STATE["open"]:
             lamp='🟩 LONG' if STATE['side']=='long' else '🟥 SHORT'
             print(f"   {lamp}  Entry={fmt(STATE['entry'])}  Qty={fmt(STATE['qty'],4)}  Bars={STATE['bars']}  Trail={fmt(STATE['trail'])}  BE={fmt(STATE['breakeven'])}")
-            print(f"   🎯 TP_done={STATE['profit_targets_achieved']}  HP={fmt(STATE['highest_profit_pct'],2)}%")
+            print(f"   🎯 TP_done={STATE['profit_targets_achieved']}  HP={fmt(STATE['highest_profit_pct'],2)}%  Adds={STATE.get('adds',0)}")
         else:
             print("   ⚪ FLAT")
             if wait_for_next_signal_side:
@@ -1703,7 +1826,7 @@ app = Flask(__name__)
 @app.route("/")
 def home():
     mode='LIVE' if MODE_LIVE else 'PAPER'
-    return f"✅ Council ELITE Bot — {SYMBOL} {INTERVAL} — {mode} — Smart Entry + Smart Management"
+    return f"✅ Hybrid Smart System Bot — {SYMBOL} {INTERVAL} — {mode} — Fast RF + Council ELITE + Smart Management"
 
 @app.route("/metrics")
 def metrics():
@@ -1711,7 +1834,7 @@ def metrics():
         "symbol": SYMBOL, "interval": INTERVAL, "mode": "live" if MODE_LIVE else "paper",
         "leverage": LEVERAGE, "risk_alloc": RISK_ALLOC, "price": price_now(),
         "state": STATE, "compound_pnl": compound_pnl,
-        "entry_mode": "COUNCIL_ELITE", "wait_for_next_signal": wait_for_next_signal_side,
+        "entry_mode": "HYBRID_SMART_SYSTEM", "wait_for_next_signal": wait_for_next_signal_side,
         "guards": {"max_spread_bps": MAX_SPREAD_BPS, "final_chunk_qty": FINAL_CHUNK_QTY}
     })
 
@@ -1734,7 +1857,7 @@ def keepalive_loop():
 
 # =================== BOOT ===================
 if __name__ == "__main__":
-    log_banner("COUNCIL ELITE INIT")
+    log_banner("HYBRID SMART SYSTEM INIT")
     state = load_state() or {}
     state.setdefault("in_position", False)
 
@@ -1747,12 +1870,13 @@ if __name__ == "__main__":
     verify_execution_environment()
 
     print(colored(f"MODE: {'LIVE' if MODE_LIVE else 'PAPER'}  •  {SYMBOL}  •  {INTERVAL}", "yellow"))
-    print(colored(f"RISK: {int(RISK_ALLOC*100)}% × {LEVERAGE}x  •  COUNCIL_ELITE=ENABLED", "yellow"))
-    print(colored(f"SMC/ICT: Golden Zones + FVG + BOS + Sweeps + Order Blocks", "yellow"))
+    print(colored(f"RISK: {int(RISK_ALLOC*100)}% × {LEVERAGE}x  •  HYBRID_SYSTEM=ENABLED", "yellow"))
+    print(colored(f"FAST RF: ADX≥{RF_ADX_MIN} | ΔADX≥{RF_ADX_RISE_DELTA} | Spread≤{RF_MAX_SPREAD_BPS}bps", "yellow"))
+    print(colored(f"COUNCIL ELITE: Golden Zones + Scale-In + Opportunistic Entries", "yellow"))
     print(colored(f"MANAGEMENT: Smart TP + Smart Exit + Trail Adaptation", "yellow"))
     print(colored(f"EXECUTION: {'ACTIVE' if EXECUTE_ORDERS and not DRY_RUN else 'SIMULATION'}", "yellow"))
     
-    logging.info("Council ELITE service starting…")
+    logging.info("Hybrid Smart System service starting…")
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
     signal.signal(signal.SIGINT,  lambda *_: sys.exit(0))
     
