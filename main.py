@@ -2,8 +2,8 @@
 """
 RF Futures Bot — RF-LIVE ONLY (BingX Perp via CCXT)
 • Council ELITE Unified Decision System with Smart Management
-• Golden Entry + SMC/ICT + Smart Exit Management + Flow-Pressure v2
-• Dynamic TP ladder + Breakeven + ATR-trailing + Order Book Diagonal Analysis
+• Golden Entry + SMC/ICT + Smart Exit Management
+• Dynamic TP ladder + Breakeven + ATR-trailing
 • Professional Logging & Dashboard
 """
 
@@ -15,7 +15,6 @@ import numpy as np
 import ccxt
 from flask import Flask, jsonify
 from decimal import Decimal, ROUND_DOWN, InvalidOperation
-from collections import deque
 
 try:
     from termcolor import colored
@@ -40,7 +39,7 @@ SHADOW_MODE_DASHBOARD = False
 DRY_RUN = False
 
 # ==== Addon: Logging + Recovery Settings ====
-BOT_VERSION = "DOGE Council ELITE v6.0 — Flow-Pressure v2 Hybrid System"
+BOT_VERSION = "DOGE Council ELITE v5.0 — Smart Hybrid System"
 print("🔁 Booting:", BOT_VERSION, flush=True)
 
 STATE_PATH = "./bot_state.json"
@@ -56,20 +55,6 @@ IMBALANCE_ALERT = 1.30
 FLOW_WINDOW = 20
 FLOW_SPIKE_Z = 1.60
 CVD_SMOOTH = 8
-
-# =================== FLOW-PRESSURE v2 SETTINGS ===================
-FLOW_V2_ENABLED = True
-FLOW_V2_DEPTH = 15
-FLOW_V2_SHIFT = 1
-FLOW_V2_WALL_K = 5.0
-FLOW_V2_WIN_SIZE = 120
-FLOW_V2_AGGRESSION_RATIO_TH = 1.15
-FLOW_V2_AGGRESSION_Z_TH = 0.5
-FLOW_V2_SCALP_Z_TH = 0.8
-FLOW_V2_WALL_PROX_BPS = 10
-
-# تخزين التاريخ للـ z-score
-_flow_hist = deque(maxlen=FLOW_V2_WIN_SIZE)
 
 # =================== SETTINGS ===================
 SYMBOL     = os.getenv("SYMBOL", "DOGE/USDT:USDT")
@@ -283,174 +268,6 @@ def load_state() -> dict:
         log_w(f"state load failed: {e}")
     return {}
 
-# =================== FLOW-PRESSURE v2 CORE FUNCTIONS ===================
-def _safe_ob_fetch(exchange, symbol, limit=50):
-    """جلب دفتر الطلبات بأمان مع معالجة الأخطاء"""
-    try:
-        ob = exchange.fetch_order_book(symbol, limit=limit)
-        return {"ok": True, "bids": ob.get("bids", []), "asks": ob.get("asks", []), "ts": ob.get("timestamp")}
-    except Exception as e:
-        log_w(f"Order book fetch failed: {e}")
-        return {"ok": False, "err": str(e)}
-
-def _diag_metrics(bids, asks, shift=FLOW_V2_SHIFT, depth=FLOW_V2_DEPTH):
-    """حساب المقاييس القطرية للدفتر"""
-    n = min(len(bids), len(asks) - shift, depth)
-    if n <= 0: 
-        return None
-    
-    diag_delta = 0.0
-    diag_ratio_sum = 0.0
-    
-    for i in range(n):
-        bsz = float(bids[i][1] or 0)
-        asz = float(asks[i + shift][1] or 0)
-        diag_delta += (bsz - asz)
-        diag_ratio_sum += (bsz / max(asz, 1e-9))
-    
-    return {
-        "n": n, 
-        "diag_delta": diag_delta, 
-        "diag_ratio": diag_ratio_sum / n,
-        "total_bid_vol": sum(float(b[1]) for b in bids[:n]),
-        "total_ask_vol": sum(float(a[1]) for a in asks[:n])
-    }
-
-def compute_flow_v2(exchange, symbol, trades_fn=None, price=None, wall_k=FLOW_V2_WALL_K, depth=FLOW_V2_DEPTH):
-    """الحساب الرئيسي لـ Flow-Pressure v2"""
-    if not FLOW_V2_ENABLED:
-        return {"ok": False, "why": "disabled"}
-    
-    ob = _safe_ob_fetch(exchange, symbol, limit=50)
-    if not ob["ok"]:
-        return {"ok": False, "why": "ob_fetch_failed", "err": ob.get("err")}
-    
-    m = _diag_metrics(ob["bids"], ob["asks"], shift=FLOW_V2_SHIFT, depth=depth)
-    if not m:
-        return {"ok": False, "why": "insufficient_depth"}
-    
-    # اكتشاف الجدران
-    all_sizes = []
-    for side in [ob["bids"][:depth], ob["asks"][:depth]]:
-        for _, size in side:
-            all_sizes.append(float(size))
-    
-    med_size = sorted(all_sizes)[len(all_sizes)//2] if all_sizes else 0
-    
-    # البحث عن جدران البيع والشراء
-    bid_wall_idx = None
-    ask_wall_idx = None
-    bid_wall_price = None
-    ask_wall_price = None
-    
-    for i, (price_val, size) in enumerate(ob["bids"][:depth]):
-        if float(size) >= wall_k * med_size:
-            bid_wall_idx = i
-            bid_wall_price = float(price_val)
-            break
-            
-    for i, (price_val, size) in enumerate(ob["asks"][:depth]):
-        if float(size) >= wall_k * med_size:
-            ask_wall_idx = i
-            ask_wall_price = float(price_val)
-            break
-    
-    # حساب z-score
-    _flow_hist.append(m["diag_delta"])
-    mu = sum(_flow_hist) / len(_flow_hist) if _flow_hist else 0.0
-    var = sum((x - mu) ** 2 for x in _flow_hist) / max(1, len(_flow_hist))
-    std = var ** 0.5 if var > 0 else 1e-9
-    z = (m["diag_delta"] - mu) / std
-
-    # حساب CVD من التداولات
-    cvd = 0
-    trade_imbalance = 0
-    if trades_fn:
-        try:
-            trades = trades_fn()
-            buys = sum(float(t["amount"]) for t in trades if str(t.get("side", "")).lower() == "buy")
-            sells = sum(float(t["amount"]) for t in trades if str(t.get("side", "")).lower() == "sell")
-            cvd = buys - sells
-            trade_imbalance = (buys - sells) / max(buys + sells, 1) * 100
-        except Exception as e:
-            log_w(f"Trades fetch failed: {e}")
-
-    # تصنيف العدوانية
-    agg = "flat"
-    agg_strength = 0.0
-    
-    if m["diag_ratio"] > FLOW_V2_AGGRESSION_RATIO_TH and z > FLOW_V2_AGGRESSION_Z_TH:
-        agg = "buy"
-        agg_strength = min(2.0, (m["diag_ratio"] - 1.0) * 2 + z)
-    elif m["diag_ratio"] < (1.0 / FLOW_V2_AGGRESSION_RATIO_TH) and z < -FLOW_V2_AGGRESSION_Z_TH:
-        agg = "sell" 
-        agg_strength = min(2.0, ((1.0 / m["diag_ratio"]) - 1.0) * 2 + abs(z))
-
-    # اكتشاف الامتصاص
-    absorption = None
-    wall_prox_bps = None
-    
-    if price is not None:
-        current_price = float(price)
-        
-        # حساب المسافة لأقرب جدار
-        if bid_wall_price and ask_wall_price:
-            bid_dist = abs(current_price - bid_wall_price) / current_price * 10000
-            ask_dist = abs(current_price - ask_wall_price) / current_price * 10000
-            wall_prox_bps = min(bid_dist, ask_dist)
-            
-            # اكتشاف الامتصاص
-            if agg == "buy" and ask_wall_idx is not None and ask_dist <= FLOW_V2_WALL_PROX_BPS:
-                absorption = "ask"
-            elif agg == "sell" and bid_wall_idx is not None and bid_dist <= FLOW_V2_WALL_PROX_BPS:
-                absorption = "bid"
-
-    return {
-        "ok": True,
-        "agg": agg,               # buy/sell/flat
-        "agg_strength": round(agg_strength, 2),
-        "ratio": round(m["diag_ratio"], 3),
-        "z": round(z, 2),
-        "cvd": float(cvd),
-        "trade_imbalance": round(trade_imbalance, 1),
-        "bid_wall_idx": bid_wall_idx,
-        "ask_wall_idx": ask_wall_idx,
-        "bid_wall_price": bid_wall_price,
-        "ask_wall_price": ask_wall_price,
-        "wall_prox_bps": wall_prox_bps,
-        "absorption": absorption,
-        "total_bid_vol": m["total_bid_vol"],
-        "total_ask_vol": m["total_ask_vol"],
-        "vol_imbalance": (m["total_bid_vol"] - m["total_ask_vol"]) / max(m["total_bid_vol"] + m["total_ask_vol"], 1) * 100
-    }
-
-def log_flow_v2_snapshot(flow_data):
-    """تسجيل لقطة Flow-Pressure v2"""
-    if not flow_data.get("ok"):
-        return
-        
-    agg = flow_data["agg"]
-    ratio = flow_data["ratio"]
-    z = flow_data["z"]
-    cvd = flow_data["cvd"]
-    absorption = flow_data.get("absorption")
-    wall_prox = flow_data.get("wall_prox_bps")
-    
-    if agg == "buy":
-        log_i(f"🟢 Flow: Buy  A={ratio:+.2f}  z={z:+.2f} | CVD 📊 {int(cvd):+} | wall⬆️ {wall_prox or '--'}bps")
-    elif agg == "sell":
-        log_i(f"🔴 Flow: Sell A={ratio:+.2f}  z={z:+.2f} | CVD 📊 {int(cvd):+} | wall⬇️ {wall_prox or '--'}bps")
-    else:
-        log_i(f"🟨 Flow: Flat  A={ratio:+.2f}  z={z:+.2f} | CVD 📊 {int(cvd):+}")
-    
-    if absorption:
-        log_w(f"🛡️ Absorption: {absorption} wall detected — tighten risk")
-        
-    # معلومات إضافية عن التوازن
-    vol_imb = flow_data.get("vol_imbalance", 0)
-    trade_imb = flow_data.get("trade_imbalance", 0)
-    log_i(f"📊 Vol-Imb: {vol_imb:+.1f}% | Trade-Imb: {trade_imb:+.1f}%")
-
 # =================== HYBRID SMART SYSTEM FUNCTIONS ===================
 def classify_move(ind, rsi_ctx):
     """تصنيف الحركة: سكالب vs ترند"""
@@ -465,37 +282,20 @@ def classify_move(ind, rsi_ctx):
     # خلاف ذلك سكالب ذكي
     return "scalp"
 
-def rf_entry_guard_ok(df, ind, spread_bps, last_adx_vals):
-    """التحقق المحسن من شروط دخول RF"""
+def rf_entry_guard_ok(ind, spread_bps, last_adx_vals):
+    """التحقق من شروط دخول RF"""
     if spread_bps is not None and spread_bps > RF_MAX_SPREAD_BPS:
         return False, f"spread {spread_bps:.1f}bps>{RF_MAX_SPREAD_BPS}"
     
     adx = ind.get('adx', 0.0)
-    di_plus = ind.get('plus_di', 0.0)
-    di_minus = ind.get('minus_di', 0.0)
-    di_spread = abs(di_plus - di_minus)
+    adx_rise = 0.0
+    if len(last_adx_vals) >= 3:
+        adx_rise = last_adx_vals[-1] - last_adx_vals[-3]
     
-    # شرط انتشار الاتجاه واستمرارية ADX
-    adx_persistence = 0
-    if len(last_adx_vals) >= 3:  # RF_ADX_PERSISTENCE
-        adx_persistence = sum(1 for i in range(1, 4) if last_adx_vals[-i] >= RF_ADX_MIN)
-    
-    # الشرط الأساسي: ADX مرتفع أو متصاعد مع انتشار DI
-    basic_condition = (adx >= RF_ADX_MIN and di_spread >= 6.0 and adx_persistence >= 2)
-    
-    # الشرط المبكر: Council قوي مع إشارات ذهبية/FVG
-    early_condition = False
-    if adx >= 16.0:  # COUNCIL_EARLY_ADX_MIN
-        cv = council_votes_pro_enhanced(df)
-        gz = cv["ind"].get("gz", {})
-        fvg_ok = detect_fvg(df).get("ok", False)
-        council_strong = max(cv["score_b"], cv["score_s"]) >= 7.0  # COUNCIL_EARLY_ENTRY_MIN
-        early_condition = council_strong and (gz.get("ok") or fvg_ok)
-    
-    if basic_condition or early_condition:
+    if adx >= RF_ADX_MIN or adx_rise >= RF_ADX_RISE_DELTA:
         return True, None
     
-    return False, f"ADX {adx:.1f}<{RF_ADX_MIN} or DI-spread {di_spread:.1f}<6.0 or ADX-persistence {adx_persistence}<2"
+    return False, f"ADX {adx:.1f}<{RF_ADX_MIN} & ΔADX {adx_rise:.2f}<{RF_ADX_RISE_DELTA}"
 
 def maybe_open_via_rf(df, info, ind, spread_bps, last_adx_vals):
     """الدخول السريع عبر RF مع تصنيف النمط"""
@@ -515,7 +315,7 @@ def maybe_open_via_rf(df, info, ind, spread_bps, last_adx_vals):
         return
     
     # التحقق من شروط الدخول
-    ok, reason = rf_entry_guard_ok(df, ind, spread_bps, last_adx_vals)
+    ok, reason = rf_entry_guard_ok(ind, spread_bps, last_adx_vals)
     if not ok:
         log_i(f"RF_SKIP | {reason}")
         return
@@ -535,23 +335,15 @@ def maybe_open_via_rf(df, info, ind, spread_bps, last_adx_vals):
         STATE["adds"] = 0  # إعادة تعزيزات لصفر
         log_g(f"🟢 RF ENTRY {sig.upper()} | mode={mode} | ADX={ind.get('adx',0):.1f} DIsp={abs(ind.get('plus_di',0)-ind.get('minus_di',0)):.1f}")
 
-def council_opportunistic_action_enhanced(df, ind, extras):
-    """المجلس الانتهازي المحسن - فتح/تعزيز عند الفرص القوية"""
+def council_opportunistic_action(df, ind, extras):
+    """المجلس الانتهازي - فتح/تعزيز عند الفرص القوية"""
     if not COUNCIL_OPPORTUNISTIC_MODE:
         return
         
-    # التحقق من التبريد
-    if STATE.get("last_action_time") and len(df) > 0:
-        last_action_ts = STATE["last_action_time"]
-        current_ts = int(df["time"].iloc[-1])
-        tf_ms = _interval_seconds(INTERVAL) * 1000
-        if current_ts - last_action_ts < 2 * tf_ms:  # ACTION_COOLDOWN_CANDLES = 2
-            return
-
     cv = council_votes_pro_enhanced(df)
     gz = cv["ind"].get("gz", {})
     adx = cv["ind"].get("adx", 0.0)
-    rsi_ctx = rsi_ma_context(df)
+    rsi_trend = cv["ind"].get("rsi_trendz", "flat")
     score_b, score_s = cv["score_b"], cv["score_s"]
     winner = "buy" if score_b > score_s else "sell"
     winner_score = max(score_b, score_s)
@@ -560,67 +352,51 @@ def council_opportunistic_action_enhanced(df, ind, extras):
     if not current_price:
         return
 
-    # الحصول على إشارات التدفق والكتل
-    bm = extras.get("bm", {})
-    flow = extras.get("flow", {})
-    flow_v2 = cv["ind"].get("flow_v2", {})
-    fvg_ok = detect_fvg(df).get("ok", False)
-    imbalance_ok = bm.get("imbalance", 1.0) >= 1.10 if bm.get("ok") else False  # COUNCIL_ENTRY_IMBALANCE_MIN
-    flow_pressure = flow_v2.get("ok") and flow_v2.get("agg_strength", 0) > 1.0
-    no_chop = not rsi_ctx["in_chop"]
-
-    # 1- تعزيز ذكي للصفقة الحالية
+    # 4.a — تعزيز ذكي للصفقة الحالية
     if STATE["open"] and SCALE_IN_ENABLED and STATE.get("adds", 0) < SCALE_IN_MAX_ADDS:
         same_dir = (STATE["side"] == "long" and winner == "buy") or (STATE["side"] == "short" and winner == "sell")
         enough_conf = winner_score >= SCALE_IN_MIN_CONFIDENCE
         
-        # شروط التعزيز: أي اثنين من الأربعة
-        conditions = {
-            "golden_zone": gz and gz.get("ok") and (
-                (gz["zone"]["type"] == "golden_bottom" and STATE["side"] == "long") or
-                (gz["zone"]["type"] == "golden_top" and STATE["side"] == "short")
-            ),
-            "fvg": fvg_ok,
-            "flow_pressure": flow_pressure,
-            "imbalance": imbalance_ok
-        }
-        conditions_met = sum(conditions.values()) >= 2
+        # اكتشاف الفرص الذهبية/FVG/التدفق
+        golden_ok = gz and gz.get("ok") and (
+            (gz["zone"]["type"] == "golden_bottom" and STATE["side"] == "long") or
+            (gz["zone"]["type"] == "golden_top" and STATE["side"] == "short")
+        )
         
+        fvg_ok = detect_fvg(df).get("ok", False)
+        flow_ok = extras.get("flow", {}).get("ok") and extras["flow"].get("cvd_trend") == ("up" if STATE["side"] == "long" else "down")
         dist_ok = abs(current_price - STATE["entry"]) / STATE["entry"] * 10000.0 >= SCALE_IN_MIN_DISTANCE_BPS
 
-        if same_dir and enough_conf and conditions_met and no_chop and dist_ok:
+        if same_dir and enough_conf and adx >= GZ_REQ_ADX and (golden_ok or fvg_ok or flow_ok) and dist_ok:
             add_qty = safe_qty(STATE["qty"] * SCALE_IN_STEP_PCT)
             if add_qty > 0:
                 side = "buy" if STATE["side"] == "long" else "sell"
                 if MODE_LIVE and EXECUTE_ORDERS and not DRY_RUN:
                     try:
                         ex.create_order(SYMBOL, "market", side, add_qty, None, _params_open(side))
-                        log_g(f"➕ COUNCIL ADD-ON {side.upper()} | conf={winner_score:.1f} | conditions={sum(conditions.values())}/4")
+                        log_g(f"➕ COUNCIL ADD-ON {side.upper()} | conf={winner_score:.1f} | gz={golden_ok} | fvg={fvg_ok} | flow={flow_ok}")
                         STATE["qty"] = safe_qty(STATE["qty"] + add_qty)
                         STATE["adds"] = STATE.get("adds", 0) + 1
-                        STATE["last_action_time"] = int(df["time"].iloc[-1])
                         save_state(STATE)
                     except Exception as e:
                         log_e(f"❌ Scale-in failed: {e}")
                 else:
                     log_i(f"DRY_RUN: Scale-in {side.upper()} {add_qty:.4f}")
 
-    # 2- فتح انتهازي عند الفرص الذهبية
+    # 4.b — فتح انتهازي عند الفرص الذهبية
     if not STATE["open"]:
         golden_buy = gz and gz.get("ok") and gz["zone"]["type"] == "golden_bottom" and winner == "buy"
         golden_sell = gz and gz.get("ok") and gz["zone"]["type"] == "golden_top" and winner == "sell"
+        strong_flow = extras.get("flow", {}).get("ok") and extras["flow"].get("cvd_trend") == ("up" if winner == "buy" else "down")
         
-        strong_flow = flow_v2.get("ok") and flow_v2.get("agg") == winner
-        rsi_cross = (winner == "buy" and rsi_ctx["cross"] == "bull") or (winner == "sell" and rsi_ctx["cross"] == "bear")
-        
-        if (golden_buy or golden_sell) and adx >= 20.0 and rsi_cross and imbalance_ok and no_chop:  # COUNCIL_ENTRY_ADX_MIN
+        if (golden_buy or golden_sell) and adx >= GZ_REQ_ADX and rsi_trend in ("bull", "bear") and winner_score >= GZ_MIN_SCORE:
             bal = balance_usdt()
             qty = compute_size(bal, current_price)
             if qty > 0:
                 if open_market(winner, qty, current_price):
+                    rsi_ctx = rsi_ma_context(df)
                     STATE["mode"] = classify_move(ind, rsi_ctx)
                     STATE["adds"] = 0
-                    STATE["last_action_time"] = int(df["time"].iloc[-1])
                     log_g(f"🏆 COUNCIL ENTRY {winner.upper()} | golden={gz['zone']['type']} | score={winner_score:.1f} | ADX={adx:.1f}")
 
 # =================== SMC/ICT TOOLS ===================
@@ -856,8 +632,8 @@ def verify_execution_environment():
     """التحقق من بيئة التنفيذ عند الإقلاع"""
     print(f"⚙️ EXECUTION ENVIRONMENT", flush=True)
     print(f"🔧 EXECUTE_ORDERS: {EXECUTE_ORDERS} | SHADOW_MODE: {SHADOW_MODE_DASHBOARD} | DRY_RUN: {DRY_RUN}", flush=True)
-    print(f"🎯 HYBRID SMART SYSTEM: Fast RF + Council ELITE + Flow-Pressure v2", flush=True)
-    print(f"📈 SMC/ICT: Golden Zones + FVG + BOS + Sweeps + Scale-In + Diagonal Analysis", flush=True)
+    print(f"🎯 HYBRID SMART SYSTEM: Fast RF + Council ELITE + Smart Management", flush=True)
+    print(f"📈 SMC/ICT: Golden Zones + FVG + BOS + Sweeps + Scale-In", flush=True)
     
     if not EXECUTE_ORDERS:
         print("🟡 WARNING: EXECUTE_ORDERS=False - البوت في وضع التحليل فقط!", flush=True)
@@ -1024,12 +800,12 @@ def decide_strategy_mode(df, adx=None, di_plus=None, di_minus=None, rsi_ctx=None
     
     return {"mode": mode, "why": why}
 
-# =================== COUNCIL ELITE VOTING WITH FLOW-PRESSURE v2 ===================
+# =================== COUNCIL ELITE VOTING ===================
 COUNCIL_BUSY = False
 LAST_COUNCIL = {"b": 0, "s": 0, "score_b": 0.0, "score_s": 0.0, "logs": [], "ind": {}}
 
-def council_votes_pro_enhanced_with_flow_v2(df):
-    """مجلس محسّن مع دمج Flow-Pressure v2"""
+def council_votes_pro_enhanced(df):
+    """مجلس محسّن — بدون أي استدعاءات ل emit_snapshots لتفادي recursion"""
     global COUNCIL_BUSY, LAST_COUNCIL
     if COUNCIL_BUSY:
         return LAST_COUNCIL
@@ -1043,22 +819,12 @@ def council_votes_pro_enhanced_with_flow_v2(df):
         votes_b = votes_s = 0
         score_b = score_s = 0.0
         logs = []
-        actions = []
 
         adx = ind.get('adx', 0.0)
         plus_di = ind.get('plus_di', 0.0)
         minus_di = ind.get('minus_di', 0.0)
         di_spread = abs(plus_di - minus_di)
 
-        # حساب Flow-Pressure v2
-        current_price = price_now()
-        flow_v2 = compute_flow_v2(
-            ex, SYMBOL, 
-            trades_fn=lambda: ex.fetch_trades(SYMBOL, limit=100),
-            price=current_price
-        )
-
-        # 1- التصويت الأساسي من المؤشرات التقنية
         if adx > ADX_TREND_MIN:
             if plus_di > minus_di and di_spread > DI_SPREAD_TREND:
                 votes_b += 2
@@ -1097,52 +863,6 @@ def council_votes_pro_enhanced_with_flow_v2(df):
                 score_s += 1.5
                 logs.append(f"🏆 قمة ذهبية (قوة {gz['score']:.1f})")
 
-        # 2- التصويت من Flow-Pressure v2
-        if flow_v2.get("ok"):
-            # عدوانية الشراء
-            if flow_v2["agg"] == "buy":
-                votes_b += 2
-                score_b += 1.2
-                logs.append(f"💰 ضغط شراء (A={flow_v2['ratio']:.2f} z={flow_v2['z']:.2f})")
-                
-                # دفعة إضافية مع Golden Zone
-                if gz and gz.get("ok") and gz['zone']['type'] == 'golden_bottom':
-                    votes_b += 2
-                    score_b += 1.0
-                    logs.append("🚀 دفعة ذهبية مع ضغط شراء")
-                    
-            # عدوانية البيع        
-            elif flow_v2["agg"] == "sell":
-                votes_s += 2
-                score_s += 1.2
-                logs.append(f"💸 ضغط بيع (A={flow_v2['ratio']:.2f} z={flow_v2['z']:.2f})")
-                
-                # دفعة إضافية مع Golden Zone
-                if gz and gz.get("ok") and gz['zone']['type'] == 'golden_top':
-                    votes_s += 2
-                    score_s += 1.0
-                    logs.append("🚀 دفعة ذهبية مع ضغط بيع")
-
-            # اكتشاف الامتصاص وإدارة المخاطر
-            if STATE.get("open"):
-                if STATE["side"] == "long" and flow_v2["absorption"] == "ask":
-                    actions.append({"type": "tighten_trail", "why": "امتصاص بيعي"})
-                    logs.append("🛡️ تشديد بسبب امتصاص بيعي")
-                    
-                elif STATE["side"] == "short" and flow_v2["absorption"] == "bid":
-                    actions.append({"type": "tighten_trail", "why": "امتصاص شرائي"})
-                    logs.append("🛡️ تشديد بسبب امتصاص شرائي")
-
-            # السماح بالسكالب في ظروف محددة
-            spread_bps = orderbook_spread_bps()
-            allow_scalp = False
-            if (adx < 18 and flow_v2["agg"] in ("buy", "sell") and 
-                abs(flow_v2["z"]) >= FLOW_V2_SCALP_Z_TH and 
-                spread_bps and spread_bps <= 6):
-                allow_scalp = True
-                logs.append("⚡ سكالب مسموح (ADX منخفض + ضغط عالي)")
-
-        # 3- التعديلات النهائية
         if rsi_ctx["in_chop"]:
             score_b *= 0.8
             score_s *= 0.8
@@ -1157,9 +877,7 @@ def council_votes_pro_enhanced_with_flow_v2(df):
             "rsi_ma": rsi_ctx["rsi_ma"], 
             "rsi_trendz": rsi_ctx["trendZ"], 
             "di_spread": di_spread, 
-            "gz": gz,
-            "flow_v2": flow_v2,
-            "allow_scalp": allow_scalp
+            "gz": gz
         })
         
         result = {
@@ -1168,7 +886,6 @@ def council_votes_pro_enhanced_with_flow_v2(df):
             "score_b": round(score_b, 2),
             "score_s": round(score_s, 2),
             "logs": logs,
-            "actions": actions,
             "ind": ind
         }
         
@@ -1176,12 +893,12 @@ def council_votes_pro_enhanced_with_flow_v2(df):
         return result
         
     except Exception as e:
-        addon_log_safe(f"council_votes_pro_enhanced_with_flow_v2 error: {e}")
+        addon_log_safe(f"council_votes_pro_enhanced error: {e}")
         return LAST_COUNCIL
     finally:
         COUNCIL_BUSY = False
 
-council_votes_pro = council_votes_pro_enhanced_with_flow_v2
+council_votes_pro = council_votes_pro_enhanced
 
 # =================== SMART TRADE MANAGEMENT ===================
 def setup_trade_management(mode):
@@ -1556,18 +1273,17 @@ def compute_flow_metrics(df):
     except Exception as e:
         return {"ok": False, "why": str(e)}
 
-# ========= Unified snapshot emitter with Flow-Pressure v2 =========
-def emit_snapshots_with_flow_v2(exchange, symbol, df, balance_fn=None, pnl_fn=None, council=None):
-    """تحديث الـ Snapshots مع دمج Flow-Pressure v2"""
+# ========= Unified snapshot emitter =========
+def emit_snapshots(exchange, symbol, df, balance_fn=None, pnl_fn=None, council=None):
+    """
+    يطبع Snapshot موحّد: Bookmap + Flow + Council + Strategy + Balance/PnL
+    """
     try:
         bm = bookmap_snapshot(exchange, symbol)
         flow = compute_flow_metrics(df)
-        flow_v2 = compute_flow_v2(exchange, symbol, 
-                                trades_fn=lambda: exchange.fetch_trades(symbol, limit=100),
-                                price=price_now())
         
         if council is None:
-            cv = council_votes_pro_enhanced_with_flow_v2(df)
+            cv = council_votes_pro_enhanced(df)
         else:
             cv = council
             
@@ -1582,18 +1298,12 @@ def emit_snapshots_with_flow_v2(exchange, symbol, df, balance_fn=None, pnl_fn=No
             try: cpnl = pnl_fn()
             except: cpnl = None
 
-        # لوج Bookmap العادي
         if bm.get("ok"):
             imb_tag = "🟢" if bm["imbalance"]>=IMBALANCE_ALERT else ("🔴" if bm["imbalance"]<=1/IMBALANCE_ALERT else "⚖️")
             bm_note = f"Bookmap: {imb_tag} Imb={bm['imbalance']:.2f} | Buy[{fmt_walls(bm['buy_walls'])}] | Sell[{fmt_walls(bm['sell_walls'])}]"
         else:
             bm_note = f"Bookmap: N/A ({bm.get('why')})"
 
-        # لوج Flow-Pressure v2
-        if flow_v2.get("ok"):
-            log_flow_v2_snapshot(flow_v2)
-
-        # لوج Flow العادي
         if flow.get("ok"):
             dtag = "🟢Buy" if flow["delta_last"]>0 else ("🔴Sell" if flow["delta_last"]<0 else "⚖️Flat")
             spk = " ⚡Spike" if flow["spike"] else ""
@@ -1601,7 +1311,6 @@ def emit_snapshots_with_flow_v2(exchange, symbol, df, balance_fn=None, pnl_fn=No
         else:
             fl_note = f"Flow: N/A ({flow.get('why')})"
 
-        # الباقي من اللوج العادي
         side_hint = "BUY" if cv["b"]>=cv["s"] else "SELL"
         dash = (f"DASH → hint-{side_hint} | Council BUY({cv['b']},{cv['score_b']:.1f}) "
                 f"SELL({cv['s']},{cv['score_s']:.1f}) | "
@@ -1624,14 +1333,28 @@ def emit_snapshots_with_flow_v2(exchange, symbol, df, balance_fn=None, pnl_fn=No
             print(f"📦 {fl_note}", flush=True)
             print(f"📊 {dash}{gz_note}", flush=True)
             print(f"{strat}{(' | ' + wallet) if wallet else ''}", flush=True)
+            
+            gz_snap_note = ""
+            if gz and gz.get("ok"):
+                zone_type = gz["zone"]["type"]
+                zone_score = gz["score"]
+                gz_snap_note = f" | 🟡{zone_type} s={zone_score:.1f}"
+            
+            flow_z = flow['delta_z'] if flow and flow.get('ok') else 0.0
+            bm_imb = bm['imbalance'] if bm and bm.get('ok') else 1.0
+            
+            print(f"🧠 SNAP | {side_hint} | votes={cv['b']}/{cv['s']} score={cv['score_b']:.1f}/{cv['score_s']:.1f} "
+                  f"| ADX={cv['ind'].get('adx',0):.1f} DI={cv['ind'].get('di_spread',0):.1f} | "
+                  f"z={flow_z:.2f} | imb={bm_imb:.2f}{gz_snap_note}", 
+                  flush=True)
+            
+            print("✅ ADDONS LIVE", flush=True)
 
-        return {"bm": bm, "flow": flow, "flow_v2": flow_v2, "cv": cv, "mode": mode, "gz": gz, "wallet": wallet}
+        return {"bm": bm, "flow": flow, "cv": cv, "mode": mode, "gz": gz, "wallet": wallet}
     except Exception as e:
         addon_log_safe(f"🟨 AddonLog error: {e}")
-        return {"bm": None, "flow": None, "flow_v2": None, "cv": {"b":0,"s":0,"score_b":0.0,"score_s":0.0,"ind":{}},
+        return {"bm": None, "flow": None, "cv": {"b":0,"s":0,"score_b":0.0,"score_s":0.0,"ind":{}},
                 "mode": {"mode":"n/a"}, "gz": None, "wallet": ""}
-
-emit_snapshots = emit_snapshots_with_flow_v2
 
 # =================== EXECUTION MANAGER ===================
 def execute_trade_decision(side, price, qty, mode, council_data, gz_data):
@@ -1672,7 +1395,7 @@ def open_market_enhanced(side, qty, price):
     
     df = fetch_ohlcv()
     
-    cv = council_votes_pro_enhanced_with_flow_v2(df)
+    cv = council_votes_pro_enhanced(df)
     snap = emit_snapshots(ex, SYMBOL, df, council=cv)
     
     votes = cv
@@ -1727,7 +1450,7 @@ def open_market_enhanced(side, qty, price):
         
         log_trade_open(
             side=side, price=price, qty=qty, leverage=LEVERAGE,
-            source="Hybrid Smart System + Flow-Pressure v2",
+            source="Hybrid Smart System",
             mode=mode,
             risk_alloc=RISK_ALLOC,
             council=votes,
@@ -1899,48 +1622,7 @@ def _reset_after_close(reason, prev_side=None):
     _arm_wait_after_close(prev_side)
     logging.info(f"AFTER_CLOSE waiting_for={wait_for_next_signal_side}")
 
-# =================== ENHANCED TRADE MANAGEMENT WITH FLOW-PRESSURE v2 ===================
-def manage_after_entry_with_flow_v2(df, ind, info):
-    """إدارة محسنة للمركز مع دمج Flow-Pressure v2"""
-    if not STATE["open"] or STATE["qty"] <= 0:
-        return
-
-    px = info["price"]
-    entry = STATE["entry"]
-    side = STATE["side"]
-    qty = STATE["qty"]
-    mode = STATE.get("mode", "trend")
-    
-    pnl_pct = (px - entry) / entry * 100 * (1 if side == "long" else -1)
-    STATE["pnl"] = pnl_pct
-    
-    if pnl_pct > STATE["highest_profit_pct"]:
-        STATE["highest_profit_pct"] = pnl_pct
-
-    # حساب المجلس مع Flow-Pressure v2
-    cv = council_votes_pro_enhanced_with_flow_v2(df)
-    flow_v2 = cv["ind"].get("flow_v2", {})
-    
-    # تطبيق إجراءات Flow-Pressure v2
-    for action in cv.get("actions", []):
-        if action["type"] == "tighten_trail" and not STATE.get("trail_tightened"):
-            STATE["trail_tightened"] = True
-            STATE["trail"] = None
-            log_w(f"🔄 TRAIL TIGHTENED: {action['why']}")
-
-    # اكتشاف الامتصاص المتكرر
-    if flow_v2.get("ok") and flow_v2.get("absorption"):
-        absorption_key = f"absorption_{flow_v2['absorption']}"
-        STATE[absorption_key] = STATE.get(absorption_key, 0) + 1
-        
-        # إذا تكرر الامتصاص مرتين، استعداد للإغلاق
-        if STATE[absorption_key] >= 2:
-            STATE["strict_close_ready"] = True
-            log_w(f"🚨 STRICT CLOSE READY: repeated {flow_v2['absorption']} absorption")
-
-    # الباقي من إدارة الصفقة العادية
-    manage_after_entry_enhanced(df, ind, info)
-
+# =================== ENHANCED TRADE MANAGEMENT ===================
 def manage_after_entry_enhanced(df, ind, info):
     """إدارة محسنة للمركز مع خروج ذكي حسب النمط"""
     if not STATE["open"] or STATE["qty"] <= 0:
@@ -1959,7 +1641,7 @@ def manage_after_entry_enhanced(df, ind, info):
     if pnl_pct > STATE["highest_profit_pct"]:
         STATE["highest_profit_pct"] = pnl_pct
 
-    cv = council_votes_pro_enhanced_with_flow_v2(df)
+    cv = council_votes_pro_enhanced(df)
     snap = emit_snapshots(ex, SYMBOL, df, council=cv)
     
     gz = snap["gz"]
@@ -2050,18 +1732,17 @@ def manage_after_entry_enhanced(df, ind, info):
         log_w(f"DUST GUARD: qty {STATE['qty']} <= {FINAL_CHUNK_QTY}, closing...")
         close_market_strict("dust_guard")
 
-manage_after_entry = manage_after_entry_with_flow_v2
+manage_after_entry = manage_after_entry_enhanced
 
 # =================== ENHANCED TRADE LOOP ===================
-def trade_loop_enhanced_final():
-    """الحلقة النهائية المحسنة مع جميع التحسينات"""
+def trade_loop_enhanced():
+    """حلقة تداول محسنة مع النظام الهجيني الذكي"""
     global wait_for_next_signal_side
     loop_i = 0
     last_adx_vals = []
     
     while True:
         try:
-            # جمع البيانات الأساسية
             bal = balance_usdt()
             px = price_now()
             df = fetch_ohlcv()
@@ -2069,13 +1750,12 @@ def trade_loop_enhanced_final():
             ind = compute_indicators(df)
             spread_bps = orderbook_spread_bps()
             
-            # تحديث تاريخ ADX
             current_adx = ind.get('adx', 0.0)
             last_adx_vals.append(current_adx)
             if len(last_adx_vals) > 5:
                 last_adx_vals.pop(0)
             
-            council_data = council_votes_pro_enhanced_with_flow_v2(df)
+            council_data = council_votes_pro_enhanced(df)
             
             snap = emit_snapshots(ex, SYMBOL, df,
                                 balance_fn=lambda: float(bal) if bal else None,
@@ -2085,7 +1765,7 @@ def trade_loop_enhanced_final():
             if STATE["open"] and px:
                 STATE["pnl"] = (px - STATE["entry"]) * STATE["qty"] if STATE["side"] == "long" else (STATE["entry"] - px) * STATE["qty"]
             
-            # 1- الدخول السريع عبر RF (المحسن)
+            # 1- الدخول السريع عبر RF
             maybe_open_via_rf(df, info, ind, spread_bps, last_adx_vals)
             
             # 2- إدارة الصفقة المفتوحة
@@ -2097,8 +1777,8 @@ def trade_loop_enhanced_final():
                     **info
                 })
             
-            # 3- المجلس الانتهازي المحسن
-            council_opportunistic_action_enhanced(df, ind, snap)
+            # 3- المجلس الانتهازي (فتح/تعزيز)
+            council_opportunistic_action(df, ind, snap)
             
             if LOG_LEGACY:
                 pretty_snapshot(bal, {"price": px or info["price"], **info}, ind, spread_bps, None, df)
@@ -2112,7 +1792,7 @@ def trade_loop_enhanced_final():
             logging.error(f"trade_loop error: {e}\n{traceback.format_exc()}")
             time.sleep(BASE_SLEEP)
 
-trade_loop = trade_loop_enhanced_final
+trade_loop = trade_loop_enhanced
 
 # =================== LOOP / LOG ===================
 def pretty_snapshot(bal, info, ind, spread_bps, reason=None, df=None):
@@ -2124,7 +1804,7 @@ def pretty_snapshot(bal, info, ind, spread_bps, reason=None, df=None):
         print("📈 INDICATORS & RF")
         print(f"   💲 Price {fmt(info.get('price'))} | RF filt={fmt(info.get('filter'))}  hi={fmt(info.get('hi'))} lo={fmt(info.get('lo'))}")
         print(f"   🧮 RSI={fmt(ind.get('rsi'))}  +DI={fmt(ind.get('plus_di'))}  -DI={fmt(ind.get('minus_di'))}  ADX={fmt(ind.get('adx'))}  ATR={fmt(ind.get('atr'))}")
-        print(f"   🎯 ENTRY: HYBRID SMART SYSTEM (Fast RF + Council ELITE + Flow-Pressure v2)  |  spread_bps={fmt(spread_bps,2)}")
+        print(f"   🎯 ENTRY: HYBRID SMART SYSTEM (Fast RF + Council ELITE)  |  spread_bps={fmt(spread_bps,2)}")
         print(f"   ⏱️ closes_in ≈ {left_s}s")
         print("\n🧭 POSITION")
         bal_line = f"Balance={fmt(bal,2)}  Risk={int(RISK_ALLOC*100)}%×{LEVERAGE}x  CompoundPnL={fmt(compound_pnl)}  Eq~{fmt((bal or 0)+compound_pnl,2)}"
@@ -2146,24 +1826,16 @@ app = Flask(__name__)
 @app.route("/")
 def home():
     mode='LIVE' if MODE_LIVE else 'PAPER'
-    return f"✅ Hybrid Smart System Bot — {SYMBOL} {INTERVAL} — {mode} — Fast RF + Council ELITE + Flow-Pressure v2"
+    return f"✅ Hybrid Smart System Bot — {SYMBOL} {INTERVAL} — {mode} — Fast RF + Council ELITE + Smart Management"
 
 @app.route("/metrics")
 def metrics():
-    # حساب Flow-Pressure v2 الحالي
-    current_flow_v2 = compute_flow_v2(
-        ex, SYMBOL, 
-        trades_fn=lambda: ex.fetch_trades(SYMBOL, limit=100),
-        price=price_now()
-    )
-    
     return jsonify({
         "symbol": SYMBOL, "interval": INTERVAL, "mode": "live" if MODE_LIVE else "paper",
         "leverage": LEVERAGE, "risk_alloc": RISK_ALLOC, "price": price_now(),
         "state": STATE, "compound_pnl": compound_pnl,
-        "entry_mode": "HYBRID_SMART_SYSTEM_WITH_FLOW_V2", "wait_for_next_signal": wait_for_next_signal_side,
-        "guards": {"max_spread_bps": MAX_SPREAD_BPS, "final_chunk_qty": FINAL_CHUNK_QTY},
-        "flow_v2": current_flow_v2 if current_flow_v2.get("ok") else None
+        "entry_mode": "HYBRID_SMART_SYSTEM", "wait_for_next_signal": wait_for_next_signal_side,
+        "guards": {"max_spread_bps": MAX_SPREAD_BPS, "final_chunk_qty": FINAL_CHUNK_QTY}
     })
 
 @app.route("/health")
@@ -2185,7 +1857,7 @@ def keepalive_loop():
 
 # =================== BOOT ===================
 if __name__ == "__main__":
-    log_banner("HYBRID SMART SYSTEM WITH FLOW-PRESSURE v2")
+    log_banner("HYBRID SMART SYSTEM INIT")
     state = load_state() or {}
     state.setdefault("in_position", False)
 
@@ -2200,16 +1872,11 @@ if __name__ == "__main__":
     print(colored(f"MODE: {'LIVE' if MODE_LIVE else 'PAPER'}  •  {SYMBOL}  •  {INTERVAL}", "yellow"))
     print(colored(f"RISK: {int(RISK_ALLOC*100)}% × {LEVERAGE}x  •  HYBRID_SYSTEM=ENABLED", "yellow"))
     print(colored(f"FAST RF: ADX≥{RF_ADX_MIN} | ΔADX≥{RF_ADX_RISE_DELTA} | Spread≤{RF_MAX_SPREAD_BPS}bps", "yellow"))
-    print(colored(f"FLOW-PRESSURE v2: ENABLED", "green"))
-    print(colored(f"  • Depth: {FLOW_V2_DEPTH} | Shift: {FLOW_V2_SHIFT} | Wall-K: {FLOW_V2_WALL_K}", "cyan"))
-    print(colored(f"  • Aggression: ratio>{FLOW_V2_AGGRESSION_RATIO_TH} | z>{FLOW_V2_AGGRESSION_Z_TH}", "cyan"))
-    print(colored(f"  • Scalp Trigger: z≥{FLOW_V2_SCALP_Z_TH} with spread≤6bps", "cyan"))
-    print(colored(f"  • Wall Proximity: {FLOW_V2_WALL_PROX_BPS}bps", "cyan"))
-    print(colored(f"COUNCIL ELITE: Golden Zones + Scale-In + Opportunistic Entries + Diagonal Analysis", "yellow"))
-    print(colored(f"MANAGEMENT: Smart TP + Smart Exit + Trail Adaptation + Absorption Detection", "yellow"))
+    print(colored(f"COUNCIL ELITE: Golden Zones + Scale-In + Opportunistic Entries", "yellow"))
+    print(colored(f"MANAGEMENT: Smart TP + Smart Exit + Trail Adaptation", "yellow"))
     print(colored(f"EXECUTION: {'ACTIVE' if EXECUTE_ORDERS and not DRY_RUN else 'SIMULATION'}", "yellow"))
     
-    logging.info("Hybrid Smart System with Flow-Pressure v2 service starting…")
+    logging.info("Hybrid Smart System service starting…")
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
     signal.signal(signal.SIGINT,  lambda *_: sys.exit(0))
     
