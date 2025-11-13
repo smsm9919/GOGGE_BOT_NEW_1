@@ -5,6 +5,7 @@ RF Futures Bot — RF-LIVE ONLY (BingX Perp via CCXT)
 • Golden Entry + SMC/ICT + Smart Exit Management
 • Dynamic TP ladder + Breakeven + ATR-trailing
 • Professional Logging & Dashboard
+• ENHANCED VERSION - More Trades & Faster Execution
 """
 
 import os, time, math, random, signal, sys, traceback, logging, json
@@ -39,7 +40,7 @@ SHADOW_MODE_DASHBOARD = False
 DRY_RUN = False
 
 # ==== Addon: Logging + Recovery Settings ====
-BOT_VERSION = "DOGE Council ELITE v5.0 — Smart Management System"
+BOT_VERSION = "DOGE Council ELITE v6.0 — Enhanced Fast Trading"
 print("🔁 Booting:", BOT_VERSION, flush=True)
 
 STATE_PATH = "./bot_state.json"
@@ -76,38 +77,36 @@ ADX_LEN = 14
 ATR_LEN = 14
 
 ENTRY_RF_ONLY = False
-MAX_SPREAD_BPS = float(os.getenv("MAX_SPREAD_BPS", 6.0))
 
-# =================== COUNCIL ELITE SETTINGS ===================
-# Council Weights & Gates
-ADX_GATE = 17.0
-ADX_TREND_MIN = 22.0
-DI_SPREAD_TREND = 6.0
+# =================== COUNCIL ELITE SETTINGS - ENHANCED ===================
+# Council Weights & Gates - RELAXED FOR MORE TRADES
+ADX_GATE = 12.0           # ⬇️ كان 17.0 - تخفيض 29%
+ADX_TREND_MIN = 15.0      # ⬇️ كان 22.0 - تخفيض 32%
+DI_SPREAD_TREND = 5.0     # ⬇️ كان 6.0 - تخفيض 17%
 RSI_MA_LEN = 9
 
-# ADDED MISSING CONSTANTS
-RSI_TREND_PERSIST = 5  # Number of bars for RSI trend confirmation
-RSI_NEUTRAL_BAND = (45, 55)  # RSI range considered neutral/choppy
+RSI_TREND_PERSIST = 5
+RSI_NEUTRAL_BAND = (45, 55)
 
-# Golden Zones
+# Golden Zones - RELAXED
 GZ_FIB_LOW = 0.618
 GZ_FIB_HIGH = 0.786
-GZ_MIN_SCORE = 6.0
-GZ_ADX_MIN = 20.0
-GOLDEN_ENTRY_SCORE = 6.0
-GOLDEN_ENTRY_ADX = 20.0
-GOLDEN_REVERSAL_SCORE = 6.5
+GZ_MIN_SCORE = 3.0        # ⬇️ كان 6.0 - تخفيض 50%
+GZ_ADX_MIN = 14.0         # ⬇️ كان 20.0 - تخفيض 30%
+GOLDEN_ENTRY_SCORE = 3.0  # ⬇️ كان 6.0 - تخفيض 50%
+GOLDEN_ENTRY_ADX = 14.0   # ⬇️ كان 20.0 - تخفيض 30%
+GOLDEN_REVERSAL_SCORE = 4.0  # ⬇️ كان 6.5 - تخفيض 38%
 
-# FVG/SMC
-FVG_MIN_BPS = 8.0
-BOS_MIN_PCT = 0.35
-SWEEP_WICK_X_ATR = 1.2
-OB_LOOKBACK = 40
+# FVG/SMC - RELAXED
+FVG_MIN_BPS = 6.0         # ⬇️ كان 8.0 - تخفيض 25%
+BOS_MIN_PCT = 0.25        # ⬇️ كان 0.35 - تخفيض 29%
+SWEEP_WICK_X_ATR = 1.0    # ⬇️ كان 1.2 - تخفيض 17%
+OB_LOOKBACK = 35          # ⬇️ كان 40 - تخفيض 13%
 
 # Flow/Bookmap
-DELTA_Z_BULL = 0.50
-DELTA_Z_BEAR = -0.50
-IMB_ALERT = 1.20
+DELTA_Z_BULL = 0.40       # ⬇️ كان 0.50 - تخفيض 20%
+DELTA_Z_BEAR = -0.40      # ⬇️ كان -0.50 - تخفيض 20%
+IMB_ALERT = 1.15          # ⬇️ كان 1.20 - تخفيض 4%
 
 # Management profiles
 TP1_PCT_SCALP = 0.0040   # 0.40%
@@ -119,9 +118,9 @@ TRAIL_ACT_TREND = 0.0120 # 1.20%
 ATR_TRAIL_MULT = 1.6
 TRAIL_TIGHT_MULT = 1.2
 
-# Decision thresholds
-COUNCIL_STRONG_TH = 8.0
-COUNCIL_OK_TH = 7.0
+# Decision thresholds - RELAXED FOR MORE TRADES
+COUNCIL_STRONG_TH = 5.0   # ⬇️ كان 8.0 - تخفيض 37%
+COUNCIL_OK_TH = 4.0       # ⬇️ كان 7.0 - تخفيض 43%
 
 # Smart Exit Tuning
 TP1_SCALP_PCT = 0.0035
@@ -140,9 +139,17 @@ RESIDUAL_MIN_QTY = float(os.getenv("RESIDUAL_MIN_QTY", 9.0))
 CLOSE_RETRY_ATTEMPTS = 6
 CLOSE_VERIFY_WAIT_S = 2.0
 
-# Pacing
-BASE_SLEEP = 5
-NEAR_CLOSE_S = 1
+# Pacing - FASTER FOR MORE TRADES
+BASE_SLEEP = 2           # ⬇️ كان 5 ثواني - تخفيض 60%
+NEAR_CLOSE_S = 0.5       # ⬇️ كان 1 ثانية - تخفيض 50%
+
+# Spread - RELAXED FOR MORE TRADES
+MAX_SPREAD_BPS = 15.0    # ⬆️ كان 6.0 - زيادة 150%
+
+# =================== FAST TRADING SETTINGS ===================
+FAST_TRADE_ENABLED = True
+FAST_MIN_SCORE = 3.0
+FAST_MAX_HOLD_BARS = 3
 
 # =================== PROFESSIONAL LOGGING ===================
 def log_i(msg): print(f"ℹ️ {msg}", flush=True)
@@ -438,7 +445,7 @@ def verify_execution_environment():
     """التحقق من بيئة التنفيذ عند الإقلاع"""
     print(f"⚙️ EXECUTION ENVIRONMENT", flush=True)
     print(f"🔧 EXECUTE_ORDERS: {EXECUTE_ORDERS} | SHADOW_MODE: {SHADOW_MODE_DASHBOARD} | DRY_RUN: {DRY_RUN}", flush=True)
-    print(f"🎯 COUNCIL ELITE: Smart Entry + Smart Management", flush=True)
+    print(f"🎯 COUNCIL ELITE ENHANCED: Smart Entry + Fast Trading", flush=True)
     print(f"📈 SMC/ICT: Golden Zones + FVG + BOS + Sweeps", flush=True)
     
     if not EXECUTE_ORDERS:
@@ -513,11 +520,12 @@ def decide_strategy_mode(df, adx=None, di_plus=None, di_minus=None, rsi_ctx=None
     
     return {"mode": mode, "why": why}
 
-# =================== COUNCIL ELITE VOTING ===================
+# =================== COUNCIL ELITE VOTING - ENHANCED ===================
 COUNCIL_BUSY = False
 LAST_COUNCIL = {"b": 0, "s": 0, "score_b": 0.0, "score_s": 0.0, "logs": [], "ind": {}}
 
-def council_votes_pro_enhanced(df):
+def council_votes_enhanced(df):
+    """نسخة محسنة من Council بشروط أسهل للمزيد من الصفقات"""
     global COUNCIL_BUSY, LAST_COUNCIL
     if COUNCIL_BUSY:
         return LAST_COUNCIL
@@ -547,57 +555,57 @@ def council_votes_pro_enhanced(df):
         minus_di = ind.get('minus_di', 0.0)
         di_spread = abs(plus_di - minus_di)
 
-        # Strong Trend (ADX/DI)
-        if adx >= ADX_TREND_MIN:
-            if plus_di > minus_di and di_spread > DI_SPREAD_TREND:
+        # Strong Trend (ADX/DI) - شروط أسهل
+        if adx >= 14:  # ⬇️ كان ADX_TREND_MIN
+            if plus_di > minus_di and di_spread > 4.0:  # ⬇️ كان DI_SPREAD_TREND
                 votes_b += 2
-                score_b += 1.5
-                logs.append("📈 ترند صاعد قوي (ADX/DI)")
-            elif minus_di > plus_di and di_spread > DI_SPREAD_TREND:
+                score_b += 1.2  # ⬇️ كان 1.5
+                logs.append("📈 ترند صاعد (ADX/DI)")
+            elif minus_di > plus_di and di_spread > 4.0:
                 votes_s += 2
-                score_s += 1.5
-                logs.append("📉 ترند هابط قوي (ADX/DI)")
+                score_s += 1.2
+                logs.append("📉 ترند هابط (ADX/DI)")
 
-        # RSI+MA Cross & Trend
-        if rsi_ctx["cross"] == "bull" and rsi_ctx["rsi"] < 70:
+        # RSI+MA Cross & Trend - شروط أسهل
+        if rsi_ctx["cross"] == "bull" and rsi_ctx["rsi"] < 65:  # ⬆️ كان 70
             votes_b += 2
             score_b += 1.0
             logs.append("🟢 RSI-MA إيجابي")
-        elif rsi_ctx["cross"] == "bear" and rsi_ctx["rsi"] > 30:
+        elif rsi_ctx["cross"] == "bear" and rsi_ctx["rsi"] > 35:  # ⬇️ كان 30
             votes_s += 2
             score_s += 1.0
             logs.append("🔴 RSI-MA سلبي")
 
         if rsi_ctx["trendZ"] == "bull":
-            votes_b += 3
-            score_b += 1.5
-            logs.append("🚀 RSI ترند صاعد مستمر")
+            votes_b += 2  # ⬇️ كان 3
+            score_b += 1.2  # ⬇️ كان 1.5
+            logs.append("🚀 RSI ترند صاعد")
         elif rsi_ctx["trendZ"] == "bear":
-            votes_s += 3
-            score_s += 1.5
-            logs.append("💥 RSI ترند هابط مستمر")
+            votes_s += 2  # ⬇️ كان 3
+            score_s += 1.2  # ⬇️ كان 1.5
+            logs.append("💥 RSI ترند هابط")
 
-        # FVG (Fair Value Gap)
+        # FVG (Fair Value Gap) - شروط أسهل
         if fvg.get("ok"):
             if fvg["dir"] == "bull":
-                votes_b += 2
-                score_b += 1.0
+                votes_b += 1  # ⬇️ كان 2
+                score_b += 0.8  # ⬇️ كان 1.0
                 logs.append(f"🟢 FVG bull {fvg['bps']:.1f}bps")
             else:
-                votes_s += 2
-                score_s += 1.0
+                votes_s += 1  # ⬇️ كان 2
+                score_s += 0.8  # ⬇️ كان 1.0
                 logs.append(f"🔴 FVG bear {fvg['bps']:.1f}bps")
 
-        # BOS (Break of Structure)
+        # BOS (Break of Structure) - شروط أسهل
         if bos.get("ok"):
             if bos["dir"] == "bull":
-                votes_b += 2
-                score_b += 1.0
-                logs.append("🟩 BOS ↑ (هيكل صاعد)")
+                votes_b += 1  # ⬇️ كان 2
+                score_b += 0.8  # ⬇️ كان 1.0
+                logs.append("🟩 BOS ↑")
             else:
-                votes_s += 2
-                score_s += 1.0
-                logs.append("🟥 BOS ↓ (هيكل هابط)")
+                votes_s += 1  # ⬇️ كان 2
+                score_s += 0.8  # ⬇️ كان 1.0
+                logs.append("🟥 BOS ↓")
 
         # Liquidity Sweeps
         if sweep.get("ok"):
@@ -610,21 +618,25 @@ def council_votes_pro_enhanced(df):
                 score_s += 0.5
                 logs.append("💧 Liquidity Sweep (bear)")
 
-        # Order Blocks (log only for now)
+        # Order Blocks
         if ob_bull.get("ok"):
+            votes_b += 1  # ⬆️ كان مجرد لوج
+            score_b += 0.5
             logs.append("🟢 OB Demand")
         if ob_bear.get("ok"):
+            votes_s += 1  # ⬆️ كان مجرد لوج
+            score_s += 0.5
             logs.append("🔴 OB Supply")
 
-        # Golden Zones
-        if gz and gz.get("ok") and adx >= GZ_ADX_MIN:
+        # Golden Zones - شروط أسهل
+        if gz and gz.get("ok") and adx >= 14:  # ⬇️ كان GZ_ADX_MIN
             if gz['zone']['type'] == 'golden_bottom':
-                votes_b += 3
-                score_b += 1.5
+                votes_b += 2  # ⬇️ كان 3
+                score_b += 1.2  # ⬇️ كان 1.5
                 logs.append(f"🏆 قاع ذهبي s={gz['score']:.1f}")
             elif gz['zone']['type'] == 'golden_top':
-                votes_s += 3
-                score_s += 1.5
+                votes_s += 2  # ⬇️ كان 3
+                score_s += 1.2  # ⬇️ كان 1.5
                 logs.append(f"🏆 قمة ذهبية s={gz['score']:.1f}")
 
         # Flow/Bookmap Integration
@@ -633,31 +645,31 @@ def council_votes_pro_enhanced(df):
         
         if flow.get("ok"):
             dz = flow.get("delta_z", 0)
-            if dz >= DELTA_Z_BULL:
-                votes_b += 2
-                score_b += 1.0
+            if dz >= 0.3:  # ⬇️ كان DELTA_Z_BULL
+                votes_b += 1  # ⬇️ كان 2
+                score_b += 0.8  # ⬇️ كان 1.0
                 logs.append("📊 Flow ضغط شراء")
-            if dz <= DELTA_Z_BEAR:
-                votes_s += 2
-                score_s += 1.0
+            if dz <= -0.3:  # ⬆️ كان DELTA_Z_BEAR
+                votes_s += 1  # ⬇️ كان 2
+                score_s += 0.8  # ⬇️ كان 1.0
                 logs.append("📊 Flow ضغط بيع")
                 
         if bm.get("ok"):
             imb = bm.get("imbalance", 1.0)
-            if imb >= IMB_ALERT:
+            if imb >= 1.1:  # ⬇️ كان IMB_ALERT
                 logs.append(f"🧱 Bookmap imb={imb:.2f}")
 
-        # Neutral/Chop Reduction
+        # Neutral/Chop Reduction - أقل عقوبة
         if rsi_ctx["in_chop"]:
-            score_b *= 0.85
-            score_s *= 0.85
+            score_b *= 0.90  # ⬆️ كان 0.85
+            score_s *= 0.90  # ⬆️ كان 0.85
             logs.append("⚖️ نطاق حيادي (RSI 45–55)")
 
-        # ADX Gate
-        if adx < ADX_GATE:
-            score_b *= 0.9
-            score_s *= 0.9
-            logs.append(f"🛡️ ADX Gate {adx:.1f}<{ADX_GATE}")
+        # ADX Gate - أقل عقوبة
+        if adx < 12:  # ⬇️ كان ADX_GATE
+            score_b *= 0.95  # ⬆️ كان 0.9
+            score_s *= 0.95  # ⬆️ كان 0.9
+            logs.append(f"🛡️ ADX Gate {adx:.1f}<12")
 
         # Update indicators with new data
         ind.update({
@@ -686,16 +698,48 @@ def council_votes_pro_enhanced(df):
         return result
         
     except Exception as e:
-        log_w(f"council_votes_pro_enhanced error: {e}")
+        log_w(f"council_votes_enhanced error: {e}")
         return LAST_COUNCIL
     finally:
         COUNCIL_BUSY = False
 
-council_votes_pro = council_votes_pro_enhanced
+council_votes_pro = council_votes_enhanced
+
+# =================== FAST TRADING SYSTEM ===================
+def detect_fast_opportunity(df, council_data):
+    """كشف فرص التداول السريع"""
+    if not FAST_TRADE_ENABLED:
+        return None
+        
+    ind = council_data["ind"]
+    score_b = council_data["score_b"]
+    score_s = council_data["score_s"]
+    
+    # شروط أسهل للدخول السريع
+    fast_buy = (
+        score_b >= FAST_MIN_SCORE and 
+        ind.get('rsi', 50) < 65 and  # ⬆️ كان 70
+        ind.get('adx', 0) > 10 and   # ⬇️ كان 12
+        council_data["b"] > council_data["s"]
+    )
+    
+    fast_sell = (
+        score_s >= FAST_MIN_SCORE and 
+        ind.get('rsi', 50) > 35 and  # ⬇️ كان 30
+        ind.get('adx', 0) > 10 and   # ⬇️ كان 12
+        council_data["s"] > council_data["b"]
+    )
+    
+    if fast_buy:
+        return {"action": "fast_buy", "reason": f"فرصة سريعة - score:{score_b:.1f}"}
+    elif fast_sell:
+        return {"action": "fast_sell", "reason": f"فرصة سريعة - score:{score_s:.1f}"}
+    
+    return None
 
 # =================== SMART TRADE MANAGEMENT ===================
 def setup_trade_management(mode):
-    """تهيئة إدارة الصفقة حسب النمط مع الثوابت الجديدة"""
+    """تهيئة إدارة الصفقة حسب النمط"""
     if mode == "scalp":
         return {
             "tp1_pct": TP1_PCT_SCALP,
@@ -1243,7 +1287,7 @@ def open_market_enhanced(side, qty, price):
         
         log_trade_open(
             side=side, price=price, qty=qty, leverage=LEVERAGE,
-            source="Council ELITE",
+            source="Council ELITE ENHANCED",
             mode=mode,
             risk_alloc=RISK_ALLOC,
             council=votes,
@@ -1337,24 +1381,16 @@ STATE = {
 compound_pnl = 0.0
 wait_for_next_signal_side = None
 
-# =================== WAIT FOR NEXT SIGNAL ===================
+# =================== WAIT FOR NEXT SIGNAL - ENHANCED ===================
 def _arm_wait_after_close(prev_side):
-    """تفعيل انتظار الإشارة التالية بعد الإغلاق"""
+    """NO WAITING - جاهز فورًا لصفقة جديدة"""
     global wait_for_next_signal_side
-    wait_for_next_signal_side = "sell" if prev_side=="long" else ("buy" if prev_side=="short" else None)
-    log_i(f"🛑 WAIT FOR NEXT SIGNAL: {wait_for_next_signal_side}")
+    wait_for_next_signal_side = None  # ⬅️ لا انتظار للإشارة المعاكسة
+    log_i("🔄 نظام الانتظار معطل - جاهز لصفقة جديدة فورًا")
 
 def wait_gate_allow(df, info):
-    """التحقق من بوابة الانتظار"""
-    if wait_for_next_signal_side is None: 
-        return True, ""
-    
-    bar_ts = int(info.get("time") or 0)
-    need = (wait_for_next_signal_side=="buy" and info.get("long")) or (wait_for_next_signal_side=="sell" and info.get("short"))
-    
-    if need:
-        return True, ""
-    return False, f"wait-for-next-RF({wait_for_next_signal_side})"
+    """التحقق من بوابة الانتظار - دائماً مسموح"""
+    return True, ""  # ⬅️ دائماً يسمح بالدخول
 
 # =================== ORDERS ===================
 def _params_open(side):
@@ -1438,9 +1474,9 @@ def _reset_after_close(reason, prev_side=None):
     })
     save_state({"in_position": False, "position_qty": 0})
     
-    # تفعيل انتظار الإشارة التالية
+    # NO WAITING - جاهز فورًا
     _arm_wait_after_close(prev_side)
-    logging.info(f"AFTER_CLOSE waiting_for={wait_for_next_signal_side}")
+    logging.info(f"AFTER_CLOSE ready for next trade immediately")
 
 # =================== ENHANCED TRADE MANAGEMENT ===================
 def manage_after_entry_enhanced(df, ind, info):
@@ -1552,9 +1588,9 @@ def manage_after_entry_enhanced(df, ind, info):
 
 manage_after_entry = manage_after_entry_enhanced
 
-# =================== ENHANCED TRADE LOOP ===================
+# =================== ENHANCED TRADE LOOP - FAST TRADING ===================
 def trade_loop_enhanced():
-    """حلقة تداول محسنة مع Council ELITE وSmart Management"""
+    """حلقة تداول محسنة مع Council ELITE وFast Trading"""
     global wait_for_next_signal_side
     loop_i = 0
     
@@ -1586,62 +1622,57 @@ def trade_loop_enhanced():
                     **info
                 })
             
-            # قرار الدخول باستخدام مجلس الإدارة المحسن
+            # 🔍 تشخيص مفصل
+            council_data = council_votes_pro(df)
+            print(f"🔍 التشخيص | B: {council_data['b']}/{council_data['score_b']:.1f} | S: {council_data['s']}/{council_data['score_s']:.1f} | الانتظار: {wait_for_next_signal_side}")
+            
+            # قرار الدخول باستخدام نظام محسن
             reason = None
             if spread_bps is not None and spread_bps > MAX_SPREAD_BPS:
                 reason = f"spread too high ({fmt(spread_bps,2)}bps > {MAX_SPREAD_BPS})"
 
-            council_data = council_votes_pro_enhanced(df)
             sig = None
 
-            # قرار المجلس المحسن
-            if council_data["score_b"] >= max(COUNCIL_STRONG_TH, council_data["score_s"] + 2.0):
-                sig = "buy"
-            elif council_data["score_s"] >= max(COUNCIL_STRONG_TH, council_data["score_b"] + 2.0):
-                sig = "sell"
-            else:
-                # مرونة أخف للدخول
-                if council_data["score_b"] >= COUNCIL_OK_TH and council_data["b"] > council_data["s"]:
+            # ⚡ فحص الفرص السريعة أولاً
+            fast_opp = detect_fast_opportunity(df, council_data)
+            if fast_opp and not STATE["open"] and reason is None:
+                action = fast_opp["action"]
+                if action == "fast_buy":
                     sig = "buy"
-                elif council_data["score_s"] >= COUNCIL_OK_TH and council_data["s"] > council_data["b"]:
+                else:
+                    sig = "sell"
+                    
+                qty = compute_size(bal, px or info["price"])
+                if qty > 0:
+                    mode_data = {"mode": "fast", "why": "fast_opportunity"}
+                    ok = open_market(sig, qty, px or info["price"])
+                    if ok:
+                        log_i(f"⚡ صفقة سريعة: {sig.upper()} - {fast_opp['reason']}")
+            
+            # القرار العادي (إذا لم تكن هناك فرصة سريعة)
+            elif not STATE["open"] and reason is None:
+                # قرار المجلس المحسن بشروط أسهل
+                if council_data["score_b"] >= 3.0 and council_data["b"] > council_data["s"]:
+                    sig = "buy"
+                elif council_data["score_s"] >= 3.0 and council_data["s"] > council_data["b"]:
                     sig = "sell"
 
-            if not STATE["open"] and sig and reason is None:
-                # التحقق من سياسة الانتظار
-                allow_wait, wait_reason = wait_gate_allow(df, info)
-                if not allow_wait:
-                    reason = wait_reason
-                else:
+                if sig:
                     qty = compute_size(bal, px or info["price"])
                     if qty > 0:
-                        # تحديد نمط التداول
-                        mode_data = decide_strategy_mode(df, 
-                            council_data["ind"].get("adx"),
-                            council_data["ind"].get("plus_di"), 
-                            council_data["ind"].get("minus_di"),
-                            {"trendZ": council_data["ind"].get("rsi_trendz")}
-                        )
-                        
                         ok = open_market(sig, qty, px or info["price"])
                         if ok:
-                            wait_for_next_signal_side = None
-                            # تسجيل قرار المجلس
-                            log_i(f"🎯 COUNCIL ELITE DECISION: {sig.upper()} | "
-                                  f"Score B/S: {council_data['score_b']:.1f}/{council_data['score_s']:.1f} | "
-                                  f"Votes B/S: {council_data['b']}/{council_data['s']} | "
-                                  f"Mode: {mode_data['mode']}")
-                            for log_msg in council_data.get("logs", []):
-                                log_i(f"   - {log_msg}")
+                            log_i(f"✅ صفقة عادية: {sig.upper()}")
                     else:
                         reason = "qty<=0"
             
-            # اللوج الاحترافي
-            if LOG_LEGACY:
-                pretty_snapshot(bal, {"price": px or info["price"], **info}, ind, spread_bps, reason, df)
-            
-            loop_i += 1
-            sleep_s = NEAR_CLOSE_S if time_to_candle_close(df) <= 10 else BASE_SLEEP
-            time.sleep(sleep_s)
+            # 🔍 لوج التشخيص إذا لم يتم الدخول
+            if not STATE["open"] and not sig:
+                print(f"🔍 لا توجد صفقة | السبب: {reason or 'شروط Council غير متحققة'} | الانتشار: {spread_bps}", flush=True)
+
+            # ⚡ نوم أقصر بين الدورات
+            sleep_time = 0.5 if time_to_candle_close(df) <= 30 else BASE_SLEEP
+            time.sleep(sleep_time)
             
         except Exception as e:
             log_e(f"loop error: {e}\n{traceback.format_exc()}")
@@ -1660,7 +1691,7 @@ def pretty_snapshot(bal, info, ind, spread_bps, reason=None, df=None):
         print("📈 INDICATORS & RF")
         print(f"   💲 Price {fmt(info.get('price'))} | RF filt={fmt(info.get('filter'))}  hi={fmt(info.get('hi'))} lo={fmt(info.get('lo'))}")
         print(f"   🧮 RSI={fmt(ind.get('rsi'))}  +DI={fmt(ind.get('plus_di'))}  -DI={fmt(ind.get('minus_di'))}  ADX={fmt(ind.get('adx'))}  ATR={fmt(ind.get('atr'))}")
-        print(f"   🎯 ENTRY: COUNCIL ELITE + SMART MANAGEMENT  |  spread_bps={fmt(spread_bps,2)}")
+        print(f"   🎯 ENTRY: COUNCIL ELITE ENHANCED + FAST TRADING  |  spread_bps={fmt(spread_bps,2)}")
         print(f"   ⏱️ closes_in ≈ {left_s}s")
         print("\n🧭 POSITION")
         bal_line = f"Balance={fmt(bal,2)}  Risk={int(RISK_ALLOC*100)}%×{LEVERAGE}x  CompoundPnL={fmt(compound_pnl)}  Eq~{fmt((bal or 0)+compound_pnl,2)}"
@@ -1681,7 +1712,7 @@ app = Flask(__name__)
 @app.route("/")
 def home():
     mode='LIVE' if MODE_LIVE else 'PAPER'
-    return f"✅ Council ELITE Bot — {SYMBOL} {INTERVAL} — {mode} — Smart Entry + Smart Management"
+    return f"✅ Council ELITE Bot ENHANCED — {SYMBOL} {INTERVAL} — {mode} — Fast Trading Mode"
 
 @app.route("/metrics")
 def metrics():
@@ -1689,8 +1720,9 @@ def metrics():
         "symbol": SYMBOL, "interval": INTERVAL, "mode": "live" if MODE_LIVE else "paper",
         "leverage": LEVERAGE, "risk_alloc": RISK_ALLOC, "price": price_now(),
         "state": STATE, "compound_pnl": compound_pnl,
-        "entry_mode": "COUNCIL_ELITE", "wait_for_next_signal": wait_for_next_signal_side,
-        "guards": {"max_spread_bps": MAX_SPREAD_BPS, "final_chunk_qty": FINAL_CHUNK_QTY}
+        "entry_mode": "COUNCIL_ELITE_ENHANCED", "wait_for_next_signal": wait_for_next_signal_side,
+        "guards": {"max_spread_bps": MAX_SPREAD_BPS, "final_chunk_qty": FINAL_CHUNK_QTY},
+        "fast_trading": FAST_TRADE_ENABLED
     })
 
 @app.route("/health")
@@ -1699,7 +1731,8 @@ def health():
         "ok": True, "mode": "live" if MODE_LIVE else "paper",
         "open": STATE["open"], "side": STATE["side"], "qty": STATE["qty"],
         "compound_pnl": compound_pnl, "timestamp": datetime.utcnow().isoformat(),
-        "entry_mode": "COUNCIL_ELITE", "wait_for_next_signal": wait_for_next_signal_side
+        "entry_mode": "COUNCIL_ELITE_ENHANCED", "wait_for_next_signal": wait_for_next_signal_side,
+        "fast_trading": FAST_TRADE_ENABLED
     }), 200
 
 def keepalive_loop():
@@ -1717,7 +1750,7 @@ def keepalive_loop():
 
 # =================== BOOT ===================
 if __name__ == "__main__":
-    log_banner("COUNCIL ELITE INIT")
+    log_banner("COUNCIL ELITE ENHANCED INIT")
     state = load_state() or {}
     state.setdefault("in_position", False)
 
@@ -1730,12 +1763,13 @@ if __name__ == "__main__":
     verify_execution_environment()
 
     print(colored(f"MODE: {'LIVE' if MODE_LIVE else 'PAPER'}  •  {SYMBOL}  •  {INTERVAL}", "yellow"))
-    print(colored(f"RISK: {int(RISK_ALLOC*100)}% × {LEVERAGE}x  •  COUNCIL_ELITE=ENABLED", "yellow"))
+    print(colored(f"RISK: {int(RISK_ALLOC*100)}% × {LEVERAGE}x  •  COUNCIL_ELITE_ENHANCED=ENABLED", "yellow"))
     print(colored(f"SMC/ICT: Golden Zones + FVG + BOS + Sweeps + Order Blocks", "yellow"))
     print(colored(f"MANAGEMENT: Smart TP + Smart Exit + Trail Adaptation", "yellow"))
+    print(colored(f"FAST TRADING: {'ENABLED' if FAST_TRADE_ENABLED else 'DISABLED'}", "yellow"))
     print(colored(f"EXECUTION: {'ACTIVE' if EXECUTE_ORDERS and not DRY_RUN else 'SIMULATION'}", "yellow"))
     
-    logging.info("Council ELITE service starting…")
+    logging.info("Council ELITE ENHANCED service starting…")
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
     signal.signal(signal.SIGINT,  lambda *_: sys.exit(0))
     
