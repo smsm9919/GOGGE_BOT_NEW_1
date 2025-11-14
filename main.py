@@ -6,7 +6,7 @@ RF Futures Bot — RF-LIVE ONLY (BingX Perp via CCXT)
 • Dynamic TP ladder + Breakeven + ATR-trailing
 • Professional Logging & Dashboard
 • ENHANCED VERSION - More Trades & Faster Execution
-• WEAK SCALP PROTECTION - No weak scalp trades
+• STRICT SCALP PROTECTION - High Quality Scalp Trades Only
 • TREND COOLDOWN SYSTEM - Protection after strong trends
 • STRATEGY AVOID MODE - Avoid weak market conditions
 • SMART CHOP DETECTION - Avoid choppy markets
@@ -45,7 +45,7 @@ SHADOW_MODE_DASHBOARD = False
 DRY_RUN = False
 
 # ==== Addon: Logging + Recovery Settings ====
-BOT_VERSION = "DOGE Council ELITE v9.0 — Smart Chop Detection & Intelligent Entry"
+BOT_VERSION = "DOGE Council ELITE v9.0 — Strict Scalp Protection & Intelligent Entry"
 print("🔁 Booting:", BOT_VERSION, flush=True)
 
 STATE_PATH = "./bot_state.json"
@@ -123,10 +123,14 @@ TRAIL_ACT_TREND = 0.0120 # 1.20%
 ATR_TRAIL_MULT = 1.6
 TRAIL_TIGHT_MULT = 1.2
 
-# Weak Scalp Protection Settings
-SCALP_MIN_ADX = 14        # ⬆️ أدنى ADX للسكالب
-SCALP_MIN_ATR_PCT = 0.0025 # ⬆️ أدنى ATR نسبي
-MIN_RR_RATIO = 1.2        # أقل نسبة R/R مسموح بها
+# =================== STRICT SCALP PROTECTION SETTINGS ===================
+SCALP_MIN_SCORE = 5.0  # ⬆️ زيادة من 3.0 إلى 5.0
+SCALP_MIN_VOTES = 4    # ⬆️ زيادة من 2 إلى 4 أصوات
+SCALP_ADX_RANGE = (16, 25)  # نطاق ADX مثالي للسكالب
+SCALP_RSI_RANGE = (35, 65)  # نطاق RSI آمن للسكالب
+SCALP_MIN_FLOW_Z = 0.6      # عتبة تدفق أعلى
+SCALP_MAX_TRADES_PER_DAY = 4  # أقصى عدد صفقات سكالب يومياً
+SCALP_COOLDOWN_MINUTES = 90   # تبريد بين صفقات السكالب
 
 # Trend Cooldown System
 TREND_COOLDOWN_HOURS = 4  # فترة التبريد بعد الترند القوي
@@ -146,7 +150,6 @@ TP1_SCALP_PCT = 0.0050    # ⬆️ تحديث مع TP1_PCT_SCALP
 TP1_TREND_PCT = 0.0060
 HARD_CLOSE_PNL_PCT = 0.0110
 WICK_ATR_MULT = 1.5
-EVX_SPIKE = 1.8
 BM_WALL_PROX_BPS = 5
 TIME_IN_TRADE_MIN = 8
 
@@ -231,6 +234,141 @@ def load_state() -> dict:
         log_w(f"state load failed: {e}")
     return {}
 
+# =================== STRICT SCALP PROTECTION SYSTEM ===================
+# تتبع صفقات السكالب اليومية
+daily_scalp_trades = []
+last_scalp_time = 0
+
+def can_trade_scalp_today():
+    """التحقق من إمكانية تنفيذ صفقة سكالب اليوم"""
+    today = datetime.now().date()
+    today_trades = [t for t in daily_scalp_trades if t.date() == today]
+    return len(today_trades) < SCALP_MAX_TRADES_PER_DAY
+
+def update_scalp_trade_timestamp():
+    """تحديث وقت آخر صفقة سكالب"""
+    global last_scalp_time, daily_scalp_trades
+    now = datetime.now()
+    last_scalp_time = time.time()
+    daily_scalp_trades.append(now)
+    # تنظيف القائمة القديمة
+    daily_scalp_trades = [t for t in daily_scalp_trades 
+                         if (datetime.now() - t).days < 1]
+
+def is_in_scalp_cooldown():
+    """التحقق من فترة التبريد بين صفقات السكالب"""
+    if last_scalp_time == 0:
+        return False, ""
+    
+    cooldown_end = last_scalp_time + (SCALP_COOLDOWN_MINUTES * 60)
+    remaining = cooldown_end - time.time()
+    
+    if remaining > 0:
+        mins_left = remaining / 60
+        return True, f"تبديد سكالب - متبقي {mins_left:.1f} دقيقة"
+    
+    return False, ""
+
+def is_high_quality_scalp(df, council_data, current_price):
+    """
+    التحقق من جودة صفقة السكالب (80%+ احتمالية نجاح)
+    """
+    ind = council_data["ind"]
+    score_b = council_data["score_b"]
+    score_s = council_data["score_s"]
+    votes_b = council_data["b"]
+    votes_s = council_data["s"]
+    
+    # 1) شروط أساسية قوية
+    base_conditions = [
+        max(score_b, score_s) >= SCALP_MIN_SCORE,  # نقاط كافية
+        max(votes_b, votes_s) >= SCALP_MIN_VOTES,  # أصوات كافية
+        can_trade_scalp_today(),  # ضمن الحد اليومي
+    ]
+    
+    if not all(base_conditions):
+        return False, "شروط أساسية غير متوفرة"
+    
+    # 2) شروط المؤشرات الفنية
+    adx = ind.get('adx', 0)
+    rsi = ind.get('rsi', 50)
+    di_spread = ind.get('di_spread', 0)
+    atr = ind.get('atr', 0)
+    atr_pct = (atr / current_price) * 100 if current_price > 0 else 0
+    
+    tech_conditions = [
+        SCALP_ADX_RANGE[0] <= adx <= SCALP_ADX_RANGE[1],  # ADX في النطاق المثالي
+        SCALP_RSI_RANGE[0] <= rsi <= SCALP_RSI_RANGE[1],  # RSI في النطاق الآمن
+        di_spread >= 4.0,  # فرق كافي بين مؤشرات الاتجاه
+        atr_pct >= 0.3,    # تذبذب كافي للسكالب
+    ]
+    
+    tech_score = sum(tech_conditions)
+    if tech_score < 3:
+        return False, f"شروط فنية ضعيفة (score: {tech_score}/4)"
+    
+    # 3) شروط التدفق والكتاب
+    flow = ind.get('flow', {})
+    bm = ind.get('bm', {})
+    
+    flow_conditions = []
+    if flow.get('ok'):
+        delta_z = flow.get('delta_z', 0)
+        if abs(delta_z) >= SCALP_MIN_FLOW_Z:
+            flow_conditions.append(True)
+    
+    if bm.get('ok'):
+        imb = bm.get('imbalance', 1.0)
+        if imb >= 1.2 or imb <= 0.8:  # عدم توازن واضح
+            flow_conditions.append(True)
+    
+    if len(flow_conditions) < 1:
+        return False, "ضعف في التدفق أو ضغط الكتاب"
+    
+    # 4) شروط SMC/ICT إضافية
+    smc_conditions = []
+    
+    # FVG قوي
+    fvg = ind.get('fvg', {})
+    if fvg.get('ok') and fvg.get('bps', 0) >= 8.0:
+        smc_conditions.append(True)
+    
+    # منطقة ذهبية
+    gz = ind.get('gz', {})
+    if gz.get('ok') and gz.get('score', 0) >= 4.0:
+        smc_conditions.append(True)
+    
+    # كسور هيكل
+    bos = ind.get('bos', {})
+    if bos.get('ok'):
+        smc_conditions.append(True)
+    
+    if len(smc_conditions) < 1:
+        return False, "ضعف في إشارات SMC/ICT"
+    
+    # 5) نسبة المخاطرة/العائد
+    expected_profit = TP1_PCT_SCALP
+    stop_loss_pct = (atr * 2.0) / current_price
+    rr_ratio = expected_profit / stop_loss_pct
+    
+    if rr_ratio < 1.5:  # ⬆️ زيادة من 1.2 إلى 1.5
+        return False, f"نسبة R/R ضعيفة ({rr_ratio:.2f})"
+    
+    # كل الشروط متحققة - صفقة عالية الجودة
+    return True, f"صفقة سكالب عالية الجودة (R/R: {rr_ratio:.2f}, نقاط: {max(score_b, score_s):.1f})"
+
+def log_scalp_decision(decision, details, council_data):
+    """تسجيل قرار السكالب مع التفاصيل"""
+    score_b = council_data["score_b"]
+    score_s = council_data["score_s"]
+    votes_b = council_data["b"]
+    votes_s = council_data["s"]
+    
+    if decision:
+        log_g(f"✅ [سكالب مضمون] {details} | نقاط: {max(score_b, score_s):.1f} | أصوات: {max(votes_b, votes_s)}")
+    else:
+        log_w(f"⏳ [سكالب مؤجل] {details} | نقاط: {max(score_b, score_s):.1f} | أصوات: {max(votes_b, votes_s)}")
+
 # =================== MARKET CHOP DETECTION SYSTEM ===================
 def detect_market_chop(df, council_data, current_price):
     """
@@ -295,7 +433,7 @@ def should_avoid_chop_market(chop_signals):
 # =================== SMART ENTRY DECISION SYSTEM ===================
 def smart_entry_decision(df, council_data, strategy_mode, snap, current_price):
     """
-    قرار دخول ذكي يأخذ في الاعتبار حالة السوق
+    قرار دخول ذكي مع تحسينات للسكالب
     """
     # أولاً: كشف التذبذب
     chop_signals = detect_market_chop(df, council_data, current_price)
@@ -304,7 +442,13 @@ def smart_entry_decision(df, council_data, strategy_mode, snap, current_price):
     if avoid_chop:
         return None, f"سوق متذبذب: {', '.join(chop_details[:3])}"
     
-    # ثانياً: تحليل قوة الإشارة
+    # ثانياً: فحص التبريد للسكالب
+    if strategy_mode["mode"] == "scalp":
+        in_cooldown, cooldown_reason = is_in_scalp_cooldown()
+        if in_cooldown:
+            return None, f"تبديد سكالب: {cooldown_reason}"
+    
+    # ثالثاً: تحليل قوة الإشارة
     ind = council_data["ind"]
     flow = snap.get("flow", {})
     bm = snap.get("bm", {})
@@ -365,11 +509,29 @@ def smart_entry_decision(df, council_data, strategy_mode, snap, current_price):
     buy_advantage = (score_b > score_s and votes_b > votes_s)
     sell_advantage = (score_s > score_b and votes_s > votes_b)
     
-    if strength_points >= 4:  # عتبة الدخول الذكي
-        if buy_advantage:
-            return "buy", f"إشارة شراء قوية [{strength_points} نقاط]: {', '.join(reasons)}"
-        elif sell_advantage:
-            return "sell", f"إشارة بيع قوية [{strength_points} نقاط]: {', '.join(reasons)}"
+    # 🔥 تحسين خاص للسكالب: شروط أقسى
+    if strategy_mode["mode"] == "scalp":
+        is_quality_scalp, scalp_reason = is_high_quality_scalp(df, council_data, current_price)
+        if not is_quality_scalp:
+            return None, f"سكالب مرفوض: {scalp_reason}"
+        
+        # للسكالب: نحتاج قوة إضافية
+        if strength_points >= 5 and (buy_advantage or sell_advantage):  # ⬆️ زيادة من 4 إلى 5
+            if buy_advantage:
+                update_scalp_trade_timestamp()
+                log_scalp_decision(True, scalp_reason, council_data)
+                return "buy", f"🔥 إشارة سكالب قوية [{strength_points} نقاط]: {scalp_reason}"
+            elif sell_advantage:
+                update_scalp_trade_timestamp()
+                log_scalp_decision(True, scalp_reason, council_data)
+                return "sell", f"🔥 إشارة سكالب قوية [{strength_points} نقاط]: {scalp_reason}"
+    else:
+        # للترند: نفس الشروط السابقة
+        if strength_points >= 4:
+            if buy_advantage:
+                return "buy", f"إشارة شراء قوية [{strength_points} نقاط]: {', '.join(reasons)}"
+            elif sell_advantage:
+                return "sell", f"إشارة بيع قوية [{strength_points} نقاط]: {', '.join(reasons)}"
     
     return None, f"إشارة ضعيفة [{strength_points} نقاط]: {', '.join(reasons)}"
 
@@ -705,9 +867,9 @@ def verify_execution_environment():
     """التحقق من بيئة التنفيذ عند الإقلاع"""
     print(f"⚙️ EXECUTION ENVIRONMENT", flush=True)
     print(f"🔧 EXECUTE_ORDERS: {EXECUTE_ORDERS} | SHADOW_MODE: {SHADOW_MODE_DASHBOARD} | DRY_RUN: {DRY_RUN}", flush=True)
-    print(f"🎯 COUNCIL ELITE ENHANCED: Smart Entry + Fast Trading", flush=True)
+    print(f"🎯 COUNCIL ELITE ENHANCED: Smart Entry + Strict Scalp Protection", flush=True)
     print(f"📈 SMC/ICT: Golden Zones + FVG + BOS + Sweeps", flush=True)
-    print(f"🛡️ WEAK SCALP PROTECTION: ACTIVE", flush=True)
+    print(f"🛡️ STRICT SCALP PROTECTION: ACTIVE (Max {SCALP_MAX_TRADES_PER_DAY}/day)", flush=True)
     print(f"🔄 TREND COOLDOWN SYSTEM: ACTIVE", flush=True)
     print(f"🎯 STRATEGY AVOID MODE: ACTIVE", flush=True)
     print(f"🔄 SMART CHOP DETECTION: ACTIVE", flush=True)
@@ -1015,33 +1177,46 @@ council_votes_pro = council_votes_enhanced
 
 # =================== FAST TRADING SYSTEM ===================
 def detect_fast_opportunity(df, council_data):
-    """كشف فرص التداول السريع"""
+    """كشف فرص التداول السريع مع شروط أقوى للسكالب"""
     if not FAST_TRADE_ENABLED:
         return None
         
     ind = council_data["ind"]
     score_b = council_data["score_b"]
     score_s = council_data["score_s"]
+    current_price = float(df['close'].iloc[-1]) if len(df) > 0 else 0
     
-    # شروط أسهل للدخول السريع
+    # للسكالب: شروط أقسى
     fast_buy = (
-        score_b >= FAST_MIN_SCORE and 
-        ind.get('rsi', 50) < 65 and  # ⬆️ كان 70
-        ind.get('adx', 0) > 10 and   # ⬇️ كان 12
-        council_data["b"] > council_data["s"]
+        score_b >= SCALP_MIN_SCORE and 
+        council_data["b"] >= SCALP_MIN_VOTES and
+        ind.get('rsi', 50) < 65 and
+        ind.get('adx', 0) > 16 and   # ⬆️ زيادة من 10 إلى 16
+        council_data["b"] > council_data["s"] and
+        can_trade_scalp_today()
     )
     
     fast_sell = (
-        score_s >= FAST_MIN_SCORE and 
-        ind.get('rsi', 50) > 35 and  # ⬇️ كان 30
-        ind.get('adx', 0) > 10 and   # ⬇️ كان 12
-        council_data["s"] > council_data["b"]
+        score_s >= SCALP_MIN_SCORE and 
+        council_data["s"] >= SCALP_MIN_VOTES and
+        ind.get('rsi', 50) > 35 and
+        ind.get('adx', 0) > 16 and   # ⬆️ زيادة من 10 إلى 16
+        council_data["s"] > council_data["b"] and
+        can_trade_scalp_today()
     )
     
-    if fast_buy:
-        return {"action": "fast_buy", "reason": f"فرصة سريعة - score:{score_b:.1f}"}
-    elif fast_sell:
-        return {"action": "fast_sell", "reason": f"فرصة سريعة - score:{score_s:.1f}"}
+    # فحص الجودة الإضافي
+    if fast_buy or fast_sell:
+        is_quality, quality_reason = is_high_quality_scalp(df, council_data, current_price)
+        if is_quality:
+            if fast_buy:
+                update_scalp_trade_timestamp()
+                log_scalp_decision(True, quality_reason, council_data)
+                return {"action": "fast_buy", "reason": f"🔥 سكالب عالي الجودة - {quality_reason}"}
+            elif fast_sell:
+                update_scalp_trade_timestamp()
+                log_scalp_decision(True, quality_reason, council_data)
+                return {"action": "fast_sell", "reason": f"🔥 سكالب عالي الجودة - {quality_reason}"}
     
     return None
 
@@ -1591,7 +1766,7 @@ def open_market_enhanced(side, qty, price):
         
         log_trade_open(
             side=side, price=price, qty=qty, leverage=LEVERAGE,
-            source="SMART CHOP DETECTION SYSTEM",
+            source="STRICT SCALP PROTECTION SYSTEM",
             mode=mode,
             risk_alloc=RISK_ALLOC,
             council=votes,
@@ -2025,7 +2200,7 @@ def pretty_snapshot(bal, info, ind, spread_bps, reason=None, df=None):
         print("📈 INDICATORS & RF")
         print(f"   💲 Price {fmt(info.get('price'))} | RF filt={fmt(info.get('filter'))}  hi={fmt(info.get('hi'))} lo={fmt(info.get('lo'))}")
         print(f"   🧮 RSI={fmt(ind.get('rsi'))}  +DI={fmt(ind.get('plus_di'))}  -DI={fmt(ind.get('minus_di'))}  ADX={fmt(ind.get('adx'))}  ATR={fmt(ind.get('atr'))}")
-        print(f"   🎯 ENTRY: SMART CHOP DETECTION SYSTEM  |  spread_bps={fmt(spread_bps,2)}")
+        print(f"   🎯 ENTRY: STRICT SCALP PROTECTION SYSTEM  |  spread_bps={fmt(spread_bps,2)}")
         print(f"   ⏱️ closes_in ≈ {left_s}s")
         print("\n🧭 POSITION")
         bal_line = f"Balance={fmt(bal,2)}  Risk={int(RISK_ALLOC*100)}%×{LEVERAGE}x  CompoundPnL={fmt(compound_pnl)}  Eq~{fmt((bal or 0)+compound_pnl,2)}"
@@ -2046,19 +2221,27 @@ app = Flask(__name__)
 @app.route("/")
 def home():
     mode='LIVE' if MODE_LIVE else 'PAPER'
-    return f"✅ SMART CHOP DETECTION BOT — {SYMBOL} {INTERVAL} — {mode} — Intelligent Market Analysis"
+    return f"✅ STRICT SCALP PROTECTION BOT — {SYMBOL} {INTERVAL} — {mode} — High Quality Scalp Trades Only"
 
 @app.route("/metrics")
 def metrics():
     in_cooldown, cooldown_reason = is_in_trend_cooldown()
+    in_scalp_cooldown, scalp_cooldown_reason = is_in_scalp_cooldown()
+    scalp_trades_today = len([t for t in daily_scalp_trades if t.date() == datetime.now().date()])
     
     return jsonify({
         "symbol": SYMBOL, "interval": INTERVAL, "mode": "live" if MODE_LIVE else "paper",
         "leverage": LEVERAGE, "risk_alloc": RISK_ALLOC, "price": price_now(),
         "state": STATE, "compound_pnl": compound_pnl,
-        "entry_mode": "SMART_CHOP_DETECTION",
+        "entry_mode": "STRICT_SCALP_PROTECTION",
         "protection_system": {
-            "weak_scalp_protection": True,
+            "strict_scalp_protection": True,
+            "scalp_trades_today": scalp_trades_today,
+            "scalp_max_per_day": SCALP_MAX_TRADES_PER_DAY,
+            "scalp_cooldown": {
+                "active": in_scalp_cooldown,
+                "reason": scalp_cooldown_reason,
+            },
             "trend_cooldown": {
                 "active": in_cooldown,
                 "reason": cooldown_reason,
@@ -2071,13 +2254,20 @@ def metrics():
 @app.route("/health")
 def health():
     in_cooldown, cooldown_reason = is_in_trend_cooldown()
+    in_scalp_cooldown, scalp_cooldown_reason = is_in_scalp_cooldown()
+    scalp_trades_today = len([t for t in daily_scalp_trades if t.date() == datetime.now().date()])
     
     return jsonify({
         "ok": True, "mode": "live" if MODE_LIVE else "paper",
         "open": STATE["open"], "side": STATE["side"], "qty": STATE["qty"],
         "compound_pnl": compound_pnl, "timestamp": datetime.utcnow().isoformat(),
+        "scalp_stats": {
+            "trades_today": scalp_trades_today,
+            "max_per_day": SCALP_MAX_TRADES_PER_DAY
+        },
         "protection_active": {
-            "weak_scalp": True,
+            "strict_scalp": True,
+            "scalp_cooldown": in_scalp_cooldown,
             "trend_cooldown": in_cooldown,
             "market_chop_detection": True,
             "strategy_avoid": True
@@ -2099,7 +2289,7 @@ def keepalive_loop():
 
 # =================== BOOT ===================
 if __name__ == "__main__":
-    log_banner("SMART CHOP DETECTION SYSTEM")
+    log_banner("STRICT SCALP PROTECTION SYSTEM")
     state = load_state() or {}
     state.setdefault("in_position", False)
 
@@ -2112,17 +2302,17 @@ if __name__ == "__main__":
     verify_execution_environment()
 
     print(colored(f"MODE: {'LIVE' if MODE_LIVE else 'PAPER'}  •  {SYMBOL}  •  {INTERVAL}", "yellow"))
-    print(colored(f"RISK: {int(RISK_ALLOC*100)}% × {LEVERAGE}x  •  SMART_SYSTEM=ENABLED", "yellow"))
+    print(colored(f"RISK: {int(RISK_ALLOC*100)}% × {LEVERAGE}x  •  STRICT_SCALP_SYSTEM=ENABLED", "yellow"))
     print(colored(f"SMC/ICT: Golden Zones + FVG + BOS + Sweeps + Order Blocks", "yellow"))
     print(colored(f"MANAGEMENT: Smart TP + Smart Exit + Trail Adaptation", "yellow"))
-    print(colored(f"🛡️  WEAK SCALP PROTECTION: ACTIVATED", "green"))
+    print(colored(f"🛡️  STRICT SCALP PROTECTION: ACTIVATED (Max {SCALP_MAX_TRADES_PER_DAY}/day)", "green"))
     print(colored(f"🔄 TREND COOLDOWN SYSTEM: ACTIVATED", "green")) 
     print(colored(f"🎯 STRATEGY AVOID MODE: ACTIVATED", "green"))
     print(colored(f"🔄 SMART CHOP DETECTION: ACTIVATED", "green"))
     print(colored(f"🎯 INTELLIGENT ENTRY SYSTEM: ACTIVATED", "green"))
     print(colored(f"EXECUTION: {'ACTIVE' if EXECUTE_ORDERS and not DRY_RUN else 'SIMULATION'}", "yellow"))
     
-    logging.info("SMART CHOP DETECTION service starting…")
+    logging.info("STRICT SCALP PROTECTION service starting…")
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
     signal.signal(signal.SIGINT,  lambda *_: sys.exit(0))
     
