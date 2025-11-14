@@ -9,6 +9,8 @@ RF Futures Bot — RF-LIVE ONLY (BingX Perp via CCXT)
 • WEAK SCALP PROTECTION - No weak scalp trades
 • TREND COOLDOWN SYSTEM - Protection after strong trends
 • STRATEGY AVOID MODE - Avoid weak market conditions
+• SMART CHOP DETECTION - Avoid choppy markets
+• INTELLIGENT ENTRY SYSTEM - Smart trend and signal detection
 """
 
 import os, time, math, random, signal, sys, traceback, logging, json
@@ -43,7 +45,7 @@ SHADOW_MODE_DASHBOARD = False
 DRY_RUN = False
 
 # ==== Addon: Logging + Recovery Settings ====
-BOT_VERSION = "DOGE Council ELITE v7.0 — Enhanced Fast Trading + Weak Scalp Protection + Trend Cooldown"
+BOT_VERSION = "DOGE Council ELITE v9.0 — Smart Chop Detection & Intelligent Entry"
 print("🔁 Booting:", BOT_VERSION, flush=True)
 
 STATE_PATH = "./bot_state.json"
@@ -128,6 +130,12 @@ MIN_RR_RATIO = 1.2        # أقل نسبة R/R مسموح بها
 
 # Trend Cooldown System
 TREND_COOLDOWN_HOURS = 4  # فترة التبريد بعد الترند القوي
+
+# Smart Entry System - NEW
+STRONG_TREND_ADX = 20     # عتبة الترند القوي
+VERY_STRONG_TREND_ADX = 25 # عتبة الترند القوي جداً
+MIN_COUNCIL_SCORE = 2.5   # ⬇️ عتبة أقل للمجلس
+STRONG_FLOW_Z = 0.8       # عتبة التدفق القوي
 
 # Decision thresholds - RELAXED FOR MORE TRADES
 COUNCIL_STRONG_TH = 5.0   # ⬇️ كان 8.0 - تخفيض 37%
@@ -222,6 +230,148 @@ def load_state() -> dict:
     except Exception as e:
         log_w(f"state load failed: {e}")
     return {}
+
+# =================== MARKET CHOP DETECTION SYSTEM ===================
+def detect_market_chop(df, council_data, current_price):
+    """
+    كشف حالات التذبذب وعدم الاتجاه في السوق
+    """
+    ind = council_data["ind"]
+    
+    chop_signals = []
+    
+    # 1) ADX مرتفع لكن DI متقارب (ترند ضعيف)
+    adx = ind.get('adx', 0)
+    di_plus = ind.get('plus_di', 0)
+    di_minus = ind.get('minus_di', 0)
+    di_spread = abs(di_plus - di_minus)
+    
+    if adx > 20 and di_spread < 5:
+        chop_signals.append(f"ADX مرتفع ({adx:.1f}) لكن DI متقارب ({di_spread:.1f})")
+    
+    # 2) RSI في منتصف الطريق (40-60) + ADX منخفض
+    rsi = ind.get('rsi', 50)
+    if 40 <= rsi <= 60 and adx < 18:
+        chop_signals.append(f"RSI محايد ({rsi:.1f}) مع ADX منخفض")
+    
+    # 3) Bookmap متوازن جداً
+    bm = council_data.get("ind", {}).get("bm", {})
+    if bm.get("ok"):
+        imb = bm.get("imbalance", 1.0)
+        if 0.9 <= imb <= 1.1:  # توازن تام
+            chop_signals.append(f"Bookmap متوازن (imb={imb:.2f})")
+    
+    # 4) تدفق ضعيف ومتذبذب
+    flow = council_data.get("ind", {}).get("flow", {})
+    if flow.get("ok"):
+        delta_z = flow.get("delta_z", 0)
+        if abs(delta_z) < 0.5:  # تدفق ضعيف
+            chop_signals.append(f"تدفق ضعيف (z={delta_z:.2f})")
+    
+    # 5) قرار مجلس ضعيف ومتضارب
+    score_b = council_data.get('score_b', 0)
+    score_s = council_data.get('score_s', 0)
+    if max(score_b, score_s) < 3.0:
+        chop_signals.append(f"قرار مجلس ضعيف (B:{score_b:.1f}/S:{score_s:.1f})")
+    
+    # 6) ATR منخفض (تذبذب سعري قليل)
+    atr = ind.get('atr', 0)
+    atr_pct = (atr / current_price) * 100 if current_price > 0 else 0
+    if atr_pct < 0.2:  # ATR أقل من 0.2%
+        chop_signals.append(f"تذبذب سعري منخفض (ATR={atr_pct:.2f}%)")
+    
+    return chop_signals
+
+def should_avoid_chop_market(chop_signals):
+    """
+    يقرر إذا كان يجب تجنب السوق المتذبذب
+    """
+    if len(chop_signals) >= 3:  # إذا توفرت 3 إشارات تذبذب أو أكثر
+        return True, chop_signals
+    elif len(chop_signals) == 2 and any("ADX مرتفع" in s for s in chop_signals):
+        return True, chop_signals
+    return False, chop_signals
+
+# =================== SMART ENTRY DECISION SYSTEM ===================
+def smart_entry_decision(df, council_data, strategy_mode, snap, current_price):
+    """
+    قرار دخول ذكي يأخذ في الاعتبار حالة السوق
+    """
+    # أولاً: كشف التذبذب
+    chop_signals = detect_market_chop(df, council_data, current_price)
+    avoid_chop, chop_details = should_avoid_chop_market(chop_signals)
+    
+    if avoid_chop:
+        return None, f"سوق متذبذب: {', '.join(chop_details[:3])}"
+    
+    # ثانياً: تحليل قوة الإشارة
+    ind = council_data["ind"]
+    flow = snap.get("flow", {})
+    bm = snap.get("bm", {})
+    
+    # حساب نقاط القوة
+    strength_points = 0
+    reasons = []
+    
+    # 1) قوة الترند
+    adx = ind.get('adx', 0)
+    di_spread = ind.get('di_spread', 0)
+    if adx > 25 and di_spread > 8:
+        strength_points += 3
+        reasons.append("ترند قوي جداً")
+    elif adx > 20:
+        strength_points += 2
+        reasons.append("ترند قوي")
+    elif strategy_mode["mode"] == "trend":
+        strength_points += 1
+        reasons.append("نمط ترند")
+    
+    # 2) قوة المجلس
+    score_b = council_data.get('score_b', 0)
+    score_s = council_data.get('score_s', 0)
+    votes_b = council_data.get('b', 0)
+    votes_s = council_data.get('s', 0)
+    
+    if max(score_b, score_s) >= 4.0:
+        strength_points += 2
+        reasons.append("قرار مجلس قوي")
+    elif max(score_b, score_s) >= 2.5:
+        strength_points += 1
+        reasons.append("قرار مجلس مقبول")
+    
+    # 3) التدفق والدعم
+    if flow.get('ok'):
+        if abs(flow.get('delta_z', 0)) > 1.0:
+            strength_points += 2
+            reasons.append("تدفق قوي")
+        elif abs(flow.get('delta_z', 0)) > 0.5:
+            strength_points += 1
+            reasons.append("تدفق معتدل")
+    
+    # 4) المناطق الذهبية
+    gz = ind.get('gz', {})
+    if gz.get('ok') and gz.get('score', 0) >= 4.0:
+        strength_points += 2
+        reasons.append("منطقة ذهبية قوية")
+    
+    # 5) Bookmap
+    if bm.get('ok'):
+        imb = bm.get('imbalance', 1.0)
+        if imb >= 1.3 or imb <= 0.7:
+            strength_points += 1
+            reasons.append("ضغط كتابي قوي")
+    
+    # قرار الدخول النهائي
+    buy_advantage = (score_b > score_s and votes_b > votes_s)
+    sell_advantage = (score_s > score_b and votes_s > votes_b)
+    
+    if strength_points >= 4:  # عتبة الدخول الذكي
+        if buy_advantage:
+            return "buy", f"إشارة شراء قوية [{strength_points} نقاط]: {', '.join(reasons)}"
+        elif sell_advantage:
+            return "sell", f"إشارة بيع قوية [{strength_points} نقاط]: {', '.join(reasons)}"
+    
+    return None, f"إشارة ضعيفة [{strength_points} نقاط]: {', '.join(reasons)}"
 
 # =================== PROTECTION SYSTEMS ===================
 # Trend Cooldown System
@@ -322,17 +472,6 @@ def log_protection_event(event_type, details):
     icon = icons.get(event_type, "🔔")
     print(f"{icon} [نظام الحماية] {details}", flush=True)
 
-def log_trade_decision(sig, strategy_mode, council_data, protection_checks):
-    """تسجيل قرار التداول مع أنظمة الحماية"""
-    if protection_checks:
-        log_protection_event("protection_active", f"منع تداول - {len(protection_checks)} تحذير")
-        for check in protection_checks:
-            print(f"   ↳ {check[1]}", flush=True)
-    elif sig:
-        log_protection_event("protection_pass", 
-                           f"تداول {sig.upper()} - {strategy_mode['mode']} - "
-                           f"score: {council_data['score_b']:.1f}/{council_data['score_s']:.1f}")
-
 # =================== SMC/ICT TOOLS ===================
 def _fib_zone(last_impulse_low, last_impulse_high):
     rng = last_impulse_high - last_impulse_low
@@ -398,6 +537,7 @@ def detect_fvg(df, min_bps=FVG_MIN_BPS):
     
     up = (l0 - h1) / ((h1 + l0) / 2) * 10000.0
     down = (l1 - h0) / ((h0 + l1) / 2) * 10000.0
+    
     if up >= min_bps:   
         return {"ok": True, "dir": "bull", "bps": up}
     if down >= min_bps: 
@@ -570,6 +710,7 @@ def verify_execution_environment():
     print(f"🛡️ WEAK SCALP PROTECTION: ACTIVE", flush=True)
     print(f"🔄 TREND COOLDOWN SYSTEM: ACTIVE", flush=True)
     print(f"🎯 STRATEGY AVOID MODE: ACTIVE", flush=True)
+    print(f"🔄 SMART CHOP DETECTION: ACTIVE", flush=True)
     
     if not EXECUTE_ORDERS:
         print("🟡 WARNING: EXECUTE_ORDERS=False - البوت في وضع التحليل فقط!", flush=True)
@@ -1450,7 +1591,7 @@ def open_market_enhanced(side, qty, price):
         
         log_trade_open(
             side=side, price=price, qty=qty, leverage=LEVERAGE,
-            source="Council ELITE ENHANCED PRO",
+            source="SMART CHOP DETECTION SYSTEM",
             mode=mode,
             risk_alloc=RISK_ALLOC,
             council=votes,
@@ -1759,9 +1900,9 @@ def manage_after_entry_enhanced_pro(df, ind, info):
 
 manage_after_entry = manage_after_entry_enhanced_pro
 
-# =================== ENHANCED TRADE LOOP - FAST TRADING ===================
-def trade_loop_enhanced_pro():
-    """حلقة تداول محترفة مع أنظمة الحماية الكاملة"""
+# =================== SMART TRADE LOOP ===================
+def trade_loop_smart_system():
+    """نظام تداول ذكي يتعامل مع جميع حالات السوق"""
     global wait_for_next_signal_side, last_strong_trend_time
     
     while True:
@@ -1774,6 +1915,10 @@ def trade_loop_enhanced_pro():
             ind = compute_indicators(df)
             spread_bps = orderbook_spread_bps()
             
+            if not px:
+                time.sleep(BASE_SLEEP)
+                continue
+                
             # تحديث الـ Snapshots
             snap = emit_snapshots(ex, SYMBOL, df,
                                 balance_fn=lambda: float(bal) if bal else None,
@@ -1783,16 +1928,16 @@ def trade_loop_enhanced_pro():
             if STATE["open"] and px:
                 STATE["pnl"] = (px-STATE["entry"])*STATE["qty"] if STATE["side"]=="long" else (STATE["entry"]-px)*STATE["qty"]
             
-            # إدارة الصفقة المفتوحة + تحديث التبريد
+            # إدارة الصفقة المفتوحة
             if STATE["open"]:
-                manage_after_entry_enhanced_pro(df, ind, {
+                manage_after_entry(df, ind, {
                     "price": px or info["price"], 
                     "bm": snap["bm"],
                     "flow": snap["flow"],
                     **info
                 })
             
-            # 🔍 تشخيص مفصل مع أنظمة الحماية
+            # 🔍 تشخيص مفصل
             council_data = council_votes_pro(df)
             strategy_mode = snap["mode"]
             
@@ -1800,42 +1945,43 @@ def trade_loop_enhanced_pro():
                   f"S: {council_data['s']}/{council_data['score_s']:.1f} | "
                   f"الاستراتيجية: {strategy_mode['mode']} ({strategy_mode['why']})")
             
-            # 🛡️ فحص أنظمة الحماية
+            # 🛡️ فحص أنظمة الحماية الأساسية
             protection_checks = []
             
             # 1. فحص وضع avoid
             if strategy_mode["mode"] == "avoid":
                 protection_checks.append(("🛑", f"تجنب التداول: {strategy_mode['why']}"))
             
-            # 2. فحص تبريد الترند القوي
-            in_cooldown, cooldown_reason = is_in_trend_cooldown()
-            if in_cooldown and strategy_mode["mode"] == "scalp":
-                protection_checks.append(("🛑", f"تبديد ترند: {cooldown_reason}"))
-            
-            # 3. فحص الانتشار
+            # 2. فحص الانتشار
             if spread_bps is not None and spread_bps > MAX_SPREAD_BPS:
                 protection_checks.append(("🛑", f"انتشار عالي: {fmt(spread_bps,2)}bps"))
+            
+            # 3. فحص التذبذب (النظام الجديد)
+            chop_signals = detect_market_chop(df, council_data, px)
+            avoid_chop, chop_details = should_avoid_chop_market(chop_signals)
+            if avoid_chop:
+                protection_checks.append(("🔄", f"سوق متذبذب: {chop_details[0]}"))
             
             # إذا فيه أي حماية نشطة، منع التداول
             if protection_checks and not STATE["open"]:
                 for icon, reason in protection_checks:
                     print(f"{icon} {reason}", flush=True)
+                if avoid_chop and len(chop_details) > 1:
+                    for i, signal in enumerate(chop_details[1:3], 1):
+                        print(f"   ↳ {signal}", flush=True)
                 print("🔒 منع التداول بسبب أنظمة الحماية", flush=True)
                 time.sleep(BASE_SLEEP)
                 continue
             
-            # قرار الدخول مع أنظمة الحماية المشددة
+            # 🎯 قرار الدخول الذكي
             sig = None
             reason = None
 
             if not STATE["open"]:
-                # قرار المجلس المحسن
-                if council_data["score_b"] >= 4.0 and council_data["b"] > council_data["s"]:
-                    sig = "buy"
-                elif council_data["score_s"] >= 4.0 and council_data["s"] > council_data["b"]:
-                    sig = "sell"
+                # استخدام النظام الذكي الجديد
+                sig, reason = smart_entry_decision(df, council_data, strategy_mode, snap, px)
                 
-                # 🛡️ فحص السكالب الضعيف للتأكيد النهائي
+                # فحص إضافي للسكالب الضعيف
                 if sig and strategy_mode["mode"] == "scalp":
                     expected_profit = TP1_PCT_SCALP
                     is_weak, weak_reason = detect_weak_scalp(df, council_data, expected_profit)
@@ -1844,20 +1990,22 @@ def trade_loop_enhanced_pro():
                         sig = None
                         reason = weak_reason
 
-            # تنفيذ الصفقة إذا مفيش موانع
-            if sig and not reason:
-                qty = compute_size(bal, px or info["price"])
+            # تنفيذ الصفقة
+            if sig and not protection_checks:
+                qty = compute_size(bal, px)
                 if qty > 0:
-                    ok = open_market(sig, qty, px or info["price"])
+                    ok = open_market(sig, qty, px)
                     if ok:
-                        log_g(f"✅ صفقة {strategy_mode['mode']}: {sig.upper()}")
+                        log_g(f"✅ {reason}")
                 else:
                     reason = "qty<=0"
             
-            # 🔍 لوج التشخيص إذا لم يتم الدخول
+            # 🔍 لوج التشخيص
             if not STATE["open"] and not sig:
-                print(f"🔍 لا توجد صفقة | السبب: {reason or 'شروط Council غير متحققة'} | "
-                      f"الاستراتيجية: {strategy_mode['mode']}", flush=True)
+                if chop_signals:
+                    print(f"🔄 سوق متذبذب | إشارات: {len(chop_signals)} | {chop_signals[0]}", flush=True)
+                else:
+                    print(f"🔍 لا توجد صفقة | السبب: {reason or 'شروط غير متحققة'}", flush=True)
 
             time.sleep(BASE_SLEEP)
             
@@ -1865,7 +2013,7 @@ def trade_loop_enhanced_pro():
             log_e(f"loop error: {e}\n{traceback.format_exc()}")
             time.sleep(BASE_SLEEP)
 
-trade_loop = trade_loop_enhanced_pro
+trade_loop = trade_loop_smart_system
 
 # =================== LOOP / LOG ===================
 def pretty_snapshot(bal, info, ind, spread_bps, reason=None, df=None):
@@ -1877,7 +2025,7 @@ def pretty_snapshot(bal, info, ind, spread_bps, reason=None, df=None):
         print("📈 INDICATORS & RF")
         print(f"   💲 Price {fmt(info.get('price'))} | RF filt={fmt(info.get('filter'))}  hi={fmt(info.get('hi'))} lo={fmt(info.get('lo'))}")
         print(f"   🧮 RSI={fmt(ind.get('rsi'))}  +DI={fmt(ind.get('plus_di'))}  -DI={fmt(ind.get('minus_di'))}  ADX={fmt(ind.get('adx'))}  ATR={fmt(ind.get('atr'))}")
-        print(f"   🎯 ENTRY: COUNCIL ELITE ENHANCED PRO + FAST TRADING + WEAK SCALP PROTECTION  |  spread_bps={fmt(spread_bps,2)}")
+        print(f"   🎯 ENTRY: SMART CHOP DETECTION SYSTEM  |  spread_bps={fmt(spread_bps,2)}")
         print(f"   ⏱️ closes_in ≈ {left_s}s")
         print("\n🧭 POSITION")
         bal_line = f"Balance={fmt(bal,2)}  Risk={int(RISK_ALLOC*100)}%×{LEVERAGE}x  CompoundPnL={fmt(compound_pnl)}  Eq~{fmt((bal or 0)+compound_pnl,2)}"
@@ -1898,7 +2046,7 @@ app = Flask(__name__)
 @app.route("/")
 def home():
     mode='LIVE' if MODE_LIVE else 'PAPER'
-    return f"✅ Council ELITE Bot ENHANCED PRO — {SYMBOL} {INTERVAL} — {mode} — Fast Trading + Weak Scalp Protection + Trend Cooldown"
+    return f"✅ SMART CHOP DETECTION BOT — {SYMBOL} {INTERVAL} — {mode} — Intelligent Market Analysis"
 
 @app.route("/metrics")
 def metrics():
@@ -1908,23 +2056,15 @@ def metrics():
         "symbol": SYMBOL, "interval": INTERVAL, "mode": "live" if MODE_LIVE else "paper",
         "leverage": LEVERAGE, "risk_alloc": RISK_ALLOC, "price": price_now(),
         "state": STATE, "compound_pnl": compound_pnl,
-        "entry_mode": "COUNCIL_ELITE_ENHANCED_PRO", 
-        "wait_for_next_signal": wait_for_next_signal_side,
+        "entry_mode": "SMART_CHOP_DETECTION",
         "protection_system": {
             "weak_scalp_protection": True,
             "trend_cooldown": {
                 "active": in_cooldown,
                 "reason": cooldown_reason,
-                "last_strong_trend_profit": last_strong_trend_profit,
-                "cooldown_hours": TREND_COOLDOWN_HOURS
             },
+            "market_chop_detection": True,
             "strategy_avoid": True,
-            "max_spread_bps": MAX_SPREAD_BPS
-        },
-        "trading_stats": {
-            "total_trades": STATE.get("profit_targets_achieved", 0),
-            "current_streak": STATE.get("bars", 0),
-            "highest_profit_pct": STATE.get("highest_profit_pct", 0)
         }
     })
 
@@ -1936,17 +2076,11 @@ def health():
         "ok": True, "mode": "live" if MODE_LIVE else "paper",
         "open": STATE["open"], "side": STATE["side"], "qty": STATE["qty"],
         "compound_pnl": compound_pnl, "timestamp": datetime.utcnow().isoformat(),
-        "entry_mode": "COUNCIL_ELITE_ENHANCED_PRO", 
-        "wait_for_next_signal": wait_for_next_signal_side,
         "protection_active": {
             "weak_scalp": True,
             "trend_cooldown": in_cooldown,
+            "market_chop_detection": True,
             "strategy_avoid": True
-        },
-        "performance": {
-            "current_profit_pct": STATE.get("pnl", 0),
-            "bars_in_trade": STATE.get("bars", 0),
-            "targets_achieved": STATE.get("profit_targets_achieved", 0)
         }
     }), 200
 
@@ -1965,7 +2099,7 @@ def keepalive_loop():
 
 # =================== BOOT ===================
 if __name__ == "__main__":
-    log_banner("COUNCIL ELITE ENHANCED PRO - نظام الحماية الكامل")
+    log_banner("SMART CHOP DETECTION SYSTEM")
     state = load_state() or {}
     state.setdefault("in_position", False)
 
@@ -1978,17 +2112,17 @@ if __name__ == "__main__":
     verify_execution_environment()
 
     print(colored(f"MODE: {'LIVE' if MODE_LIVE else 'PAPER'}  •  {SYMBOL}  •  {INTERVAL}", "yellow"))
-    print(colored(f"RISK: {int(RISK_ALLOC*100)}% × {LEVERAGE}x  •  COUNCIL_ELITE_ENHANCED_PRO=ENABLED", "yellow"))
+    print(colored(f"RISK: {int(RISK_ALLOC*100)}% × {LEVERAGE}x  •  SMART_SYSTEM=ENABLED", "yellow"))
     print(colored(f"SMC/ICT: Golden Zones + FVG + BOS + Sweeps + Order Blocks", "yellow"))
     print(colored(f"MANAGEMENT: Smart TP + Smart Exit + Trail Adaptation", "yellow"))
-    print(colored(f"FAST TRADING: {'ENABLED' if FAST_TRADE_ENABLED else 'DISABLED'}", "yellow"))
     print(colored(f"🛡️  WEAK SCALP PROTECTION: ACTIVATED", "green"))
     print(colored(f"🔄 TREND COOLDOWN SYSTEM: ACTIVATED", "green")) 
     print(colored(f"🎯 STRATEGY AVOID MODE: ACTIVATED", "green"))
-    print(colored(f"📊 إحصائيات حية في الـ API: ACTIVATED", "green"))
+    print(colored(f"🔄 SMART CHOP DETECTION: ACTIVATED", "green"))
+    print(colored(f"🎯 INTELLIGENT ENTRY SYSTEM: ACTIVATED", "green"))
     print(colored(f"EXECUTION: {'ACTIVE' if EXECUTE_ORDERS and not DRY_RUN else 'SIMULATION'}", "yellow"))
     
-    logging.info("Council ELITE ENHANCED PRO service starting…")
+    logging.info("SMART CHOP DETECTION service starting…")
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
     signal.signal(signal.SIGINT,  lambda *_: sys.exit(0))
     
