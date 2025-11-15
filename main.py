@@ -11,8 +11,6 @@ RF Futures Bot — RF-LIVE ONLY (BingX Perp via CCXT)
 • STRATEGY AVOID MODE - Avoid weak market conditions
 • SMART CHOP DETECTION - Avoid choppy markets
 • INTELLIGENT ENTRY SYSTEM - Smart trend and signal detection
-• FORBIDDEN ZONES DETECTION - Prevent scalp in dangerous areas
-• VOLUME & RSI CROSS VALIDATION - Mandatory for scalp trades
 """
 
 import os, time, math, random, signal, sys, traceback, logging, json
@@ -47,7 +45,7 @@ SHADOW_MODE_DASHBOARD = False
 DRY_RUN = False
 
 # ==== Addon: Logging + Recovery Settings ====
-BOT_VERSION = "DOGE Council ELITE v10.0 — Ultimate Quality Focused Scalp System"
+BOT_VERSION = "DOGE Council ELITE v9.0 — Quality Focused Scalp System"
 print("🔁 Booting:", BOT_VERSION, flush=True)
 
 STATE_PATH = "./bot_state.json"
@@ -259,133 +257,10 @@ def is_in_scalp_cooldown():
     
     return False, ""
 
-# =================== FORBIDDEN ZONES DETECTION ===================
-def detect_forbidden_zones(df, council_data, current_price):
+def is_high_quality_scalp(df, council_data, current_price):
     """
-    كشف المناطق المحظورة للسكالب بناء على 4 شروط رئيسية
+    التحقق من جودة صفقة السكالب (معايير أقسى)
     """
-    ind = council_data["ind"]
-    forbidden_reasons = []
-    
-    # 1) نطاق ضيق (ATR منخفض + ADX منخفض)
-    atr = ind.get('atr', 0.0)
-    atr_pct = (atr / current_price) * 100 if current_price > 0 else 0
-    adx = ind.get('adx', 0)
-    
-    if atr_pct < 0.15 and adx < 12:
-        forbidden_reasons.append("نطاق سعري ضيق جداً (ATR منخفض + ADX منخفض)")
-    
-    # 2) ضد الاتجاه الرئيسي للـ15m
-    if len(df) >= 100:  # تحتاج بيانات كافية لتحليل الاتجاه
-        # تحليل الاتجاه على الإطار 15m (باستخدام 20 شمعة سابقة)
-        closes_15m = df['close'].astype(float).tail(20)
-        trend_15m = "up" if closes_15m.iloc[-1] > closes_15m.iloc[0] else "down"
-        
-        # تحليل الاتجاه الحالي على الإطار الحالي
-        current_trend = "up" if current_price > closes_15m.iloc[-5] else "down"
-        
-        if current_trend != trend_15m:
-            forbidden_reasons.append(f"ضد الاتجاه الرئيسي للـ15m ({trend_15m.upper()})")
-    
-    # 3) ذيول سيولة كبيرة (Liquidity Sweep)
-    sweep = ind.get('sweep', {})
-    if sweep.get('ok'):
-        forbidden_reasons.append("وجود Liquidity Sweep كبير")
-    
-    # 4) شمعة ذات ذيول كبيرة جداً
-    if len(df) >= 2:
-        current_candle = df.iloc[-1]
-        high = float(current_candle['high'])
-        low = float(current_candle['low'])
-        open_price = float(current_candle['open'])
-        close_price = float(current_candle['close'])
-        
-        body_size = abs(close_price - open_price)
-        total_range = high - low
-        upper_wick = high - max(open_price, close_price)
-        lower_wick = min(open_price, close_price) - low
-        
-        # إذا كانت الذيول أكبر من الجسم بثلاثة أضعاف
-        if upper_wick > body_size * 3 or lower_wick > body_size * 3:
-            forbidden_reasons.append("شمعة ذات ذيول كبيرة جداً (فخ سيولة)")
-    
-    return forbidden_reasons
-
-# =================== VOLUME & RSI CROSS VALIDATION ===================
-def validate_volume_and_rsi(df, council_data, current_price):
-    """
-    التحقق من شرطي الفوليوم وتقاطع RSI للسكالب
-    """
-    ind = council_data["ind"]
-    validation_errors = []
-    
-    # 1) فحص الفوليوم: Volume الحالي يجب أن يكون أعلى من MA20
-    if len(df) >= 20:
-        current_volume = float(df['volume'].iloc[-1])
-        volume_ma_20 = df['volume'].tail(20).astype(float).mean()
-        
-        if current_volume <= volume_ma_20:
-            validation_errors.append(f"الفوليوم ضعيف ({current_volume:.0f} ≤ {volume_ma_20:.0f})")
-    
-    # 2) فحص تقاطع RSI
-    rsi = ind.get('rsi', 50)
-    rsi_ma = ind.get('rsi_ma', 50)
-    rsi_cross = ind.get('rsi_cross', 'none')
-    
-    # شرط التقاطع الإلزامي للسكالب
-    if rsi_cross == 'none':
-        validation_errors.append("لا يوجد تقاطع RSI")
-    else:
-        # شروط إضافية للتقاطع
-        if rsi_cross == 'bull' and rsi >= 70:
-            validation_errors.append("RSI في ذروة شراء رغم التقاطع الصاعد")
-        elif rsi_cross == 'bear' and rsi <= 30:
-            validation_errors.append("RSI في ذروة بيع رغم التقاطع الهابط")
-    
-    return validation_errors
-
-def is_scalp_allowed(df, council_data, current_price):
-    """
-    يقرر إذا كان مسموحاً بدخول صفقة سكالب
-    """
-    # 1) فحص المناطق المحظورة
-    forbidden_zones = detect_forbidden_zones(df, council_data, current_price)
-    if forbidden_zones:
-        return False, f"منطقة محظورة: {forbidden_zones[0]}"
-    
-    # 2) فحص الفوليوم وتقاطع RSI
-    volume_rsi_errors = validate_volume_and_rsi(df, council_data, current_price)
-    if volume_rsi_errors:
-        return False, f"تحقق فني: {volume_rsi_errors[0]}"
-    
-    # 3) فحص الظروف الأساسية للسكالب
-    ind = council_data["ind"]
-    
-    # شروط السماح بالسكالب
-    required_conditions = [
-        ind.get('adx', 0) >= 16,           # ADX كافي للاتجاه
-        ind.get('atr', 0) > 0,             # ATR غير معدوم
-        council_data.get('b', 0) >= 2 or council_data.get('s', 0) >= 2,  # تصويت كافي
-        ind.get('rsi', 50) < 70,           # RSI ليس في ذروة شراء
-        ind.get('rsi', 50) > 30,           # RSI ليس في ذروة بيع
-    ]
-    
-    if not all(required_conditions):
-        return False, "ظروف السوق غير مناسبة للسكالب"
-    
-    return True, "مسموح بالسكالب"
-
-# =================== ENHANCED QUALITY SCALP CHECK ===================
-def enhanced_high_quality_scalp(df, council_data, current_price):
-    """
-    نسخة محسنة من فحص جودة السكالب مع المناطق المحظورة + الفوليوم + RSI
-    """
-    # أولاً: فحص السماح الأساسي بالسكالب
-    scalp_allowed, allow_reason = is_scalp_allowed(df, council_data, current_price)
-    if not scalp_allowed:
-        return False, allow_reason
-    
-    # ثانياً: فحص الجودة المتقدم
     ind = council_data["ind"]
     score_b = council_data["score_b"]
     score_s = council_data["score_s"]
@@ -405,59 +280,35 @@ def enhanced_high_quality_scalp(df, council_data, current_price):
         quality_score += 2
         reasons.append(f"مجلس جيد ({council_strength:.1f})")
     else:
-        return False, "مجلس ضعيف للسكالب"
+        return False, "مجلس ضعيف"
     
-    # 2) المؤشرات الفنية (4 نقاط) - ⬆️ زيادة الأهمية
+    # 2) المؤشرات الفنية (3 نقاط)
     adx = ind.get('adx', 0)
     rsi = ind.get('rsi', 50)
     di_spread = ind.get('di_spread', 0)
     atr = ind.get('atr', 0)
     atr_pct = (atr / current_price) * 100 if current_price > 0 else 0
-    rsi_cross = ind.get('rsi_cross', 'none')
     
     tech_points = 0
-    
-    # ✅ شرط RSI Cross الإلزامي (نقطة إضافية)
-    if rsi_cross != 'none':
-        tech_points += 1
-        reasons.append(f"تقاطع RSI {rsi_cross}")
-    
     if SCALP_ADX_RANGE[0] <= adx <= SCALP_ADX_RANGE[1]:
         tech_points += 1
     if SCALP_RSI_RANGE[0] <= rsi <= SCALP_RSI_RANGE[1]:
         tech_points += 1  
     if di_spread >= 4.0:
         tech_points += 1
-    if 0.3 <= atr_pct <= 1.0:  # ATR معقول (ليس كبير جداً ولا صغير جداً)
+    if atr_pct >= 0.3:
         tech_points += 1
         
-    if tech_points >= 4:  # ⬆️ زيادة العتبة
-        quality_score += 4
-        reasons.append(f"مؤشرات قوية (ADX:{adx:.1f}, RSI:{rsi:.1f}, ATR:{atr_pct:.2f}%)")
-    elif tech_points >= 3:
+    if tech_points >= 3:
         quality_score += 3
+        reasons.append(f"مؤشرات قوية (ADX:{adx:.1f}, RSI:{rsi:.1f})")
+    elif tech_points >= 2:
+        quality_score += 2
         reasons.append(f"مؤشرات جيدة (ADX:{adx:.1f}, RSI:{rsi:.1f})")
     else:
-        return False, "مؤشرات تقنية ضعيفة للسكالب"
+        return False, "مؤشرات ضعيفة"
     
-    # 3) الفوليوم القوي (2 نقطة) - ⬆️ زيادة الأهمية
-    if len(df) >= 20:
-        current_volume = float(df['volume'].iloc[-1])
-        volume_ma_20 = df['volume'].tail(20).astype(float).mean()
-        volume_ratio = current_volume / volume_ma_20 if volume_ma_20 > 0 else 1.0
-        
-        if volume_ratio >= 1.2:
-            quality_score += 2
-            reasons.append(f"فوليوم قوي (x{volume_ratio:.1f})")
-        elif volume_ratio >= 1.0:
-            quality_score += 1
-            reasons.append(f"فوليوم جيد (x{volume_ratio:.1f})")
-        else:
-            # الفوليوم الضعيف يخفض الجودة
-            quality_score -= 1
-            reasons.append(f"فوليوم ضعيف (x{volume_ratio:.1f})")
-    
-    # 4) التدفق والكتاب (2 نقطة)
+    # 3) التدفق والكتاب (2 نقطة)
     flow = ind.get('flow', {})
     bm = ind.get('bm', {})
     
@@ -471,7 +322,7 @@ def enhanced_high_quality_scalp(df, council_data, current_price):
         quality_score += 2
         reasons.append("تدفق/كتاب قوي")
     
-    # 5) SMC/ICT إضافية (2 نقطة)
+    # 4) SMC/ICT إضافية (2 نقطة)
     smc_points = 0
     fvg = ind.get('fvg', {})
     gz = ind.get('gz', {})
@@ -488,12 +339,12 @@ def enhanced_high_quality_scalp(df, council_data, current_price):
         quality_score += 2
         reasons.append("إشارات SMC/ICT")
     
-    # 6) نسبة المخاطرة/العائد (نقطة إضافية)
+    # 5) نسبة المخاطرة/العائد (نقطة إضافية)
     expected_profit = TP1_PCT_SCALP
     stop_loss_pct = (atr * 2.0) / current_price
     rr_ratio = expected_profit / stop_loss_pct
     
-    if rr_ratio >= 1.8:  # نسبة مخاطرة/عائد ممتازة
+    if rr_ratio >= 1.8:  # ⬆️ زيادة المعيار
         quality_score += 1
         reasons.append(f"R/R ممتاز ({rr_ratio:.2f})")
     elif rr_ratio >= 1.5:
@@ -506,7 +357,7 @@ def enhanced_high_quality_scalp(df, council_data, current_price):
     elif quality_score >= SCALP_QUALITY_THRESHOLD:
         return True, f"سكالب عالي الجودة ({quality_score:.1f}/10): {', '.join(reasons)}"
     else:
-        return False, f"جودة غير كافية للسكالب ({quality_score:.1f}/10)"
+        return False, f"جودة غير كافية ({quality_score:.1f}/10)"
 
 def log_quality_decision(decision, details, council_data, quality_score):
     """تسجيل قرار الجودة مع التفاصيل"""
@@ -587,9 +438,9 @@ def should_avoid_chop_market(chop_signals):
     return False, chop_signals
 
 # =================== SMART ENTRY DECISION SYSTEM ===================
-def enhanced_smart_entry_decision(df, council_data, strategy_mode, snap, current_price):
+def smart_entry_decision(df, council_data, strategy_mode, snap, current_price):
     """
-    قرار دخول ذكي محسّن مع مراعاة المناطق المحظورة + الفوليوم + RSI
+    قرار دخول ذكي يركز على الجودة فقط
     """
     # أولاً: فحص تبريد الترند القوي (يمنع كل شيء)
     in_trend_cooldown, trend_cooldown_reason = is_in_trend_cooldown()
@@ -603,15 +454,10 @@ def enhanced_smart_entry_decision(df, council_data, strategy_mode, snap, current
     if avoid_chop:
         return None, f"سوق متذبذب: {', '.join(chop_details[:3])}"
     
-    # ثالثاً: فحص المناطق المحظورة للسكالب
-    forbidden_zones = detect_forbidden_zones(df, council_data, current_price)
-    if forbidden_zones:
-        return None, f"منطقة محظورة: {forbidden_zones[0]}"
-    
-    # رابعاً: فحص تبريد السكالب (يمكن تجاوزه للجودة العالية)
+    # ثالثاً: فحص تبريد السكالب (يمكن تجاوزه للجودة العالية)
     in_scalp_cooldown, scalp_cooldown_reason = is_in_scalp_cooldown()
     
-    # خامساً: تحليل قوة الإشارة
+    # رابعاً: تحليل قوة الإشارة
     ind = council_data["ind"]
     score_b = council_data["score_b"]
     score_s = council_data["score_s"]
@@ -623,7 +469,7 @@ def enhanced_smart_entry_decision(df, council_data, strategy_mode, snap, current
     sell_advantage = (score_s > score_b and votes_s > votes_b)
     
     # 🔥 التركيز على الجودة بغض النظر عن النمط
-    is_quality_trade, quality_reason = enhanced_high_quality_scalp(df, council_data, current_price)
+    is_quality_trade, quality_reason = is_high_quality_scalp(df, council_data, current_price)
     
     if is_quality_trade and (buy_advantage or sell_advantage):
         # إذا كانت الجودة عالية، يمكن تجاوز تبريد السكالب
@@ -649,12 +495,12 @@ def enhanced_smart_entry_decision(df, council_data, strategy_mode, snap, current
     return None, f"جودة غير كافية: {quality_reason}"
 
 # =================== PROTECTION SYSTEMS ===================
-# Trend Cooldown System
+# Trend Cooldown System - منطق الترند الأصلي محفوظ كما هو
 last_strong_trend_time = 0
 last_strong_trend_profit = 0.0
 
 def update_strong_trend_timestamp(profit_pct, bars_count):
-    """تحديث وقت آخر ترند قوي"""
+    """تحديث وقت آخر ترند قوي - المنطق الأصلي محفوظ"""
     global last_strong_trend_time, last_strong_trend_profit
     
     if profit_pct >= 0.008 or bars_count >= 8:
@@ -663,7 +509,7 @@ def update_strong_trend_timestamp(profit_pct, bars_count):
         log_i(f"🔄 تبديد ترند قوي: ربح {profit_pct*100:.2f}% لمدة {TREND_COOLDOWN_HOURS} ساعات")
 
 def is_in_trend_cooldown():
-    """التحقق من فترة التبريد بعد الترند القوي"""
+    """التحقق من فترة التبريد بعد الترند القوي - المنطق الأصلي محفوظ"""
     if last_strong_trend_time == 0:
         return False, ""
     
@@ -713,6 +559,27 @@ def detect_weak_scalp(df, council_data, expected_profit_pct):
         return True, f"سكالب ضعيف: {', '.join(reasons)}"
     
     return False, "سكالب مقبول"
+
+def should_allow_scalp_mode(df, council_data):
+    """
+    يحدد إذا كان مسموحاً بدخول صفقات سكالب من الأساس
+    """
+    ind = council_data["ind"]
+    
+    # ممنوع السكالب في الحالات دي:
+    conditions = [
+        ind.get('adx', 0) < 16,           # ADX أقل من 16
+        ind.get('atr', 0) == 0,           # ATR معدوم
+        council_data.get('b', 0) < 3,     # تصويت شراء أقل من 3
+        council_data.get('s', 0) < 3,     # تصويت بيع أقل من 3  
+        ind.get('rsi', 50) > 70,          # RSI في ذروة شراء
+        ind.get('rsi', 50) < 30,          # RSI في ذروة بيع
+    ]
+    
+    if any(conditions):
+        return False, "ظروف السوق غير مناسبة للسكالب"
+    
+    return True, "مسموح"
 
 def log_protection_event(event_type, details):
     """تسجيل أحداث نظام الحماية"""
@@ -965,8 +832,6 @@ def verify_execution_environment():
     print(f"🔄 TREND COOLDOWN SYSTEM: {TREND_COOLDOWN_HOURS} hours", flush=True)
     print(f"🎯 STRATEGY AVOID MODE: ACTIVE", flush=True)
     print(f"🔄 SMART CHOP DETECTION: ACTIVE", flush=True)
-    print(f"🚫 FORBIDDEN ZONES DETECTION: ACTIVE", flush=True)
-    print(f"📊 VOLUME & RSI CROSS VALIDATION: ACTIVE", flush=True)
     
     if not EXECUTE_ORDERS:
         print("🟡 WARNING: EXECUTE_ORDERS=False - البوت في وضع التحليل فقط!", flush=True)
@@ -1018,7 +883,7 @@ def rsi_ma_context(df):
     }
 
 def decide_strategy_mode_enhanced(df, adx=None, di_plus=None, di_minus=None, rsi_ctx=None):
-    """نسخة محسنة مع وضع avoid"""
+    """نسخة محسنة مع وضع avoid - المنطق الأصلي محفوظ"""
     if adx is None or di_plus is None or di_minus is None:
         ind = compute_indicators(df)
         adx = ind.get('adx', 0)
@@ -1041,7 +906,7 @@ def decide_strategy_mode_enhanced(df, adx=None, di_plus=None, di_minus=None, rsi
     if any(avoid_conditions):
         return {"mode": "avoid", "why": "سوق ضعيف/متذبذب"}
     
-    # شروط trend
+    # شروط trend - المنطق الأصلي محفوظ
     strong_trend = (
         (adx >= 18 and di_spread >= 6.0) or
         (rsi_ctx["trendZ"] in ("bull", "bear") and not rsi_ctx["in_chop"])
@@ -1052,14 +917,12 @@ def decide_strategy_mode_enhanced(df, adx=None, di_plus=None, di_minus=None, rsi
     
     return {"mode": mode, "why": why}
 
-# =================== COUNCIL ELITE VOTING - ULTIMATE ===================
+# =================== COUNCIL ELITE VOTING - ENHANCED ===================
 COUNCIL_BUSY = False
 LAST_COUNCIL = {"b": 0, "s": 0, "score_b": 0.0, "score_s": 0.0, "logs": [], "ind": {}}
 
-def council_votes_ultimate(df):
-    """
-    النسخة النهائية من Council مع جميع أنظمة الحماية
-    """
+def council_votes_enhanced(df):
+    """نسخة محسنة من Council بشروط أسهل للمزيد من الصفقات + حماية السكالب الضعيف"""
     global COUNCIL_BUSY, LAST_COUNCIL
     if COUNCIL_BUSY:
         return LAST_COUNCIL
@@ -1069,15 +932,7 @@ def council_votes_ultimate(df):
         ind = compute_indicators(df)
         rsi_ctx = rsi_ma_context(df)
         atr = ind.get('atr', 0.0)
-        current_price = float(df['close'].iloc[-1]) if len(df) > 0 else 0
 
-        # فحص المناطق المحظورة
-        council_data_temp = {"ind": ind, "b": 0, "s": 0, "score_b": 0, "score_s": 0}
-        forbidden_zones = detect_forbidden_zones(df, council_data_temp, current_price)
-        
-        # فحص الفوليوم وتقاطع RSI
-        volume_rsi_errors = validate_volume_and_rsi(df, council_data_temp, current_price)
-        
         # SMC/ICT Detection
         bos = detect_bos(df)
         fvg = detect_fvg(df)
@@ -1097,99 +952,88 @@ def council_votes_ultimate(df):
         minus_di = ind.get('minus_di', 0.0)
         di_spread = abs(plus_di - minus_di)
 
-        # 🔒 تطبيق عقوبة المناطق المحظورة والفوليوم
-        penalty_multiplier = 1.0
-        
-        if forbidden_zones:
-            penalty_multiplier *= 0.3  # عقوبة شديدة
-            logs.append(f"🛑 مناطق محظورة: {forbidden_zones[0]}")
-        
-        if volume_rsi_errors:
-            penalty_multiplier *= 0.5  # عقوبة متوسطة
-            logs.append(f"📉 {volume_rsi_errors[0]}")
-
-        # Strong Trend (ADX/DI)
-        if adx >= 14:
-            if plus_di > minus_di and di_spread > 4.0:
+        # Strong Trend (ADX/DI) - شروط أسهل
+        if adx >= 14:  # ⬇️ كان ADX_TREND_MIN
+            if plus_di > minus_di and di_spread > 4.0:  # ⬇️ كان DI_SPREAD_TREND
                 votes_b += 2
-                score_b += 1.2 * penalty_multiplier
+                score_b += 1.2  # ⬇️ كان 1.5
                 logs.append("📈 ترند صاعد (ADX/DI)")
             elif minus_di > plus_di and di_spread > 4.0:
                 votes_s += 2
-                score_s += 1.2 * penalty_multiplier
+                score_s += 1.2
                 logs.append("📉 ترند هابط (ADX/DI)")
 
-        # RSI+MA Cross & Trend - ⬆️ زيادة الأهمية
-        if rsi_ctx["cross"] == "bull" and rsi_ctx["rsi"] < 65:
+        # RSI+MA Cross & Trend - شروط أسهل
+        if rsi_ctx["cross"] == "bull" and rsi_ctx["rsi"] < 65:  # ⬆️ كان 70
             votes_b += 2
-            score_b += 1.0 * penalty_multiplier
+            score_b += 1.0
             logs.append("🟢 RSI-MA إيجابي")
-        elif rsi_ctx["cross"] == "bear" and rsi_ctx["rsi"] > 35:
+        elif rsi_ctx["cross"] == "bear" and rsi_ctx["rsi"] > 35:  # ⬇️ كان 30
             votes_s += 2
-            score_s += 1.0 * penalty_multiplier
+            score_s += 1.0
             logs.append("🔴 RSI-MA سلبي")
 
         if rsi_ctx["trendZ"] == "bull":
-            votes_b += 2
-            score_b += 1.2 * penalty_multiplier
+            votes_b += 2  # ⬇️ كان 3
+            score_b += 1.2  # ⬇️ كان 1.5
             logs.append("🚀 RSI ترند صاعد")
         elif rsi_ctx["trendZ"] == "bear":
-            votes_s += 2
-            score_s += 1.2 * penalty_multiplier
+            votes_s += 2  # ⬇️ كان 3
+            score_s += 1.2  # ⬇️ كان 1.5
             logs.append("💥 RSI ترند هابط")
 
-        # FVG (Fair Value Gap)
+        # FVG (Fair Value Gap) - شروط أسهل
         if fvg.get("ok"):
             if fvg["dir"] == "bull":
-                votes_b += 1
-                score_b += 0.8 * penalty_multiplier
+                votes_b += 1  # ⬇️ كان 2
+                score_b += 0.8  # ⬇️ كان 1.0
                 logs.append(f"🟢 FVG bull {fvg['bps']:.1f}bps")
             else:
-                votes_s += 1
-                score_s += 0.8 * penalty_multiplier
+                votes_s += 1  # ⬇️ كان 2
+                score_s += 0.8  # ⬇️ كان 1.0
                 logs.append(f"🔴 FVG bear {fvg['bps']:.1f}bps")
 
-        # BOS (Break of Structure)
+        # BOS (Break of Structure) - شروط أسهل
         if bos.get("ok"):
             if bos["dir"] == "bull":
-                votes_b += 1
-                score_b += 0.8 * penalty_multiplier
+                votes_b += 1  # ⬇️ كان 2
+                score_b += 0.8  # ⬇️ كان 1.0
                 logs.append("🟩 BOS ↑")
             else:
-                votes_s += 1
-                score_s += 0.8 * penalty_multiplier
+                votes_s += 1  # ⬇️ كان 2
+                score_s += 0.8  # ⬇️ كان 1.0
                 logs.append("🟥 BOS ↓")
 
         # Liquidity Sweeps
         if sweep.get("ok"):
             if sweep["dir"] == "bull":
                 votes_b += 1
-                score_b += 0.5 * penalty_multiplier
+                score_b += 0.5
                 logs.append("💧 Liquidity Sweep (bull)")
             else:
                 votes_s += 1
-                score_s += 0.5 * penalty_multiplier
+                score_s += 0.5
                 logs.append("💧 Liquidity Sweep (bear)")
 
         # Order Blocks
         if ob_bull.get("ok"):
-            votes_b += 1
-            score_b += 0.5 * penalty_multiplier
+            votes_b += 1  # ⬆️ كان مجرد لوج
+            score_b += 0.5
             logs.append("🟢 OB Demand")
         if ob_bear.get("ok"):
-            votes_s += 1
-            score_s += 0.5 * penalty_multiplier
+            votes_s += 1  # ⬆️ كان مجرد لوج
+            score_s += 0.5
             logs.append("🔴 OB Supply")
 
-        # Golden Zones
-        if gz and gz.get("ok") and adx >= 14:
+        # Golden Zones - شروط أسهل
+        if gz and gz.get("ok") and adx >= 14:  # ⬇️ كان GZ_ADX_MIN
             if gz['zone']['type'] == 'golden_bottom':
-                votes_b += 2
-                score_b += 1.2 * penalty_multiplier
+                votes_b += 2  # ⬇️ كان 3
+                score_b += 1.2  # ⬇️ كان 1.5
                 logs.append(f"🏆 قاع ذهبي s={gz['score']:.1f}")
             elif gz['zone']['type'] == 'golden_top':
-                votes_s += 2
-                score_s += 1.2 * penalty_multiplier
+                votes_s += 2  # ⬇️ كان 3
+                score_s += 1.2  # ⬇️ كان 1.5
                 logs.append(f"🏆 قمة ذهبية s={gz['score']:.1f}")
 
         # Flow/Bookmap Integration
@@ -1198,30 +1042,30 @@ def council_votes_ultimate(df):
         
         if flow.get("ok"):
             dz = flow.get("delta_z", 0)
-            if dz >= 0.3:
-                votes_b += 1
-                score_b += 0.8 * penalty_multiplier
+            if dz >= 0.3:  # ⬇️ كان DELTA_Z_BULL
+                votes_b += 1  # ⬇️ كان 2
+                score_b += 0.8  # ⬇️ كان 1.0
                 logs.append("📊 Flow ضغط شراء")
-            if dz <= -0.3:
-                votes_s += 1
-                score_s += 0.8 * penalty_multiplier
+            if dz <= -0.3:  # ⬆️ كان DELTA_Z_BEAR
+                votes_s += 1  # ⬇️ كان 2
+                score_s += 0.8  # ⬇️ كان 1.0
                 logs.append("📊 Flow ضغط بيع")
                 
         if bm.get("ok"):
             imb = bm.get("imbalance", 1.0)
-            if imb >= 1.1:
+            if imb >= 1.1:  # ⬇️ كان IMB_ALERT
                 logs.append(f"🧱 Bookmap imb={imb:.2f}")
 
-        # Neutral/Chop Reduction
+        # Neutral/Chop Reduction - أقل عقوبة
         if rsi_ctx["in_chop"]:
-            score_b *= 0.90
-            score_s *= 0.90
+            score_b *= 0.90  # ⬆️ كان 0.85
+            score_s *= 0.90  # ⬆️ كان 0.85
             logs.append("⚖️ نطاق حيادي (RSI 45–55)")
 
-        # ADX Gate
-        if adx < 12:
-            score_b *= 0.95
-            score_s *= 0.95
+        # ADX Gate - أقل عقوبة
+        if adx < 12:  # ⬇️ كان ADX_GATE
+            score_b *= 0.95  # ⬆️ كان 0.9
+            score_s *= 0.95  # ⬆️ كان 0.9
             logs.append(f"🛡️ ADX Gate {adx:.1f}<12")
 
         # 🔒 STRICTER WEAK SCALP PROTECTION
@@ -1229,7 +1073,7 @@ def council_votes_ultimate(df):
         
         if mode_data["mode"] == "scalp":
             # تحقق إذا كان مسموحاً بالسكالب من الأساس
-            allow_scalp, scalp_reason = is_scalp_allowed(df, {
+            allow_scalp, scalp_reason = should_allow_scalp_mode(df, {
                 "b": votes_b, "s": votes_s, 
                 "score_b": score_b, "score_s": score_s,
                 "logs": logs, "ind": ind
@@ -1261,16 +1105,13 @@ def council_votes_ultimate(df):
             "rsi": rsi_ctx["rsi"],
             "rsi_ma": rsi_ctx["rsi_ma"], 
             "rsi_trendz": rsi_ctx["trendZ"],
-            "rsi_cross": rsi_ctx["cross"],  # ⬅️ إضافة التقاطع
             "di_spread": di_spread,
             "fvg": fvg,
             "bos": bos, 
             "sweep": sweep,
             "gz": gz,
             "flow": flow,
-            "bm": bm,
-            "forbidden_zones": forbidden_zones,
-            "volume_rsi_errors": volume_rsi_errors
+            "bm": bm
         })
 
         result = {
@@ -1286,12 +1127,12 @@ def council_votes_ultimate(df):
         return result
         
     except Exception as e:
-        log_w(f"council_votes_ultimate error: {e}")
+        log_w(f"council_votes_enhanced error: {e}")
         return LAST_COUNCIL
     finally:
         COUNCIL_BUSY = False
 
-council_votes_pro = council_votes_ultimate
+council_votes_pro = council_votes_enhanced
 
 # =================== FAST TRADING SYSTEM ===================
 def detect_fast_opportunity(df, council_data):
@@ -1323,7 +1164,7 @@ def detect_fast_opportunity(df, council_data):
     
     # فحص الجودة الإضافي
     if fast_buy or fast_sell:
-        is_quality, quality_reason = enhanced_high_quality_scalp(df, council_data, current_price)
+        is_quality, quality_reason = is_high_quality_scalp(df, council_data, current_price)
         if is_quality:
             if fast_buy:
                 update_scalp_trade_timestamp()
@@ -1884,7 +1725,7 @@ def open_market_enhanced(side, qty, price):
         
         log_trade_open(
             side=side, price=price, qty=qty, leverage=LEVERAGE,
-            source="ULTIMATE QUALITY FOCUSED SCALP SYSTEM",
+            source="QUALITY FOCUSED SCALP SYSTEM",
             mode=mode,
             risk_alloc=RISK_ALLOC,
             council=votes,
@@ -1906,7 +1747,7 @@ def wilder_ema(s: pd.Series, n: int):
 def compute_indicators(df: pd.DataFrame):
     if len(df) < max(ATR_LEN, RSI_LEN, ADX_LEN) + 2:
         return {"rsi":50.0,"plus_di":0.0,"minus_di":0.0,"dx":0.0,"adx":0.0,"atr":0.0}
-    c,h,l,v = df["close"].astype(float), df["high"].astype(float), df["low"].astype(float), df["volume"].astype(float)
+    c,h,l = df["close"].astype(float), df["high"].astype(float), df["low"].astype(float)
     tr = pd.concat([(h-l).abs(), (h-c.shift(1)).abs(), (l-c.shift(1)).abs()], axis=1).max(axis=1)
     atr = wilder_ema(tr, ATR_LEN)
 
@@ -1922,18 +1763,11 @@ def compute_indicators(df: pd.DataFrame):
     dx=(100*(plus_di-minus_di).abs()/(plus_di+minus_di).replace(0,1e-12)).fillna(0.0)
     adx=wilder_ema(dx, ADX_LEN)
 
-    # حساب Volume MA20
-    volume_ma_20 = v.rolling(20).mean() if len(v) >= 20 else pd.Series([v.mean()]*len(v))
-
     i=len(df)-1
     return {
-        "rsi": float(rsi.iloc[i]), 
-        "plus_di": float(plus_di.iloc[i]),
-        "minus_di": float(minus_di.iloc[i]), 
-        "dx": float(dx.iloc[i]),
-        "adx": float(adx.iloc[i]), 
-        "atr": float(atr.iloc[i]),
-        "volume_ma_20": float(volume_ma_20.iloc[i]) if len(volume_ma_20) > i else float(v.iloc[i])
+        "rsi": float(rsi.iloc[i]), "plus_di": float(plus_di.iloc[i]),
+        "minus_di": float(minus_di.iloc[i]), "dx": float(dx.iloc[i]),
+        "adx": float(adx.iloc[i]), "atr": float(atr.iloc[i])
     }
 
 # =================== RANGE FILTER ===================
@@ -2262,16 +2096,6 @@ def trade_loop_smart_system():
             if avoid_chop:
                 protection_checks.append(("🔄", f"سوق متذبذب: {chop_details[0]}"))
             
-            # 4. فحص المناطق المحظورة
-            forbidden_zones = detect_forbidden_zones(df, council_data, px)
-            if forbidden_zones:
-                protection_checks.append(("🚫", f"منطقة محظورة: {forbidden_zones[0]}"))
-            
-            # 5. فحص الفوليوم وتقاطع RSI
-            volume_rsi_errors = validate_volume_and_rsi(df, council_data, px)
-            if volume_rsi_errors:
-                protection_checks.append(("📉", f"تحقق فني: {volume_rsi_errors[0]}"))
-            
             # إذا فيه أي حماية نشطة، منع التداول
             if protection_checks and not STATE["open"]:
                 for icon, reason in protection_checks:
@@ -2289,7 +2113,7 @@ def trade_loop_smart_system():
 
             if not STATE["open"]:
                 # استخدام النظام الذكي الجديد
-                sig, reason = enhanced_smart_entry_decision(df, council_data, strategy_mode, snap, px)
+                sig, reason = smart_entry_decision(df, council_data, strategy_mode, snap, px)
                 
                 # فحص إضافي للسكالب الضعيف
                 if sig and strategy_mode["mode"] == "scalp":
@@ -2314,10 +2138,6 @@ def trade_loop_smart_system():
             if not STATE["open"] and not sig:
                 if chop_signals:
                     print(f"🔄 سوق متذبذب | إشارات: {len(chop_signals)} | {chop_signals[0]}", flush=True)
-                elif forbidden_zones:
-                    print(f"🚫 مناطق محظورة | {forbidden_zones[0]}", flush=True)
-                elif volume_rsi_errors:
-                    print(f"📉 مشاكل فنية | {volume_rsi_errors[0]}", flush=True)
                 else:
                     print(f"🔍 لا توجد صفقة | السبب: {reason or 'شروط غير متحققة'}", flush=True)
 
@@ -2339,7 +2159,7 @@ def pretty_snapshot(bal, info, ind, spread_bps, reason=None, df=None):
         print("📈 INDICATORS & RF")
         print(f"   💲 Price {fmt(info.get('price'))} | RF filt={fmt(info.get('filter'))}  hi={fmt(info.get('hi'))} lo={fmt(info.get('lo'))}")
         print(f"   🧮 RSI={fmt(ind.get('rsi'))}  +DI={fmt(ind.get('plus_di'))}  -DI={fmt(ind.get('minus_di'))}  ADX={fmt(ind.get('adx'))}  ATR={fmt(ind.get('atr'))}")
-        print(f"   🎯 ENTRY: ULTIMATE QUALITY FOCUSED SCALP SYSTEM  |  spread_bps={fmt(spread_bps,2)}")
+        print(f"   🎯 ENTRY: QUALITY FOCUSED SCALP SYSTEM  |  spread_bps={fmt(spread_bps,2)}")
         print(f"   ⏱️ closes_in ≈ {left_s}s")
         print("\n🧭 POSITION")
         bal_line = f"Balance={fmt(bal,2)}  Risk={int(RISK_ALLOC*100)}%×{LEVERAGE}x  CompoundPnL={fmt(compound_pnl)}  Eq~{fmt((bal or 0)+compound_pnl,2)}"
@@ -2360,7 +2180,7 @@ app = Flask(__name__)
 @app.route("/")
 def home():
     mode='LIVE' if MODE_LIVE else 'PAPER'
-    return f"✅ ULTIMATE QUALITY FOCUSED SCALP BOT — {SYMBOL} {INTERVAL} — {mode} — Ultimate High Quality Trades Only"
+    return f"✅ QUALITY FOCUSED SCALP BOT — {SYMBOL} {INTERVAL} — {mode} — High Quality Trades Only"
 
 @app.route("/metrics")
 def metrics():
@@ -2371,7 +2191,7 @@ def metrics():
         "symbol": SYMBOL, "interval": INTERVAL, "mode": "live" if MODE_LIVE else "paper",
         "leverage": LEVERAGE, "risk_alloc": RISK_ALLOC, "price": price_now(),
         "state": STATE, "compound_pnl": compound_pnl,
-        "entry_mode": "ULTIMATE_QUALITY_FOCUSED_SCALP",
+        "entry_mode": "QUALITY_FOCUSED_SCALP",
         "protection_system": {
             "quality_scalp_protection": True,
             "scalp_cooldown": {
@@ -2384,8 +2204,6 @@ def metrics():
             },
             "market_chop_detection": True,
             "strategy_avoid": True,
-            "forbidden_zones_detection": True,
-            "volume_rsi_validation": True,
         }
     })
 
@@ -2403,9 +2221,7 @@ def health():
             "scalp_cooldown": in_scalp_cooldown,
             "trend_cooldown": in_cooldown,
             "market_chop_detection": True,
-            "strategy_avoid": True,
-            "forbidden_zones": True,
-            "volume_rsi": True,
+            "strategy_avoid": True
         }
     }), 200
 
@@ -2424,7 +2240,7 @@ def keepalive_loop():
 
 # =================== BOOT ===================
 if __name__ == "__main__":
-    log_banner("ULTIMATE QUALITY FOCUSED SCALP SYSTEM")
+    log_banner("QUALITY FOCUSED SCALP SYSTEM")
     state = load_state() or {}
     state.setdefault("in_position", False)
 
@@ -2437,19 +2253,17 @@ if __name__ == "__main__":
     verify_execution_environment()
 
     print(colored(f"MODE: {'LIVE' if MODE_LIVE else 'PAPER'}  •  {SYMBOL}  •  {INTERVAL}", "yellow"))
-    print(colored(f"RISK: {int(RISK_ALLOC*100)}% × {LEVERAGE}x  •  ULTIMATE_QUALITY_FOCUSED_SYSTEM=ENABLED", "yellow"))
+    print(colored(f"RISK: {int(RISK_ALLOC*100)}% × {LEVERAGE}x  •  QUALITY_FOCUSED_SYSTEM=ENABLED", "yellow"))
     print(colored(f"SMC/ICT: Golden Zones + FVG + BOS + Sweeps + Order Blocks", "yellow"))
     print(colored(f"MANAGEMENT: Smart TP + Smart Exit + Trail Adaptation", "yellow"))
-    print(colored(f"🛡️  ULTIMATE QUALITY FOCUSED SCALP: ACTIVATED (Min {SCALP_QUALITY_THRESHOLD}/10)", "green"))
+    print(colored(f"🛡️  QUALITY FOCUSED SCALP: ACTIVATED (Min {SCALP_QUALITY_THRESHOLD}/10)", "green"))
     print(colored(f"🔄 TREND COOLDOWN SYSTEM: {TREND_COOLDOWN_HOURS} hours", "green")) 
     print(colored(f"🎯 STRATEGY AVOID MODE: ACTIVATED", "green"))
     print(colored(f"🔄 SMART CHOP DETECTION: ACTIVATED", "green"))
-    print(colored(f"🚫 FORBIDDEN ZONES DETECTION: ACTIVATED", "green"))
-    print(colored(f"📊 VOLUME & RSI CROSS VALIDATION: ACTIVATED", "green"))
     print(colored(f"🎯 INTELLIGENT ENTRY SYSTEM: ACTIVATED", "green"))
     print(colored(f"EXECUTION: {'ACTIVE' if EXECUTE_ORDERS and not DRY_RUN else 'SIMULATION'}", "yellow"))
     
-    logging.info("ULTIMATE QUALITY FOCUSED SCALP service starting…")
+    logging.info("QUALITY FOCUSED SCALP service starting…")
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
     signal.signal(signal.SIGINT,  lambda *_: sys.exit(0))
     
