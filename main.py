@@ -1026,63 +1026,24 @@ STATE = {
 compound_pnl = 0.0
 wait_for_next_signal_side = None
 
-# === NEW: track RF flips even if trade not taken ===
-last_rf_flip_side = None      # "buy" / "sell"
-last_rf_flip_ts   = None      # timestamp
-
-def _rf_flip_from_info(info):
-    """استنتاج اتجاه إشارة RF من info"""
-    if info.get("long"):
-        return "buy"
-    if info.get("short"):
-        return "sell"
-    return None
+# =================== WAIT FOR NEXT SIGNAL ===================
+def _arm_wait_after_close(prev_side):
+    """تفعيل انتظار الإشارة التالية بعد الإغلاق"""
+    global wait_for_next_signal_side
+    wait_for_next_signal_side = "sell" if prev_side=="long" else ("buy" if prev_side=="short" else None)
+    log_i(f"🛑 WAIT FOR NEXT SIGNAL: {wait_for_next_signal_side}")
 
 def wait_gate_allow(df, info):
-    """
-    بوابة الانتظار بعد إغلاق الصفقة:
-    - تسجّل كل RF flip حتى لو ما دخلناش صفقة
-    - تفك القفل بمجرد ظهور الإشارة المطلوبة
-    """
-    global wait_for_next_signal_side, last_rf_flip_side, last_rf_flip_ts
-
-    # 1) التقط RF flip
-    flip = _rf_flip_from_info(info)
-    if flip:
-        last_rf_flip_side = flip
-        last_rf_flip_ts = int(time.time())
-        log_i(f"📡 RF flip detected: {flip.upper()}")
-
-    # 2) لو مفيش انتظار → عدّي
-    if wait_for_next_signal_side is None:
+    """التحقق من بوابة الانتظار"""
+    if wait_for_next_signal_side is None: 
         return True, ""
-
-    # 3) لو الإشارة المطلوبة ظهرت → فك القفل
-    if flip and flip == wait_for_next_signal_side:
-        log_g(f"⏱ WAIT GATE cleared by RF → {flip.upper()}")
-        wait_for_next_signal_side = None
+    
+    bar_ts = int(info.get("time") or 0)
+    need = (wait_for_next_signal_side=="buy" and info.get("long")) or (wait_for_next_signal_side=="sell" and info.get("short"))
+    
+    if need:
         return True, ""
-
-    # 4) لسه مستني الإشارة المعاكسة
     return False, f"wait-for-next-RF({wait_for_next_signal_side})"
-
-def log_no_trade(reason, council, ind, info):
-    print("\n" + "✖"*70)
-    print("✖  NO TRADE — FULL ANALYSIS")
-    print("✖"*70)
-
-    print(f"• reason           : {reason}")
-    print(f"• wait_for_next    : {wait_for_next_signal_side}")
-    print(f"• last RF flip     : {last_rf_flip_side} @ {last_rf_flip_ts}")
-
-    print("\nCOUNCIL:")
-    print(f"• BUY votes/score  : {council['b']} / {council['score_b']:.2f}")
-    print(f"• SELL votes/score : {council['s']} / {council['score_s']:.2f}")
-
-    print("\nINDICATORS:")
-    print(f"• RSI/ADX/DI       : {ind.get('rsi')} / {ind.get('adx')} / {ind.get('di_spread')}")
-    print(f"• RF long/short    : {info.get('long')} / {info.get('short')}")
-    print("✖"*70 + "\n")
 
 # =================== ORDERS ===================
 def _params_open(side):
@@ -1169,12 +1130,6 @@ def _reset_after_close(reason, prev_side=None):
     # تفعيل انتظار الإشارة التالية
     _arm_wait_after_close(prev_side)
     logging.info(f"AFTER_CLOSE waiting_for={wait_for_next_signal_side}")
-
-def _arm_wait_after_close(prev_side):
-    """تفعيل انتظار الإشارة التالية بعد الإغلاق"""
-    global wait_for_next_signal_side
-    wait_for_next_signal_side = "sell" if prev_side=="long" else ("buy" if prev_side=="short" else None)
-    log_i(f"🛑 WAIT FOR NEXT SIGNAL: {wait_for_next_signal_side}")
 
 # =================== ENHANCED TRADE MANAGEMENT ===================
 def manage_after_entry_enhanced(df, ind, info):
@@ -1458,10 +1413,6 @@ def trade_loop_enhanced():
                                 log_i(f"   - {log_msg}")
                     else:
                         reason = "qty<=0"
-            
-            # لو مفيش صفقة مفتوحة واحنا ما دخلناش
-            if not STATE["open"] and sig is None:
-                log_no_trade(reason, council_data, ind, info)
             
             # اللوج الاحترافي
             if LOG_LEGACY:
