@@ -2,7 +2,7 @@
 """
 RF Futures Bot — RF-LIVE ONLY (BingX Perp via CCXT)
 • Council PRO Unified Decision System with Candles & Golden Entry
-• Golden Entry + Golden Reversal + Wick Exhaustion
+• Golden Entry + Golden Reversal + Wick Exhaustion + SMC Analysis
 • Dynamic TP ladder + Breakeven + ATR-trailing
 • Smart Exit Management + Wait-for-next-signal
 • Professional Logging & Dashboard
@@ -40,7 +40,7 @@ SHADOW_MODE_DASHBOARD = False
 DRY_RUN = False
 
 # ==== Addon: Logging + Recovery Settings ====
-BOT_VERSION = "DOGE Council PRO v4.0 — Candles + Golden System"
+BOT_VERSION = "DOGE Council PRO v4.0 — Candles + Golden System + SMC Analysis"
 print("🔁 Booting:", BOT_VERSION, flush=True)
 
 STATE_PATH = "./bot_state.json"
@@ -114,6 +114,11 @@ TRAIL_TIGHT_MULT   = 1.20
 GOLDEN_ENTRY_SCORE = 6.0
 GOLDEN_ENTRY_ADX   = 20.0
 GOLDEN_REVERSAL_SCORE = 6.5
+
+# ==== Golden Zones — SMC Advanced Settings ====
+GOLDEN_STRONG_SCORE    = 7.5   # القاع/القمة الذهبية القوية فقط
+GOLDEN_SWING_CONFIRM   = True  # لازم يكون آخر قاع/قمة (swing confirmed)
+GOLDEN_SMC_MIN_SCORE   = 2.5   # أقل سكور من تحليل المنطقة (SMC/context) لقبول الدخول
 
 # ==== Execution & Strategy Thresholds ====
 ADX_TREND_MIN = 20
@@ -258,6 +263,7 @@ def verify_execution_environment():
     print(f"🔧 EXECUTE_ORDERS: {EXECUTE_ORDERS} | SHADOW_MODE: {SHADOW_MODE_DASHBOARD} | DRY_RUN: {DRY_RUN}", flush=True)
     print(f"🎯 GOLDEN ENTRY: score={GOLDEN_ENTRY_SCORE} | ADX={GOLDEN_ENTRY_ADX}", flush=True)
     print(f"📈 CANDLES: Full patterns + Wick exhaustion + Golden reversal", flush=True)
+    print(f"🔍 SMC ANALYSIS: Golden Zones + Context Analysis", flush=True)
     
     if not EXECUTE_ORDERS:
         print("🟡 WARNING: EXECUTE_ORDERS=False - البوت في وضع التحليل فقط!", flush=True)
@@ -393,6 +399,111 @@ def golden_zone_check(df, ind=None, side_hint=None):
     except Exception as e:
         return {"ok": False, "score": 0.0, "zone": None, "reasons": [f"error: {e}"]}
 
+def analyze_golden_context(df, gz, council_data, ind=None):
+    """
+    تحليل كامل لمنطقة القاع/القمة الذهبية:
+    - هيكل السوق (HH/LL بسيط + DI)
+    - Sweep سيولة
+    - اندفاع (Displacement) بعد القاع/القمة
+    - توافق مع RSI/ADX
+    يرجّع score + ok + أسباب للتحليل.
+    """
+    try:
+        if not gz or not gz.get("zone") or not gz.get("ok"):
+            return {"ok": False, "score": 0.0, "dir": None, "reasons": ["no_golden_zone"]}
+
+        zone = gz["zone"]
+        ztype = zone.get("type")
+        if ztype not in ("golden_bottom", "golden_top"):
+            return {"ok": False, "score": 0.0, "dir": None, "reasons": ["not_bottom_or_top"]}
+
+        if ind is None or not isinstance(ind, dict):
+            ind = compute_indicators(df)
+
+        closes = df["close"].astype(float).values
+        highs  = df["high"].astype(float).values
+        lows   = df["low"].astype(float).values
+        vols   = df["volume"].astype(float).values
+
+        n = len(df)
+        if n < 25:
+            return {"ok": False, "score": 0.0, "dir": None, "reasons": ["short_df"]}
+
+        pivot_idx = int(zone.get("pivot_idx", n-2))
+        pivot_idx = max(1, min(n-2, pivot_idx))
+
+        atr   = float(ind.get("atr", 0.0) or 0.0)
+        rsi   = float(ind.get("rsi", 50.0) or 50.0)
+        adx   = float(ind.get("adx", 0.0) or 0.0)
+        di_p  = float(ind.get("plus_di", 0.0) or 0.0)
+        di_m  = float(ind.get("minus_di", 0.0) or 0.0)
+
+        score = 0.0
+        reasons = []
+
+        # 1) اتجاه الهيكل (DI + last swings)
+        if ztype == "golden_bottom":
+            if di_p > di_m:
+                score += 1.0; reasons.append("DI_up_trend_shift")
+        else:
+            if di_m > di_p:
+                score += 1.0; reasons.append("DI_down_trend_shift")
+
+        # 2) Sweep سيولة: القاع تحت كل آخر X قيعان / القمة فوق آخر X قمم
+        lookback = 8
+        if pivot_idx >= lookback:
+            prev_lows  = lows[pivot_idx-lookback:pivot_idx]
+            prev_highs = highs[pivot_idx-lookback:pivot_idx]
+            if ztype == "golden_bottom":
+                if lows[pivot_idx] < prev_lows.min():
+                    score += 1.0; reasons.append("liquidity_sweep_bottom")
+            else:
+                if highs[pivot_idx] > prev_highs.max():
+                    score += 1.0; reasons.append("liquidity_sweep_top")
+
+        # 3) اندفاع بعد القاع/القمة (Displacement) — شمعة بعد الـ pivot
+        if atr > 0 and pivot_idx+1 < n:
+            next_open  = float(df["open"].astype(float).iloc[pivot_idx+1])
+            next_close = float(df["close"].astype(float).iloc[pivot_idx+1])
+            rng = abs(next_close - next_open)
+            if rng >= 1.2 * atr:
+                if ztype == "golden_bottom" and next_close > next_open:
+                    score += 1.0; reasons.append("bullish_displacement_after_bottom")
+                elif ztype == "golden_top" and next_close < next_open:
+                    score += 1.0; reasons.append("bearish_displacement_after_top")
+
+        # 4) حجم يدعم التحرك بعد القاع/القمة
+        if pivot_idx+1 < n:
+            vol_ma = vols.max() if n < 30 else float(pd.Series(vols).rolling(20).mean().iloc[-1])
+            if vol_ma > 0 and vols[pivot_idx+1] >= 1.1 * vol_ma:
+                score += 0.5; reasons.append("volume_support_after_pivot")
+
+        # 5) توافق RSI مع الاتجاه
+        if ztype == "golden_bottom":
+            if rsi >= 45:
+                score += 0.5; reasons.append("RSI_recovered_from_oversold")
+        else:
+            if rsi <= 55:
+                score += 0.5; reasons.append("RSI_falling_from_overbought")
+
+        # 6) ADX — مش ترند عنيف عكسي (لمنع الدخول ضد موضة قوية جدًا)
+        if adx >= GOLDEN_ENTRY_ADX:
+            score += 0.5; reasons.append("ADX_trend_valid")
+
+        # اتجاه الإشارة حسب نوع المنطقة
+        dir_side = "buy" if ztype == "golden_bottom" else "sell"
+
+        ok = score >= GOLDEN_SMC_MIN_SCORE
+        return {
+            "ok": ok,
+            "score": float(score),
+            "dir": dir_side,
+            "reasons": reasons
+        }
+
+    except Exception as e:
+        return {"ok": False, "score": 0.0, "dir": None, "reasons": [f"ctx_error: {e}"]}
+
 def decide_strategy_mode(df, adx=None, di_plus=None, di_minus=None, rsi_ctx=None):
     """تحديد نمط التداول: SCALP أم TREND"""
     if adx is None or di_plus is None or di_minus is None:
@@ -418,7 +529,7 @@ def decide_strategy_mode(df, adx=None, di_plus=None, di_minus=None, rsi_ctx=None
 
 # =================== ENHANCED COUNCIL VOTING ===================
 def council_votes_pro_enhanced(df):
-    """مجلس تصويت محسّن مع RSI+MA والمناطق الذهبية + الشموع"""
+    """مجلس تصويت محسّن مع RSI+MA والمناطق الذهبية + الشموع + SMC Analysis"""
     try:
         ind = compute_indicators(df)
         rsi_ctx = rsi_ma_context(df)
@@ -940,6 +1051,83 @@ def open_market_enhanced(side, qty, price):
             "trail_tightened": False,
         })
         
+        # ───────────────────────────────
+        #  لوج ملون احترافي بعد فتح الصفقة
+        # ───────────────────────────────
+        try:
+            from termcolor import colored
+        except:
+            def colored(x, c=None): return x
+
+        side_txt  = "BUY" if side == "buy" else "SELL"
+        side_emoji = "🟩 BUY (LONG)" if side == "buy" else "🟥 SELL (SHORT)"
+        mode_icon  = "⚡" if mode == "scalp" else "📈"
+        tp1_pct   = management_config.get("tp1_pct", 0) * 100
+        be_pct    = management_config.get("be_activate_pct", 0) * 100
+        trail_pct = management_config.get("trail_activate_pct", 0) * 100
+        close_aggr = management_config.get("close_aggression", "?")
+
+        # تعريف Golden Zone
+        gz_note = ""
+        if isinstance(gz, dict) and gz.get("ok") and gz.get("zone"):
+            z = gz["zone"]
+            gz_note = f"🟡 GOLDEN: {z.get('type')} | score={gz.get('score',0):.1f} | confirmed={z.get('confirmed',False)}"
+
+        # مجلس الإدارة
+        cv_note = ""
+        if isinstance(votes, dict):
+            cv_note = (
+                f"votes={votes.get('b',0)}/{votes.get('s',0)} | "
+                f"score={votes.get('score_b',0):.1f}/{votes.get('score_s',0):.1f}"
+            )
+
+        # الرصيد
+        try:
+            bal = balance_usdt()
+        except:
+            bal = None
+
+        # قراءة المؤشرات لو موجودة
+        rsi = votes["ind"].get("rsi", 0)
+        adx = votes["ind"].get("adx", 0)
+        dip = votes["ind"].get("plus_di", 0)
+        dim = votes["ind"].get("minus_di", 0)
+
+        print(colored("─"*90, "cyan"))
+        print(colored("🚀 NEW POSITION OPENED", "cyan"))
+
+        print(colored(
+            f"{side_emoji} — {qty:.4f} {SYMBOL} @ {price:.6f}",
+            "green" if side=="buy" else "red"
+        ))
+
+        print(colored(
+            f"{mode_icon} Mode: {mode.upper()} | Leverage: {LEVERAGE}x | Risk: {int(RISK_ALLOC*100)}%",
+            "yellow"
+        ))
+
+        print(colored(
+            f"🎯 TP1={tp1_pct:.2f}% | BE={be_pct:.2f}% | TRAIL={trail_pct:.2f}% | close={close_aggr}",
+            "yellow"
+        ))
+
+        if cv_note:
+            print(colored(f"🧠 COUNCIL → {cv_note}", "magenta"))
+
+        if gz_note:
+            print(colored(gz_note, "yellow"))
+
+        # مؤشرات فورية
+        print(colored(
+            f"📊 RSI={rsi:.1f} | ADX={adx:.1f} | DI+={dip:.1f} / DI-={dim:.1f}",
+            "blue"
+        ))
+
+        if bal is not None:
+            print(colored(f"💰 Balance≈{bal:.2f} USDT | Eq≈{bal + compound_pnl:.2f}", "green"))
+
+        print(colored("─"*90, "cyan"))
+        
         log_g(f"✅ POSITION OPENED: {side.upper()} | mode={mode}")
         return True
     
@@ -1337,7 +1525,7 @@ def smart_exit_guard(state, df, ind, flow, bm, now_price, pnl_pct, mode, side, e
 
 # =================== ENHANCED TRADE LOOP ===================
 def trade_loop_enhanced():
-    """حلقة تداول محسنة مع Golden Entry ومجلس الإدارة"""
+    """حلقة تداول محسنة مع Golden Entry ومجلس الإدارة + SMC Analysis"""
     global wait_for_next_signal_side
     loop_i = 0
     
@@ -1369,7 +1557,7 @@ def trade_loop_enhanced():
                     **info
                 })
             
-            # قرار الدخول باستخدام مجلس الإدارة المحسن + Golden Entry
+            # قرار الدخول باستخدام مجلس الإدارة المحسن + Golden Entry + SMC Analysis
             reason = None
             if spread_bps is not None and spread_bps > MAX_SPREAD_BPS:
                 reason = f"spread too high ({fmt(spread_bps,2)}bps > {MAX_SPREAD_BPS})"
@@ -1378,14 +1566,35 @@ def trade_loop_enhanced():
             gz = council_data.get("gz")
             sig = None
 
-            # --- Golden Entry Override ---
+            # --- Golden Entry Override مع SMC Analysis ---
+            golden_confirmed_strong = False
+            golden_side = None
+            golden_ctx = {"ok": False, "score": 0.0, "dir": None, "reasons": []}
+            
             if (gz and gz.get("ok") and ind.get("adx",0) >= GOLDEN_ENTRY_ADX):
-                if gz["zone"]["type"]=="golden_bottom" and gz["score"]>=GOLDEN_ENTRY_SCORE:
-                    sig = "buy"
-                    log_i(f"🎯 GOLDEN ENTRY: BUY | score={gz['score']:.1f} | منطقة ذهبية قوية")
-                elif gz["zone"]["type"]=="golden_top" and gz["score"]>=GOLDEN_ENTRY_SCORE:
-                    sig = "sell" 
-                    log_i(f"🎯 GOLDEN ENTRY: SELL | score={gz['score']:.1f} | منطقة ذهبية قوية")
+                # تحقق من قوة المنطقة الذهبية
+                if gz["score"] >= GOLDEN_STRONG_SCORE:
+                    zone_type = gz["zone"]["type"]
+                    if zone_type == "golden_bottom":
+                        golden_confirmed_strong = True
+                        golden_side = "buy"
+                    elif zone_type == "golden_top":
+                        golden_confirmed_strong = True
+                        golden_side = "sell"
+                    
+                    # تحليل السياق للمنطقة الذهبية القوية
+                    if golden_confirmed_strong:
+                        golden_ctx = analyze_golden_context(df, gz, council_data, ind)
+                        if golden_ctx["ok"] and golden_ctx["dir"] == golden_side:
+                            sig = golden_side
+                            log_i(f"🎯 GOLDEN ENTRY CONFIRMED: {sig.upper()} | zone_score={gz['score']:.1f} | ctx_score={golden_ctx['score']:.1f}")
+                            for r in golden_ctx["reasons"]:
+                                log_i(f"   ↳ {r}")
+                        else:
+                            reason = "golden_context_reject"
+                            log_w(f"🛑 GOLDEN REJECTED: zone_score={gz['score']:.1f} | ctx_score={golden_ctx['score']:.1f}")
+                            for r in golden_ctx["reasons"]:
+                                log_i(f"   ↳ {r}")
 
             # لو مفيش Golden، استخدم السكور المعتاد
             if sig is None:
@@ -1395,8 +1604,12 @@ def trade_loop_enhanced():
                     sig = "sell"
             
             if not STATE["open"] and sig and reason is None:
-                # التحقق من سياسة الانتظار
-                allow_wait, wait_reason = wait_gate_allow(df, info)
+                # لو الإشارة Golden مؤكدة + السياق موافق → نتجاوز بوابة الانتظار
+                if golden_confirmed_strong and golden_ctx.get("ok"):
+                    allow_wait, wait_reason = True, ""
+                else:
+                    allow_wait, wait_reason = wait_gate_allow(df, info)
+
                 if not allow_wait:
                     reason = wait_reason
                 else:
@@ -1440,7 +1653,7 @@ def pretty_snapshot(bal, info, ind, spread_bps, reason=None, df=None):
         print("📈 INDICATORS & RF")
         print(f"   💲 Price {fmt(info.get('price'))} | RF filt={fmt(info.get('filter'))}  hi={fmt(info.get('hi'))} lo={fmt(info.get('lo'))}")
         print(f"   🧮 RSI={fmt(ind.get('rsi'))}  +DI={fmt(ind.get('plus_di'))}  -DI={fmt(ind.get('minus_di'))}  ADX={fmt(ind.get('adx'))}  ATR={fmt(ind.get('atr'))}")
-        print(f"   🎯 ENTRY: COUNCIL PRO + GOLDEN ENTRY  |  spread_bps={fmt(spread_bps,2)}")
+        print(f"   🎯 ENTRY: COUNCIL PRO + GOLDEN ENTRY + SMC ANALYSIS  |  spread_bps={fmt(spread_bps,2)}")
         print(f"   ⏱️ closes_in ≈ {left_s}s")
         print("\n🧭 POSITION")
         bal_line = f"Balance={fmt(bal,2)}  Risk={int(RISK_ALLOC*100)}%×{LEVERAGE}x  CompoundPnL={fmt(compound_pnl)}  Eq~{fmt((bal or 0)+compound_pnl,2)}"
@@ -1461,7 +1674,7 @@ app = Flask(__name__)
 @app.route("/")
 def home():
     mode='LIVE' if MODE_LIVE else 'PAPER'
-    return f"✅ Council PRO Bot — {SYMBOL} {INTERVAL} — {mode} — Candles + Golden Entry + Smart Exit"
+    return f"✅ Council PRO Bot — {SYMBOL} {INTERVAL} — {mode} — Candles + Golden Entry + SMC Analysis"
 
 @app.route("/metrics")
 def metrics():
@@ -1469,7 +1682,7 @@ def metrics():
         "symbol": SYMBOL, "interval": INTERVAL, "mode": "live" if MODE_LIVE else "paper",
         "leverage": LEVERAGE, "risk_alloc": RISK_ALLOC, "price": price_now(),
         "state": STATE, "compound_pnl": compound_pnl,
-        "entry_mode": "COUNCIL_PRO_GOLDEN", "wait_for_next_signal": wait_for_next_signal_side,
+        "entry_mode": "COUNCIL_PRO_GOLDEN_SMC", "wait_for_next_signal": wait_for_next_signal_side,
         "guards": {"max_spread_bps": MAX_SPREAD_BPS, "final_chunk_qty": FINAL_CHUNK_QTY}
     })
 
@@ -1479,7 +1692,7 @@ def health():
         "ok": True, "mode": "live" if MODE_LIVE else "paper",
         "open": STATE["open"], "side": STATE["side"], "qty": STATE["qty"],
         "compound_pnl": compound_pnl, "timestamp": datetime.utcnow().isoformat(),
-        "entry_mode": "COUNCIL_PRO_GOLDEN", "wait_for_next_signal": wait_for_next_signal_side
+        "entry_mode": "COUNCIL_PRO_GOLDEN_SMC", "wait_for_next_signal": wait_for_next_signal_side
     }), 200
 
 def keepalive_loop():
@@ -1513,6 +1726,7 @@ if __name__ == "__main__":
     print(colored(f"RISK: {int(RISK_ALLOC*100)}% × {LEVERAGE}x  •  COUNCIL_PRO=ENABLED", "yellow"))
     print(colored(f"GOLDEN ENTRY: score≥{GOLDEN_ENTRY_SCORE} | ADX≥{GOLDEN_ENTRY_ADX}", "yellow"))
     print(colored(f"CANDLES: Full patterns + Wick exhaustion + Golden reversal", "yellow"))
+    print(colored(f"SMC ANALYSIS: Golden Zones + Context Analysis", "yellow"))
     print(colored(f"EXECUTION: {'ACTIVE' if EXECUTE_ORDERS and not DRY_RUN else 'SIMULATION'}", "yellow"))
     
     logging.info("service starting…")
