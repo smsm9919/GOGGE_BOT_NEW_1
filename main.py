@@ -12,6 +12,7 @@ DOGE ULTRA PRO AI BOT - الإصدار الذكي المتقدم المتكام�
 • TP PROFILE SYSTEM - نظام جني الأرباح الذكي (1→2→3 مرات)
 • COUNCIL STRONG ENTRY - دخول ذكي من مجلس الإدارة في المناطق القوية
 • SMART GOLDEN ZONE VALIDATOR - نظام تحقق متقدم من المناطق الذهبية
+• SUPER SCALP AI - سكالب ذكي متقدم بشروط مشددة وترقية تلقائية للترند
 """
 
 import os, time, math, random, signal, sys, traceback, logging, json
@@ -651,7 +652,7 @@ SHADOW_MODE_DASHBOARD = False
 DRY_RUN = False
 
 # ==== Addon: Logging + Recovery Settings ====
-BOT_VERSION = f"DOGE ULTRA PRO AI v7.0 — {EXCHANGE_NAME.upper()} - SMART PROFIT AI + TP PROFILE + COUNCIL STRONG ENTRY + GOLDEN VALIDATOR"
+BOT_VERSION = f"DOGE ULTRA PRO AI v7.0 — {EXCHANGE_NAME.upper()} - SMART PROFIT AI + TP PROFILE + COUNCIL STRONG ENTRY + GOLDEN VALIDATOR + SUPER SCALP AI"
 print("🚀 Booting:", BOT_VERSION, flush=True)
 
 STATE_PATH = "./bot_state.json"
@@ -3382,7 +3383,7 @@ def manage_trade_by_profile(df, ind, info):
         if not STATE.get("tp1_done") and pnl_pct >= tp1:
             close_qty = safe_qty(STATE["qty"] * 0.5)  # إغلاق 50% عند TP1
             if close_qty > 0:
-                close_side = "sell" if side == "long" else "buy"
+                close_side = "sell" if STATE["side"] == "long" else "buy"
                 if MODE_LIVE and EXECUTE_ORDERS and not DRY_RUN:
                     try:
                         params = exchange_specific_params(close_side, is_close=True)
@@ -3401,7 +3402,7 @@ def manage_trade_by_profile(df, ind, info):
         if not STATE.get("tp1_done") and pnl_pct >= tp1:
             close_qty = safe_qty(STATE["qty"] * 0.3)  # إغلاق 30% عند TP1
             if close_qty > 0:
-                close_side = "sell" if side == "long" else "buy"
+                close_side = "sell" if STATE["side"] == "long" else "buy"
                 if MODE_LIVE and EXECUTE_ORDERS and not DRY_RUN:
                     try:
                         params = exchange_specific_params(close_side, is_close=True)
@@ -3415,7 +3416,7 @@ def manage_trade_by_profile(df, ind, info):
         elif STATE.get("tp1_done") and not STATE.get("tp2_done") and pnl_pct >= tp2:
             close_qty = safe_qty(STATE["qty"] * 0.3)  # إغلاق 30% أخرى عند TP2
             if close_qty > 0:
-                close_side = "sell" if side == "long" else "buy"
+                close_side = "sell" if STATE["side"] == "long" else "buy"
                 if MODE_LIVE and EXECUTE_ORDERS and not DRY_RUN:
                     try:
                         params = exchange_specific_params(close_side, is_close=True)
@@ -4299,7 +4300,7 @@ def mark_position(color):
 @app.route("/")
 def home():
     mode='LIVE' if MODE_LIVE else 'PAPER'
-    return f"✅ DOGE ULTRA PRO AI Bot — {EXCHANGE_NAME.upper()} — {SYMBOL} {INTERVAL} — {mode} — Super Council AI + Intelligent Trend Riding + Smart Profit AI + TP Profile System + Council Strong Entry + Golden Zone Validator"
+    return f"✅ DOGE ULTRA PRO AI Bot — {EXCHANGE_NAME.upper()} — {SYMBOL} {INTERVAL} — {mode} — Super Council AI + Intelligent Trend Riding + Smart Profit AI + TP Profile System + Council Strong Entry + Golden Zone Validator + Super Scalp AI"
 
 @app.route("/metrics")
 def metrics():
@@ -4308,7 +4309,7 @@ def metrics():
         "symbol": SYMBOL, "interval": INTERVAL, "mode": "live" if MODE_LIVE else "paper",
         "leverage": LEVERAGE, "risk_alloc": RISK_ALLOC, "price": price_now(),
         "state": STATE, "compound_pnl": compound_pnl,
-        "entry_mode": "SUPER_COUNCIL_AI_GOLDEN_SCALP_SMART_PROFIT_TP_PROFILE_COUNCIL_STRONG_GOLDEN_VALIDATOR", 
+        "entry_mode": "SUPER_COUNCIL_AI_GOLDEN_SCALP_SMART_PROFIT_TP_PROFILE_COUNCIL_STRONG_GOLDEN_VALIDATOR_SUPER_SCALP", 
         "wait_for_next_signal": wait_for_next_signal_side,
         "guards": {"max_spread_bps": MAX_SPREAD_BPS, "final_chunk_qty": FINAL_CHUNK_QTY},
         "scalp_mode": SCALP_MODE,
@@ -4317,7 +4318,8 @@ def metrics():
         "smart_profit_ai": True,
         "tp_profile_system": True,
         "council_strong_entry": COUNCIL_STRONG_ENTRY,
-        "golden_zone_validator": True
+        "golden_zone_validator": True,
+        "super_scalp_ai": True
     })
 
 @app.route("/health")
@@ -4326,14 +4328,15 @@ def health():
         "ok": True, "exchange": EXCHANGE_NAME, "mode": "live" if MODE_LIVE else "paper",
         "open": STATE["open"], "side": STATE["side"], "qty": STATE["qty"],
         "compound_pnl": compound_pnl, "timestamp": datetime.utcnow().isoformat(),
-        "entry_mode": "SUPER_COUNCIL_AI_GOLDEN_SCALP_SMART_PROFIT_TP_PROFILE_COUNCIL_STRONG_GOLDEN_VALIDATOR", 
+        "entry_mode": "SUPER_COUNCIL_AI_GOLDEN_SCALP_SMART_PROFIT_TP_PROFILE_COUNCIL_STRONG_GOLDEN_VALIDATOR_SUPER_SCALP", 
         "wait_for_next_signal": wait_for_next_signal_side,
         "scalp_mode": SCALP_MODE,
         "super_council_ai": COUNCIL_AI_MODE,
         "smart_profit_ai": True,
         "tp_profile_system": True,
         "council_strong_entry": COUNCIL_STRONG_ENTRY,
-        "golden_zone_validator": True
+        "golden_zone_validator": True,
+        "super_scalp_ai": True
     }), 200
 
 # ============================================
@@ -4375,6 +4378,11 @@ def smart_stats():
         "golden_zone_validator": {
             "active": True,
             "current_trade": STATE.get("is_golden_trade", False)
+        },
+        "super_scalp_ai": {
+            "active": SCALP_MODE,
+            "min_score": SCALP_MIN_SCORE,
+            "cooldown_sec": SCALP_COOLDOWN_SEC
         }
     })
 
@@ -4416,8 +4424,8 @@ def verify_execution_environment():
     print(f"🔧 EXCHANGE: {EXCHANGE_NAME.upper()} | SYMBOL: {SYMBOL}", flush=True)
     print(f"🔧 EXECUTE_ORDERS: {EXECUTE_ORDERS} | DRY_RUN: {DRY_RUN}", flush=True)
     print(f"🎯 GOLDEN ENTRY: score={GOLDEN_ENTRY_SCORE} | ADX={GOLDEN_ENTRY_ADX}", flush=True)
-    print(f"🚀 SMART PATCH: OB/FVG + SMC + Golden Zones + Volume Confirmation + SMART PROFIT AI + TP PROFILE + COUNCIL STRONG ENTRY + GOLDEN VALIDATOR", flush=True)
-    print(f"🧠 SMART PROFIT AI: Scalp + Trend + Volume Analysis + TP Profile (1→2→3) + Council Strong Entry + Golden Zone Validator Activated", flush=True)
+    print(f"🚀 SMART PATCH: OB/FVG + SMC + Golden Zones + Volume Confirmation + SMART PROFIT AI + TP PROFILE + COUNCIL STRONG ENTRY + GOLDEN VALIDATOR + SUPER SCALP AI", flush=True)
+    print(f"🧠 SMART PROFIT AI: Scalp + Trend + Volume Analysis + TP Profile (1→2→3) + Council Strong Entry + Golden Zone Validator + Super Scalp AI Activated", flush=True)
 
 if __name__ == "__main__":
     verify_execution_environment()
@@ -4428,6 +4436,6 @@ if __name__ == "__main__":
     
     log_i(f"🚀 DOGE ULTRA PRO AI BOT STARTED - {BOT_VERSION}")
     log_i(f"🎯 SYMBOL: {SYMBOL} | INTERVAL: {INTERVAL} | LEVERAGE: {LEVERAGE}x")
-    log_i(f"💡 SMART PATCH ACTIVATED: Golden Zones + SMC + OB/FVG + Zero Reversal Scalping + SMART PROFIT AI + TP PROFILE + COUNCIL STRONG ENTRY + GOLDEN VALIDATOR")
+    log_i(f"💡 SMART PATCH ACTIVATED: Golden Zones + SMC + OB/FVG + Zero Reversal Scalping + SMART PROFIT AI + TP PROFILE + COUNCIL STRONG ENTRY + GOLDEN VALIDATOR + SUPER SCALP AI")
     
     app.run(host="0.0.0.0", port=PORT, debug=False)
