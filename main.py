@@ -768,7 +768,8 @@ ADX_GATE = 17
 SCALP_MODE            = True
 SCALP_EXECUTE         = True
 SCALP_ADX_GATE        = 12.0
-SCALP_MIN_SCORE       = 3.5
+# 🧠 سكالب مش هيتنفذ إلا لما مجلس الإدارة يكون متفق بقوة
+SCALP_MIN_SCORE       = 7.0   # بدل 3.5
 SCALP_IMB_THRESHOLD   = 1.00
 SCALP_VOL_MA_FACTOR   = 1.20
 SCALP_COOLDOWN_SEC    = 8
@@ -2774,17 +2775,30 @@ def detect_super_scalp_opportunity(df, ind, flow, volume_profile, momentum, spre
         elif early_trend["trend"] == "bear" and early_trend["confidence"] > 0.6:
             scalp_council['score_s'] += 1.5
             scalp_council['s'] += 1
-        
-        min_scalp_score = 4.0
-        
+
+        # 🧠 فلتر قاسي: ممنوع سكالب من غير فوليوم + موفمنت + فوليتيليتي محترمين
+        if not (volume_ok and momentum_ok and volatility_ok):
+            return (None, f"weak_scalp_context: vol={volume_ok}, mom={momentum_ok}, volty={volatility_ok}")
+
+        # درجة السكالب المطلوبة = عتبة عالية
+        min_scalp_score = max(SCALP_MIN_SCORE, 7.0)
+
         if scalp_council['score_b'] >= min_scalp_score and scalp_council['b'] > scalp_council['s']:
-            reason = f"SCALP-BUY | score={scalp_council['score_b']:.1f} | vol={volume_ok} | mom={momentum_ok}"
+            reason = (
+                f"SCALP-BUY | score={scalp_council['score_b']:.1f} "
+                f"| votes={scalp_council['b']}/{scalp_council['s']} "
+                f"| vol={volume_ok} | mom={momentum_ok}"
+            )
             return ("buy", reason)
-        
+
         if scalp_council['score_s'] >= min_scalp_score and scalp_council['s'] > scalp_council['b']:
-            reason = f"SCALP-SELL | score={scalp_council['score_s']:.1f} | vol={volume_ok} | mom={momentum_ok}"
+            reason = (
+                f"SCALP-SELL | score={scalp_council['score_s']:.1f} "
+                f"| votes={scalp_council['s']}/{scalp_council['b']} "
+                f"| vol={volume_ok} | mom={momentum_ok}"
+            )
             return ("sell", reason)
-        
+
         return (None, f"low_score_b={scalp_council['score_b']:.1f}_s={scalp_council['score_s']:.1f}")
         
     except Exception as e:
@@ -3699,6 +3713,34 @@ def manage_after_entry_enhanced_with_smart_patch(df, ind, info, performance_stat
     if pnl_pct > STATE["highest_profit_pct"]:
         STATE["highest_profit_pct"] = pnl_pct
 
+    # 🆕 ترقية السكالب إلى ترند عندما تثبت الصفقة نفسها
+    trend_ctx = info.get("trend_ctx", SmartTrendContext())
+    try:
+        is_strong_trend = trend_ctx.is_strong_trend()
+        trend_label = trend_ctx.strength
+    except Exception:
+        is_strong_trend = False
+        trend_label = "n/a"
+
+    if mode == "scalp" and is_strong_trend and pnl_pct >= 0.7:
+        # ترقية المود
+        STATE["mode"] = "trend"
+        mode = "trend"
+
+        # تشديد إدارة الصفقة (Trail + BE) بحيث نحافظ على الربح ونركب الترند
+        mgmt = STATE.get("management", {}) or {}
+        old_trail_start = mgmt.get("trail_activate_pct", 1.0)
+        old_mult = mgmt.get("atr_trail_mult", SCALP_ATR_TRAIL_MULT)
+
+        mgmt["trail_activate_pct"] = max(0.5, old_trail_start * 0.8)
+        mgmt["atr_trail_mult"] = max(old_mult * 1.1, old_mult)  # تريل أوسع شوية للترند
+        STATE["management"] = mgmt
+
+        log_i(
+            f"🚀 PROMOTE SCALP→TREND | pnl={pnl_pct:.2f}% | trend={trend_label} "
+            f"| trail_start={mgmt['trail_activate_pct']:.2f}% | atr_mult={mgmt['atr_trail_mult']:.2f}"
+        )
+
     # ============================================
     #  SMART PROFIT CORE (SCALP / TREND) — DYNAMIC BY COUNCIL
     # ============================================
@@ -3917,6 +3959,35 @@ def trade_loop_enhanced_with_smart_patch():
             
             # ---- Zero Reversal Scalping Check ----
             scalper_ready, scalper_reason = zero_scalper.can_trade(current_time)
+
+            # 🆕 محاولة SUPER SCALP ذكي قبل دخول صفقات عادية
+            if (SCALP_MODE and SCALP_EXECUTE and scalper_ready and 
+                not STATE["open"] and bal and bal > MIN_BALANCE_FOR_TRADE):
+                try:
+                    # مؤشرات الزخم + الفوليوم + Flow للمجلس
+                    momentum = compute_momentum_indicators_safe(df)
+                    volume_profile = compute_volume_profile(df)
+                    flow_ctx = compute_flow_metrics(df)
+
+                    scalp_done = execute_super_scalp(
+                        px or info["price"],  # px_now
+                        bal,                  # balance
+                        df,
+                        ind,
+                        flow_ctx,
+                        volume_profile,
+                        momentum,
+                        spread_bps
+                    )
+
+                    if scalp_done:
+                        log_g("⚡ SUPER SCALP EXECUTED — skip normal entries this loop")
+                        # ننتظر دورة واحدة قبل أي صفقات أخرى
+                        time.sleep(2)
+                        continue  # نخرج من اللوب الحالي، ما ندخلش صفقة تانية
+
+                except Exception as e:
+                    log_w(f"SUPER SCALP error: {e}")
             
             # ===== BUY CONDITIONS =====
             buy_conditions = []
