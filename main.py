@@ -3092,33 +3092,30 @@ def open_market_enhanced(side, qty, price):
             }
             log_golden_entry(side, price, qty, validation_data)
         else:
-             else:
-    # نوع الملف واضح + تصنيف البروفايل
-    label = profit_profile.get("label", "UNKNOWN")
+            # لوج ملوّن واضح + تصنيف البروفايل
+            label = profit_profile.get("label", "UNKNOWN")
 
-    if label == "SCALP_SMALL":
-        profile_color = "🟠"
-    elif label == "TREND_MEDIUM":
-        profile_color = "🟡"
-    elif label == "TREND_STRONG":
-        profile_color = "🔵"
-    else:
-        profile_color = "⚪️"
+            if label == "SCALP_SMALL":
+                profile_color = "🟠"
+            elif label == "TREND_MEDIUM":
+                profile_color = "🟡"
+            elif label == "TREND_STRONG":
+                profile_color = "🟢"
+            else:
+                profile_color = "⚪️"
 
-    tp1 = profit_profile.get("tp1_pct")
-    tp2 = profit_profile.get("tp2_pct")
-    tp3 = profit_profile.get("tp3_pct")
+            tp1 = profit_profile.get("tp1_pct")
+            tp2 = profit_profile.get("tp2_pct")
+            tp3 = profit_profile.get("tp3_pct")
 
-    tp2_str = f"{tp2}%" if tp2 else ""
-    tp3_str = f"{tp3}%" if tp3 else ""
+            tp2_str = f" → {tp2}%" if tp2 else ""
+            tp3_str = f" → {tp3}%" if tp3 else ""
 
-
-        log_g(
-            f"{profile_color} COUNCIL TRADE OPENED | {side.upper()} {qty:.4f} @ {price:.6f} "
-            f"| {mode.upper()} | {label} | "
-            f"TPs: {tp1}%{tp2_str}{tp3_str}"
-        )
-
+            log_g(
+                f"{profile_color} COUNCIL TRADE OPENED | {side.upper()} {qty:.4f} @ {price:.6f} "
+                f"| {mode.upper()} | {label} | "
+                f"TPs: {tp1}%{tp2_str}{tp3_str}"
+            )
         
         print_position_snapshot(reason=f"OPEN - {mode.upper()}[{profit_profile['label']}]")
         return True
