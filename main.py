@@ -2399,7 +2399,8 @@ def super_council_ai_enhanced(df):
         else:
             bb_position = 0.5
         
-        stoch_k, stoch_d = compute_stochastic(df['high'].astype(float), df['low'].ast(float), df['close'].astype(float))
+        # FIX: Corrected the astype method calls - added missing parentheses
+        stoch_k, stoch_d = compute_stochastic(df['high'].astype(float), df['low'].astype(float), df['close'].astype(float))
         stoch_k_val = last_scalar(stoch_k, 50.0)
         stoch_d_val = last_scalar(stoch_d, 50.0)
         
