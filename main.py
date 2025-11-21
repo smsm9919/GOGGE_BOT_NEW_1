@@ -106,11 +106,18 @@ RSI_NEUTRAL_BAND = (45, 55)
 BASE_SLEEP   = 5
 NEAR_CLOSE_S = 1
 
-BOT_VERSION = "DOGE_ELITE_PRO_1.1"
+BOT_VERSION = "DOGE_ELITE_PRO_1.2"
 
 # =================== LOGGING ===================
 
-FG_R = "\033[31m"; FG_G = "\033[32m"; FG_Y = "\033[33m"; FG_C = "\033[36m"; FG_M = "\033[35m"; RESET = "\033[0m"; BOLD = "\033[1m"
+FG_R = "\033[31m"
+FG_G = "\033[32m"
+FG_Y = "\033[33m"
+FG_B = "\033[34m"
+FG_C = "\033[36m"
+FG_M = "\033[35m"
+RESET = "\033[0m"
+BOLD  = "\033[1m"
 
 def log_i(msg): logging.info(msg)
 def log_w(msg): logging.warning(msg)
@@ -230,6 +237,10 @@ last_scalp_ts = 0
 
 def _fmt_pct(x): 
     try: return f"{float(x):.2f}%"
+    except: return str(x)
+
+def _fmt_usdt(x):
+    try: return f"{float(x):.2f} USDT"
     except: return str(x)
 
 def _round_amt(q):
@@ -660,7 +671,7 @@ def classify_trade_mode(ind: dict, council_data: dict, gz: dict):
 
     return mode, profile, reason
 
-# =================== EXECUTION HELPERS ===================
+# =================== LOG BANNER & SNAPSHOT ===================
 
 def print_position_snapshot(reason="OPEN"):
     side = STATE["side"]
@@ -686,6 +697,30 @@ def print_position_snapshot(reason="OPEN"):
         f"  • EntrySource: {STATE.get('last_entry_source','')}"
     )
     log_i(msg)
+
+def log_trade_banner(side, price, qty, mode, profile, entry_source, reason, balance_before):
+    side_icon = "🟢 BUY " if side=="long" else "🔴 SELL"
+    side_color = FG_G if side=="long" else FG_R
+    mode_icon = "⚡ SCALP" if mode=="scalp" else "📈 TREND"
+    trade_tag = "🏆 GOLDEN" if entry_source=="GOLDEN" else ("👑 COUNCIL" if entry_source=="COUNCIL_STRONG" else "⚡ SCALP")
+
+    tp1 = profile.get("tp1_pct")
+    tp2 = profile.get("tp2_pct")
+    tp3 = profile.get("tp3_pct")
+
+    msg = f"""
+{side_color}{BOLD}╔═══════════════════ TRADE OPEN ═══════════════════╗{RESET}
+{side_color}║{RESET} {side_icon} {mode_icon}  {trade_tag}
+{side_color}║{RESET} 🎯 Reason: {reason}
+{side_color}║{RESET} 🧾 Profile: {profile.get('label','N/A')}
+{side_color}║{RESET} 💰 Price: {price:.6f} | Qty: {qty:.4f}
+{side_color}║{RESET} 💼 Balance(before): {_fmt_usdt(balance_before)} | Risk Alloc: {int(RISK_ALLOC*100)}% | Lev: {LEVERAGE}x
+{side_color}║{RESET} 🎯 TP1: {tp1}%   TP2: {tp2}%   TP3: {tp3}%
+{side_color}╚══════════════════════════════════════════════════╝{RESET}
+"""
+    log_i(msg)
+
+# =================== EXECUTION HELPERS ===================
 
 def open_market(side: str, price: float, reason: str, mode: str, profile: dict, entry_source: str, gz_data=None, council_data=None, ind=None):
     global STATE, performance_stats
@@ -732,6 +767,9 @@ def open_market(side: str, price: float, reason: str, mode: str, profile: dict, 
         "trade_type": "GOLDEN" if (gz_data and gz_data.get("ok")) else mode.upper()
     })
     performance_stats["total_trades"] += 1
+
+    # لوغ محترف بالايكونات
+    log_trade_banner(side, price, qty, mode, profile, entry_source, reason, bal)
 
     if gz_data and council_data and ind:
         log_golden_entry("buy" if side=="long" else "sell", price, qty, gz_data, council_data, ind)
