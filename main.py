@@ -1361,6 +1361,25 @@ def fmt_walls(walls):
 # ========= Bookmap snapshot =========
 def bookmap_snapshot(exchange, symbol, depth=BOOKMAP_DEPTH):
     try:
+        # Adjust depth for BingX specific limits
+        if EXCHANGE_NAME == "bingx":
+            if depth not in [5, 10, 20, 50, 100, 500, 1000]:
+                # Use the closest allowed value
+                if depth <= 5:
+                    depth = 5
+                elif depth <= 10:
+                    depth = 10
+                elif depth <= 20:
+                    depth = 20
+                elif depth <= 50:
+                    depth = 50
+                elif depth <= 100:
+                    depth = 100
+                elif depth <= 500:
+                    depth = 500
+                else:
+                    depth = 1000
+        
         ob = exchange.fetch_order_book(symbol, depth)
         bids = ob.get("bids", [])[:depth]; asks = ob.get("asks", [])[:depth]
         if not bids or not asks:
@@ -1938,7 +1957,7 @@ def classify_trade_mode(df, ind):
     return {
         "mode": "scalp",
         "why": f"default_scalp adx={adx:.1f} di_spread={di_spread:.1f} rsi_trend={rsi_trend}"
-    }
+        }
 
 # =================== CANDLES MODULE ===================
 def _body(o,c): return abs(c-o)
@@ -2380,7 +2399,7 @@ def super_council_ai_enhanced(df):
         else:
             bb_position = 0.5
         
-        stoch_k, stoch_d = compute_stochastic(df['high'].astype(float), df['low'].astype(float), df['close'].astype(float))
+        stoch_k, stoch_d = compute_stochastic(df['high'].astype(float), df['low'].ast(float), df['close'].astype(float))
         stoch_k_val = last_scalar(stoch_k, 50.0)
         stoch_d_val = last_scalar(stoch_d, 50.0)
         
@@ -2396,7 +2415,12 @@ def super_council_ai_enhanced(df):
         try:
             current_orderbook = STATE.get("last_orderbook", {})
             if not current_orderbook:
-                current_orderbook = ex.fetch_order_book(SYMBOL, limit=FLOW_STACK_DEPTH)
+                # Use adjusted depth for BingX
+                orderbook_depth = FLOW_STACK_DEPTH
+                if EXCHANGE_NAME == "bingx" and orderbook_depth not in [5, 10, 20, 50, 100, 500, 1000]:
+                    orderbook_depth = 5  # Use smallest allowed value
+                
+                current_orderbook = ex.fetch_order_book(SYMBOL, limit=orderbook_depth)
                 STATE["last_orderbook"] = current_orderbook
             
             boost = council_boost_from_flow(df, current_orderbook)
@@ -3844,7 +3868,12 @@ def trade_loop_enhanced_with_smart_patch():
             
             # تحديث orderbook للـFlow Boost
             try:
-                STATE["last_orderbook"] = ex.fetch_order_book(SYMBOL, limit=FLOW_STACK_DEPTH)
+                # Use adjusted depth for BingX
+                orderbook_depth = FLOW_STACK_DEPTH
+                if EXCHANGE_NAME == "bingx" and orderbook_depth not in [5, 10, 20, 50, 100, 500, 1000]:
+                    orderbook_depth = 5  # Use smallest allowed value
+                
+                STATE["last_orderbook"] = ex.fetch_order_book(SYMBOL, limit=orderbook_depth)
             except Exception as e:
                 log_w(f"Orderbook update failed: {e}")
             
