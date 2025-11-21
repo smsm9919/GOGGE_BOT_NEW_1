@@ -8,11 +8,10 @@ DOGE/USDT — ELITE PRO BOT
 - Anti-Chop (no trading in flat / dirty ranges)
 """
 
-import os, time, math, random, logging, traceback
+import os, time, math, logging, traceback
 from logging.handlers import RotatingFileHandler
 from datetime import datetime
 from decimal import Decimal, ROUND_DOWN
-from collections import deque
 
 import ccxt
 import pandas as pd
@@ -53,11 +52,10 @@ GZ_MIN_SCORE            = 6.0
 GZ_REQ_ADX              = 20.0
 
 # ==== Profit Profiles / Targets ====
-SCALP_MIN_TP    = 0.5      # أقل TP للسكالب (٪) – لا نسمح بأقل من كده
+SCALP_MIN_TP    = 0.5      # أقل TP للسكالب (٪)
 TREND_MIN_TP1   = 1.0      # أقل TP1 للترند
 TREND_MIN_TP2   = 2.0
 
-# بروفايلات جاهزة
 PROFIT_PROFILE_CONFIG = {
     "SCALP": {
         "label": "SCALP",
@@ -108,7 +106,7 @@ RSI_NEUTRAL_BAND = (45, 55)
 BASE_SLEEP   = 5
 NEAR_CLOSE_S = 1
 
-BOT_VERSION = "DOGE_ELITE_PRO_1.0"
+BOT_VERSION = "DOGE_ELITE_PRO_1.1"
 
 # =================== LOGGING ===================
 
@@ -378,7 +376,6 @@ def _displacement(closes: pd.Series):
     return float(move / max(std, 1e-9))
 
 def detect_impulse_leg(df: pd.DataFrame):
-    # بسيط: آخر موجة قوية في آخر 40 شمعة
     close = df["close"].astype(float)
     window = close.tail(40)
     idx_max = window.idxmax()
@@ -417,7 +414,6 @@ def golden_zone_check(df: pd.DataFrame, ind: dict):
         if not in_zone:
             return {"ok": False, "score": 0.0, "zone": None, "reasons": ["price_outside_gz"]}
 
-        # Wick / rejection
         last_high = high.iloc[-1]
         last_low  = low.iloc[-1]
         rng = last_high - last_low
@@ -431,7 +427,6 @@ def golden_zone_check(df: pd.DataFrame, ind: dict):
             wick_up = (last_high - close) / rng
             wick_ok = wick_up >= MIN_WICK_PCT
 
-        # Volume / RSI / ADX / displacement
         vol_ma = vol.rolling(VOL_MA_LEN).mean()
         volume_spike = vol.iloc[-1] > vol_ma.iloc[-1] * 1.5 if vol_ma.iloc[-1] > 0 else False
 
@@ -478,7 +473,9 @@ def golden_zone_check(df: pd.DataFrame, ind: dict):
         return {"ok": False, "score": 0.0, "zone": None, "reasons": [f"error:{e}"]}
 
 def log_golden_entry(side, price, qty, gz_data, council_data, ind):
-    zone_type = gz_data["zone"]["type"].upper() if gz_data.get("zone") else "N/A"
+    zone_type = gz_data["zone"]["type"].upper() if gz_data and gz_data.get("zone") else "N/A"
+    closes = ind.get("close", pd.Series(dtype=float))
+    disp = _displacement(closes) if not closes.empty else 0.0
     msg = f"""
 🏆🚀 GOLDEN ZONE ENTRY CONFIRMED 🚀🏆
 ┌──────────────────────────────────────────────
@@ -489,7 +486,7 @@ def log_golden_entry(side, price, qty, gz_data, council_data, ind):
 │ ├─ Council Score: max(B={council_data.get('score_b',0):.1f}, S={council_data.get('score_s',0):.1f})
 │ ├─ ADX: {ind.get('adx',0):.1f} | RSI: {ind.get('rsi',50):.1f}
 │ ├─ GZ Score: {gz_data.get('score',0):.1f} | Reasons: {", ".join(gz_data.get('reasons',[]))}
-│ └─ Dispersion: { _displacement(ind.get('close', pd.Series())):.2f }
+│ └─ Dispersion: {disp:.2f}
 └──────────────────────────────────────────────
 """
     log_g(msg)
@@ -497,7 +494,6 @@ def log_golden_entry(side, price, qty, gz_data, council_data, ind):
 # =================== FOOTPRINT + SMC (مبسّط) ===================
 
 def compute_footprint_boost(df: pd.DataFrame, ind: dict):
-    """محاكاة Footprint: مقارنة حجم/جسم الشمعة بأخر N شموع"""
     if df.empty or len(df) < 30:
         return {"votes_b": 0, "votes_s": 0, "score_b": 0.0, "score_s": 0.0, "tag": "no_data"}
 
@@ -532,25 +528,23 @@ def compute_footprint_boost(df: pd.DataFrame, ind: dict):
     return {"votes_b": votes_b, "votes_s": votes_s, "score_b": score_b, "score_s": score_s, "tag": tag}
 
 def detect_liquidity_trap(df: pd.DataFrame):
-    """SMC Liquidity Trap: sweep قاع/قمة ثم ارتداد"""
     if df.empty or len(df) < 30:
         return None
     high = df["high"].astype(float)
     low  = df["low"].astype(float)
     close= df["close"].astype(float)
+    open_= df["open"].astype(float)
 
     prev_highs = high.iloc[-6:-1]
     prev_lows  = low.iloc[-6:-1]
     last_high  = high.iloc[-1]
     last_low   = low.iloc[-1]
     last_close = close.iloc[-1]
-    last_open  = df["open"].astype(float).iloc[-1]
+    last_open  = open_.iloc[-1]
 
-    # sweep high then close below
     if last_high > prev_highs.max() and last_close < last_open:
         return ("bear_trap", "liquidity_sweep_up")
 
-    # sweep low then close above
     if last_low < prev_lows.min() and last_close > last_open:
         return ("bull_trap", "liquidity_sweep_down")
 
@@ -570,34 +564,29 @@ def council_votes(df: pd.DataFrame, ind: dict, gz: dict):
     macd_hist = ind.get("macd_hist", 0.0)
     vol_spike = ind.get("volume_spike", False)
 
-    # Trend / ADX
     if adx >= 25:
         if plus_di > minus_di:
             score_b += 2.0; votes_b += 3; logs.append("📈 strong_up_trend")
         elif minus_di > plus_di:
             score_s += 2.0; votes_s += 3; logs.append("📉 strong_down_trend")
 
-    # RSI Context
     if rsi < 35:
         score_b += 1.0; votes_b += 1; logs.append("🟢 rsi_buy_zone")
     elif rsi > 65:
         score_s += 1.0; votes_s += 1; logs.append("🔴 rsi_sell_zone")
 
-    # MACD
     if macd_hist > 0:
         score_b += 1.0; votes_b += 1; logs.append("📈 macd_up")
     elif macd_hist < 0:
         score_s += 1.0; votes_s += 1; logs.append("📉 macd_down")
 
-    # Volume
     if vol_spike:
         if plus_di > minus_di:
             score_b += 1.0; votes_b += 1; logs.append("📊 volume_spike_up")
         elif minus_di > plus_di:
             score_s += 1.0; votes_s += 1; logs.append("📊 volume_spike_down")
 
-    # Golden Zone weight
-    if gz.get("ok"):
+    if gz and gz.get("ok"):
         zone_type = gz["zone"]["type"]
         gz_score  = gz.get("score", 0.0)
         if zone_type == "golden_bottom":
@@ -605,17 +594,15 @@ def council_votes(df: pd.DataFrame, ind: dict, gz: dict):
         else:
             score_s += gz_score * 0.4; votes_s += 4; logs.append(f"🏆 golden_top score={gz_score:.1f}")
 
-    # Footprint Boost
     fp = compute_footprint_boost(df, ind)
     score_b += fp["score_b"]; score_s += fp["score_s"]
     votes_b += fp["votes_b"]; votes_s += fp["votes_s"]
     if fp["tag"] != "neutral":
         logs.append(f"🧭 footprint: {fp['tag']}")
 
-    # Liquidity Trap
     trap = detect_liquidity_trap(df)
     if trap:
-        kind, reason = trap
+        kind, _ = trap
         if kind == "bull_trap":
             score_b += 1.5; votes_b += 2; logs.append("💧 bull_liquidity_trap")
         elif kind == "bear_trap":
@@ -644,33 +631,24 @@ def is_choppy(ind: dict):
 # =================== PROFIT PROFILE & MODE ===================
 
 def classify_trade_mode(ind: dict, council_data: dict, gz: dict):
-    """
-    يحدد:
-    - mode: "scalp" أو "trend"
-    - profile: SCALP / TREND_MEDIUM / TREND_STRONG
-    """
     adx = ind.get("adx", 0.0)
     rsi = ind.get("rsi", 50.0)
     score_b = council_data.get("score_b", 0.0)
     score_s = council_data.get("score_s", 0.0)
     dom_score = max(score_b, score_s)
 
-    # Golden Zone صاروخي = ترند قوي
-    if gz.get("ok") and gz.get("score",0) >= GZ_MIN_SCORE + 1.0 and adx >= GZ_REQ_ADX:
+    if gz and gz.get("ok") and gz.get("score",0) >= GZ_MIN_SCORE + 1.0 and adx >= GZ_REQ_ADX:
         profile = PROFIT_PROFILE_CONFIG["TREND_STRONG"]
         mode = "trend"
         reason = "golden_zone_trend_strong"
         return mode, profile, reason
 
-    # سكالب قوي فقط لما:
-    # ADX متوسط + Council قوي + مش في تشبع مجنون
     if SCALP_MODE and adx >= SCALP_ADX_GATE and 35 < rsi < 65 and dom_score >= SCALP_MIN_SCORE:
         profile = PROFIT_PROFILE_CONFIG["SCALP"]
         mode = "scalp"
         reason = "strong_scalp_profile"
         return mode, profile, reason
 
-    # ترند متوسط / قوي حسب ADX + score
     if adx >= 25 and dom_score >= 22:
         profile = PROFIT_PROFILE_CONFIG["TREND_STRONG"]
         mode = "trend"
@@ -772,7 +750,7 @@ def close_partial(percent: float, reason: str):
     if MODE_LIVE and not DRY_RUN:
         try:
             params = exchange_specific_params(side_mkt, is_close=True)
-            ex.create_order(SYMBOL, "market", close_qty, None, params)
+            ex.create_order(SYMBOL, "market", side_mkt, close_qty, None, params)
         except Exception as e:
             log_e(f"❌ partial close failed: {e}")
             return
@@ -816,7 +794,6 @@ def manage_open_trade(df: pd.DataFrame, ind: dict):
     profile = STATE.get("profit_profile", {}) or {}
     mode = STATE.get("mode","trend")
 
-    # Breakeven logic
     if not STATE["breakeven_armed"] and pnl_pct >= profile.get("tp1_pct", 1.0):
         STATE["breakeven"] = entry
         STATE["breakeven_armed"] = True
@@ -832,7 +809,6 @@ def manage_open_trade(df: pd.DataFrame, ind: dict):
             performance_stats["winning_trades"] += 1
             return
 
-    # SCALP: هدف واحد محترم
     if mode == "scalp":
         tp_full = max(profile.get("scalp_tp_full_pct", SCALP_TP_SINGLE_PCT), SCALP_MIN_TP)
         if pnl_pct >= tp_full and not STATE["tp1_done"]:
@@ -841,7 +817,6 @@ def manage_open_trade(df: pd.DataFrame, ind: dict):
             performance_stats["winning_trades"] += 1
             return
 
-    # TREND: 2–3 أهداف
     else:
         tp1 = max(profile.get("tp1_pct", TREND_MIN_TP1), TREND_MIN_TP1)
         tp2 = max(profile.get("tp2_pct", TREND_MIN_TP2), TREND_MIN_TP2)
@@ -851,15 +826,12 @@ def manage_open_trade(df: pd.DataFrame, ind: dict):
         f2 = profile.get("tp2_fraction", 0.6)
         f3 = profile.get("tp3_fraction", 0.0)
 
-        # TP1
         if pnl_pct >= tp1 and not STATE["tp1_done"] and STATE["qty"] > 0:
             close_partial(f1, "trend_tp1")
             STATE["tp1_done"] = True
             return
 
-        # TP2
         if pnl_pct >= tp2 and not STATE["tp2_done"] and STATE["qty"] > 0:
-            # لو مفيش TP3 → اقفل الباقي
             if not tp3:
                 close_full("trend_tp2_full")
                 STATE["tp2_done"] = True
@@ -870,17 +842,14 @@ def manage_open_trade(df: pd.DataFrame, ind: dict):
                 STATE["tp2_done"] = True
                 return
 
-        # TP3
         if tp3 and pnl_pct >= tp3 and not STATE["tp3_done"] and STATE["qty"] > 0:
             close_full("trend_tp3_full")
             STATE["tp3_done"] = True
             performance_stats["winning_trades"] += 1
             return
 
-    # حماية أرباح كبيرة: لو الربح عدّى 4–5% ومافيش TP باقي → شدد الدفاع
     if pnl_pct >= 4.0 and mode=="trend" and not STATE.get("big_profit_protected", False):
         STATE["big_profit_protected"] = True
-        # قفل جزئي إضافي لو لسه في كمية
         if STATE["qty"] > 0:
             close_partial(0.25, "big_profit_extra")
         log_i("💰 Big Profit Protection Activated")
@@ -889,26 +858,21 @@ def manage_open_trade(df: pd.DataFrame, ind: dict):
 
 def decide_entry(df: pd.DataFrame, ind: dict):
     """
-    يرجع:
-      side: "long"/"short"/None
-      reason: str
-      mode: "scalp"/"trend"
-      profile: dict
-      entry_source: "GOLDEN" / "COUNCIL_STRONG" / "SCALP"
-      gz_data: dict
-      council_data: dict
+    يرجع دائمًا 7 قيم:
+      side, reason, mode, profile, entry_source, gz_data, council_data
     """
-    if df.empty:
-        return None, "no_data", None, None, None, None
+    gz_data = None
+    council_data = None
 
-    # Spread guard
+    if df.empty:
+        return None, "no_data", None, None, None, gz_data, council_data
+
     spread = orderbook_spread_bps()
     if spread and spread > MAX_SPREAD_BPS:
-        return None, f"spread_too_wide_{spread:.1f}", None, None, None, None
+        return None, f"spread_too_wide_{spread:.1f}", None, None, None, gz_data, council_data
 
-    # Anti-chop
     if is_choppy(ind):
-        return None, "choppy_market", None, None, None, None
+        return None, "choppy_market", None, None, None, gz_data, council_data
 
     gz_data = golden_zone_check(df, ind)
     council_data = council_votes(df, ind, gz_data)
@@ -916,7 +880,6 @@ def decide_entry(df: pd.DataFrame, ind: dict):
     score_b = council_data["score_b"]
     score_s = council_data["score_s"]
 
-    # Golden Zone Priority
     if gz_data.get("ok") and gz_data.get("score",0) >= GZ_MIN_SCORE:
         zone_type = gz_data["zone"]["type"]
         if zone_type == "golden_bottom":
@@ -926,27 +889,24 @@ def decide_entry(df: pd.DataFrame, ind: dict):
             mode, profile, reason_mode = classify_trade_mode(ind, council_data, gz_data)
             return "short", f"golden_top_{reason_mode}", mode, profile, "GOLDEN", gz_data, council_data
 
-    # Council Strong Entry (بدون Golden لكن قوي)
-    dom_side = "buy" if score_b > score_s else "sell"
+    dom_side  = "buy" if score_b > score_s else "sell"
     dom_score = max(score_b, score_s)
     if dom_score >= 20.0 and council_data["confidence"] >= 0.6:
-        mode, profile, reason_mode = classify_trade_mode(ind, council_data, {"ok":False})
-        if dom_side=="buy":
+        mode, profile, reason_mode = classify_trade_mode(ind, council_data, {"ok": False})
+        if dom_side == "buy":
             return "long", f"council_strong_buy_{reason_mode}", mode, profile, "COUNCIL_STRONG", gz_data, council_data
         else:
             return "short", f"council_strong_sell_{reason_mode}", mode, profile, "COUNCIL_STRONG", gz_data, council_data
 
-    # Strong scalp only (لو مفيش Golden ولا Council قوي)
     if SCALP_MODE:
-        mode, profile, reason_mode = classify_trade_mode(ind, council_data, {"ok":False})
-        if mode=="scalp" and council_data["confidence"] >= 0.5:
-            # السكالب لازم يكون في اتجاه الدوم
-            if dom_side=="buy":
+        mode, profile, reason_mode = classify_trade_mode(ind, council_data, {"ok": False})
+        if mode == "scalp" and council_data["confidence"] >= 0.5:
+            if dom_side == "buy":
                 return "long", f"pure_scalp_buy_{reason_mode}", mode, profile, "SCALP", gz_data, council_data
             else:
                 return "short", f"pure_scalp_sell_{reason_mode}", mode, profile, "SCALP", gz_data, council_data
 
-    return None, "no_strong_setup", None, None, None, None
+    return None, "no_strong_setup", None, None, None, gz_data, council_data
 
 # =================== MAIN LOOP ===================
 
@@ -963,13 +923,11 @@ def trade_loop():
 
             ind = compute_indicators(df)
 
-            # إدارة صفقة مفتوحة
             if STATE["open"]:
                 manage_open_trade(df, ind)
                 time.sleep(NEAR_CLOSE_S if STATE["open"] else BASE_SLEEP)
                 continue
 
-            # لا يوجد صفقة مفتوحة → نبحث عن دخول
             side, reason, mode, profile, entry_source, gz_data, council_data = decide_entry(df, ind)
 
             if side is None:
