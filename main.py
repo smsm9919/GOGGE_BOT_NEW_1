@@ -7,6 +7,7 @@ RF Futures Bot — RF-LIVE ONLY (BingX Perp via CCXT)
 • Smart Exit Management + Wait-for-next-signal
 • Professional Logging & Dashboard
 • Enhanced with Footprint, SMC Candles, Liquidity Traps + VWAP Strategy
+• OTC Hidden Flow Detection & Protection System
 """
 
 import os, time, math, random, signal, sys, traceback, logging, json
@@ -41,7 +42,7 @@ SHADOW_MODE_DASHBOARD = False
 DRY_RUN = False
 
 # ==== Addon: Logging + Recovery Settings ====
-BOT_VERSION = "DOGE Council PRO v5.0 — Smart Profit AI + Golden Zone Pro + VWAP Strategy"
+BOT_VERSION = "DOGE Council PRO v5.0 — Smart Profit AI + Golden Zone Pro + VWAP Strategy + OTC Detection"
 print("🔁 Booting:", BOT_VERSION, flush=True)
 
 STATE_PATH = "./bot_state.json"
@@ -119,6 +120,16 @@ EVX_SPIKE          = 1.8
 BM_WALL_PROX_BPS   = 5
 TIME_IN_TRADE_MIN  = 8
 TRAIL_TIGHT_MULT   = 1.20
+
+# ==== OTC Hidden Flow Detection Settings ====
+OTC_WINDOW_BARS          = 5        # عدد الشموع اللي نحلّل عليها حركة السعر + الفلو
+OTC_MIN_MOVE_BPS         = 60.0     # أقل حركة سعر (بالـ bps) نعتبرها Pump/Dump (0.6%)
+OTC_MAX_VISIBLE_FLOW_PCT = 0.25     # لو الفلو الظاهر أقل من 25% من الفوليوم -> نعتبرها سيولة مخفية
+OTC_STRENGTH_SCALE       = 0.1      # مقياس لتحويل الحركة + ضعف الفلو لقوة (score)
+
+# ==== OTC Exit Tuning (بعد TP1) ====
+OTC_EXIT_MIN_STRENGTH = 2.0      # أقل قوة OTC نعتبرها تهديد حقيقي
+OTC_EXIT_MIN_PNL_PCT  = 0.60/100 # أقل ربح (0.6%) نسمح فيه بإغلاق بسبب OTC عكسي
 
 # ==== Enhanced Golden Entry Settings ====
 GOLDEN_ENTRY_SCORE = 7.0
@@ -366,6 +377,100 @@ def compute_footprint_metrics(df):
     except Exception as e:
         return {"ok": False, "why": str(e)}
 
+# =================== OTC HIDDEN FLOW DETECTION ===================
+def detect_otc_flows(df, window: int = OTC_WINDOW_BARS):
+    """
+    كشف سيولة OTC (شراء/بيع مخفي) من خلال:
+    - حركة سعر قوية في آخر N شمعة
+    - مع فلو ظاهر (delta) ضعيف مقارنة بالفوليوم
+    """
+    try:
+        if len(df) < window + 2:
+            return {
+                "otc_buy": False,
+                "otc_sell": False,
+                "strength": 0.0,
+                "reason": "",
+            }
+
+        close  = df["close"].astype(float)
+        volume = df["volume"].astype(float)
+
+        # حركة السعر في آخر window شمعة
+        start_price = float(close.iloc[-window])
+        last_price  = float(close.iloc[-1])
+        if start_price <= 0:
+            return {
+                "otc_buy": False,
+                "otc_sell": False,
+                "strength": 0.0,
+                "reason": "",
+            }
+
+        ret = (last_price - start_price) / start_price  # نسبة الحركة
+        move_bps = abs(ret) * 10000.0
+
+        # لو الحركة أصلاً ضعيفة ما نضيعش وقت
+        if move_bps < OTC_MIN_MOVE_BPS:
+            return {
+                "otc_buy": False,
+                "otc_sell": False,
+                "strength": 0.0,
+                "reason": "",
+            }
+
+        # تقريب delta من الفوليوم + اتجاه الشمعة
+        sub_close  = close.iloc[-window:]
+        sub_vol    = volume.iloc[-window:]
+        price_diff = sub_close.diff()
+
+        buy_vol  = sub_vol.where(price_diff > 0, 0.0)
+        sell_vol = sub_vol.where(price_diff < 0, 0.0)
+        delta_series = buy_vol - sell_vol
+
+        cum_delta_window = float(delta_series.sum())
+        total_vol        = float(sub_vol.sum() or 1.0)
+
+        visible_flow_ratio = abs(cum_delta_window) / total_vol  # نسبة الفلو الظاهر للفوليوم
+
+        # لو الفلو الظاهر ضعيف جدًا مقارنة بالفوليوم مع حركة سعر قوية -> OTC
+        otc_buy = False
+        otc_sell = False
+        strength = 0.0
+        reason = ""
+
+        # Pump بلا فلو شرائي واضح -> OTC BUY
+        if ret > 0:
+            if cum_delta_window <= 0 or visible_flow_ratio < OTC_MAX_VISIBLE_FLOW_PCT:
+                otc_buy = True
+                # قوة الـ OTC = حركة السعر / الفلو الظاهر
+                strength = (move_bps * OTC_STRENGTH_SCALE) / max(visible_flow_ratio, 0.05)
+                reason = "price_up_without_visible_buy_flow"
+
+        # Dump بلا فلو بيعي واضح -> OTC SELL
+        elif ret < 0:
+            if cum_delta_window >= 0 or visible_flow_ratio < OTC_MAX_VISIBLE_FLOW_PCT:
+                otc_sell = True
+                strength = (move_bps * OTC_STRENGTH_SCALE) / max(visible_flow_ratio, 0.05)
+                reason = "price_down_without_visible_sell_flow"
+
+        return {
+            "otc_buy": bool(otc_buy),
+            "otc_sell": bool(otc_sell),
+            "strength": float(strength),
+            "reason": reason,
+            "move_bps": move_bps,
+            "visible_flow_ratio": visible_flow_ratio,
+        }
+    except Exception as e:
+        # في حالة أي خطأ ما نكسرش المجلس
+        return {
+            "otc_buy": False,
+            "otc_sell": False,
+            "strength": 0.0,
+            "reason": f"error:{e}",
+        }
+
 # =================== LIQUIDITY TRAP DETECTION ===================
 def detect_liquidity_traps(df, current_price):
     """
@@ -407,6 +512,7 @@ def verify_execution_environment():
     print(f"🎯 GOLDEN ENTRY PRO: score={GOLDEN_ENTRY_SCORE} | ADX={GOLDEN_ENTRY_ADX}", flush=True)
     print(f"📈 ENHANCED CANDLES: SMC Patterns + Liquidity Traps", flush=True)
     print(f"👣 FOOTPRINT ANALYSIS: Volume spikes + Absorption", flush=True)
+    print(f"💰 OTC DETECTION: Hidden flow detection + Protection", flush=True)
     print(f"📊 VWAP STRATEGY: SCALP(near {VWAP_SCALP_BAND_BPS}bps) | TREND(far {VWAP_TREND_BAND_BPS}bps)", flush=True)
     
     if not EXECUTE_ORDERS:
@@ -743,7 +849,7 @@ def calculate_signal_strength(df, ind, side):
 
 # =================== ENHANCED COUNCIL VOTING ===================
 def council_votes_pro_enhanced(df):
-    """مجلس تصويت محسّن مع Footprint + SMC + Golden Zone Pro + VWAP"""
+    """مجلس تصويت محسّن مع Footprint + SMC + Golden Zone Pro + VWAP + OTC"""
     try:
         ind = compute_indicators(df)
         rsi_ctx = rsi_ma_context(df)
@@ -856,6 +962,29 @@ def council_votes_pro_enhanced(df):
             score_s += min(3.0, cd["score_sell"])
             logs.append(f"🕯️ SMC SELL ({cd['smc_pattern']}) +{cd['score_sell']:.1f}")
 
+        # --- OTC Hidden Flow Detection ---
+        otc = detect_otc_flows(df)
+        if otc.get("otc_buy"):
+            # سيولة شراء مخفية تدعم الشراء
+            boost = min(3.0, otc.get("strength", 1.5))
+            votes_b += 2
+            score_b += boost
+            logs.append(
+                f"💰 OTC BUY ({otc.get('reason','')}) "
+                f"move={otc.get('move_bps',0):.1f}bps flow={otc.get('visible_flow_ratio',0)*100:.1f}% s={boost:.1f}"
+            )
+        elif otc.get("otc_sell"):
+            # سيولة بيع مخفية تدعم البيع
+            boost = min(3.0, otc.get("strength", 1.5))
+            votes_s += 2
+            score_s += boost
+            logs.append(
+                f"💰 OTC SELL ({otc.get('reason','')}) "
+                f"move={otc.get('move_bps',0):.1f}bps flow={otc.get('visible_flow_ratio',0)*100:.1f}% s={boost:.1f}"
+            )
+        else:
+            otc = {"otc_buy": False, "otc_sell": False, "strength": 0.0}
+
         # --- Liquidity Trap Awareness
         if liquidity_traps.get('ok') and liquidity_traps.get('traps'):
             for trap in liquidity_traps['traps']:
@@ -899,11 +1028,17 @@ def council_votes_pro_enhanced(df):
             "score_b": score_b, "score_s": score_s,
             "logs": logs, "ind": ind, "gz": gz, 
             "footprint": footprint, "candles": cd,
-            "liquidity_traps": liquidity_traps
+            "liquidity_traps": liquidity_traps,
+            "otc": otc,
         }
     except Exception as e:
         log_w(f"council_votes_pro_enhanced error: {e}")
-        return {"b":0,"s":0,"score_b":0.0,"score_s":0.0,"logs":[],"ind":{},"gz":None,"candles":{}}
+        return {
+            "b": 0, "s": 0,
+            "score_b": 0.0, "score_s": 0.0,
+            "logs": [], "ind": {}, "gz": None,
+            "candles": {}, "footprint": {}, "liquidity_traps": {}, "otc": {}
+        }
 
 # =================== POSITION RECOVERY ===================
 def _normalize_side(pos):
@@ -1165,7 +1300,7 @@ def compute_flow_metrics(df):
 # ========= Unified snapshot emitter =========
 def emit_snapshots(exchange, symbol, df, balance_fn=None, pnl_fn=None):
     """
-    يطبع Snapshot موحّد: Bookmap + Flow + Council + Strategy + Balance/PnL + VWAP
+    يطبع Snapshot موحّد: Bookmap + Flow + Council + Strategy + Balance/PnL + VWAP + OTC
     """
     try:
         bm = bookmap_snapshot(exchange, symbol)
@@ -1213,10 +1348,17 @@ def emit_snapshots(exchange, symbol, df, balance_fn=None, pnl_fn=None):
         if gz and gz.get("ok"):
             gz_note = f" | 🟡 {gz['zone']['type']} s={gz['score']:.1f}"
 
+        # OTC info
+        otc_note = ""
+        if cv.get("otc", {}).get("otc_buy"):
+            otc_note = f" | 💰 OTC BUY s={cv['otc'].get('strength',0):.1f}"
+        elif cv.get("otc", {}).get("otc_sell"):
+            otc_note = f" | 💰 OTC SELL s={cv['otc'].get('strength',0):.1f}"
+
         if LOG_ADDONS:
             print(f"🧱 {bm_note}", flush=True)
             print(f"📦 {fl_note}", flush=True)
-            print(f"📊 {dash}{gz_note}", flush=True)
+            print(f"📊 {dash}{gz_note}{otc_note}", flush=True)
             print(f"{strat}{(' | ' + wallet) if wallet else ''}", flush=True)
             
             gz_snap_note = ""
@@ -1237,9 +1379,16 @@ def emit_snapshots(exchange, symbol, df, balance_fn=None, pnl_fn=None):
                 vwap_status = "NEAR" if vwap_diff_bps <= VWAP_SCALP_BAND_BPS else "FAR" if vwap_diff_bps >= VWAP_TREND_BAND_BPS else "MID"
                 vwap_info = f" | VWAP:{vwap_status}({vwap_diff_bps:.1f}bps)"
             
+            # OTC info for snapshot
+            otc_snap = ""
+            if cv.get("otc", {}).get("otc_buy"):
+                otc_snap = f" | 💰OTC-BUY({cv['otc'].get('strength',0):.1f})"
+            elif cv.get("otc", {}).get("otc_sell"):
+                otc_snap = f" | 💰OTC-SELL({cv['otc'].get('strength',0):.1f})"
+            
             print(f"🧠 SNAP | {side_hint} | votes={cv['b']}/{cv['s']} score={cv['score_b']:.1f}/{cv['score_s']:.1f} "
                   f"| ADX={cv['ind'].get('adx',0):.1f} DI={cv['ind'].get('di_spread',0):.1f} | "
-                  f"z={flow_z:.2f} | imb={bm_imb:.2f}{gz_snap_note}{vwap_info}", 
+                  f"z={flow_z:.2f} | imb={bm_imb:.2f}{gz_snap_note}{vwap_info}{otc_snap}", 
                   flush=True)
             
             # إضافة معلومات Footprint وSMC
@@ -1250,6 +1399,13 @@ def emit_snapshots(exchange, symbol, df, balance_fn=None, pnl_fn=None):
             
             if cv.get('candles', {}).get('smc_pattern'):
                 print(f"🕯️ SMC | {cv['candles']['smc_pattern']} | Trap={cv['candles']['liquidity_trap']}", flush=True)
+            
+            # OTC detailed info
+            if cv.get('otc', {}).get('otc_buy') or cv.get('otc', {}).get('otc_sell'):
+                otc = cv['otc']
+                print(f"💰 OTC | {'BUY' if otc.get('otc_buy') else 'SELL'} | strength={otc.get('strength',0):.1f} | "
+                      f"move={otc.get('move_bps',0):.1f}bps | flow={otc.get('visible_flow_ratio',0)*100:.1f}% | "
+                      f"reason={otc.get('reason','')}", flush=True)
             
             print("✅ ENHANCED ADDONS LIVE", flush=True)
 
@@ -1274,10 +1430,17 @@ def execute_trade_decision(side, price, qty, mode, council_data, gz_data):
     if gz_data and gz_data.get("ok"):
         gz_note = f" | 🟡 {gz_data['zone']['type']} s={gz_data['score']:.1f}"
     
+    # OTC note
+    otc_note = ""
+    if council_data.get("otc", {}).get("otc_buy"):
+        otc_note = f" | 💰 OTC BUY s={council_data['otc'].get('strength',0):.1f}"
+    elif council_data.get("otc", {}).get("otc_sell"):
+        otc_note = f" | 💰 OTC SELL s={council_data['otc'].get('strength',0):.1f}"
+    
     votes = council_data
     print(f"🎯 EXECUTE: {side.upper()} {qty:.4f} @ {price:.6f} | "
           f"mode={mode} | votes={votes['b']}/{votes['s']} score={votes['score_b']:.1f}/{votes['score_s']:.1f}"
-          f"{gz_note}", flush=True)
+          f"{gz_note}{otc_note}", flush=True)
 
     try:
         if MODE_LIVE:
@@ -1651,6 +1814,34 @@ def smart_exit_guard(state, df, ind, flow, bm, now_price, pnl_pct, mode, side, e
                 "log": f"🔴 CLOSE STRONG | golden reversal after TP1 | score={gz['score']:.1f}"
             }
 
+    # --- OTC Reversal بعد TP1 (سيولة مخفية عكسية) ---
+    # ملاحظة: هنا pnl_pct = كسر (0.01 = 1%)
+    if state.get('tp1_done') and pnl_pct >= OTC_EXIT_MIN_PNL_PCT:
+        try:
+            otc = detect_otc_flows(df)
+        except Exception as e:
+            otc = {"otc_buy": False, "otc_sell": False, "strength": 0.0, "reason": f"error:{e}"}
+
+        opp_otc = False
+        if side == "long" and otc.get("otc_sell"):
+            opp_otc = True
+        elif side == "short" and otc.get("otc_buy"):
+            opp_otc = True
+
+        if opp_otc and otc.get("strength", 0.0) >= OTC_EXIT_MIN_STRENGTH:
+            return {
+                "action": "close",
+                "why": "otc_reversal",
+                "log": (
+                    f"🔴 CLOSE STRONG | OTC reversal after TP1 | "
+                    f"side={side} pnl={pnl_pct*100:.2f}% "
+                    f"strength={otc.get('strength',0):.1f} "
+                    f"move={otc.get('move_bps',0):.1f}bps "
+                    f"flow={otc.get('visible_flow_ratio',0)*100:.1f}% "
+                    f"reason={otc.get('reason','')}"
+                )
+            }
+
     tp1_target = TP1_SCALP_PCT if mode == 'scalp' else TP1_TREND_PCT
     if pnl_pct >= tp1_target and not state.get('tp1_done'):
         qty_pct = 0.35 if mode == 'scalp' else 0.25
@@ -1810,7 +2001,7 @@ def manage_after_entry_enhanced(df, ind, info):
         close_market_strict("dust_guard")
         return
 
-    # ========= Smart Exit Guard (Golden Reversal + Wick/Flow/Wall) =========
+    # ========= Smart Exit Guard (Golden Reversal + Wick/Flow/Wall + OTC) =========
     try:
         guard = smart_exit_guard(
             STATE,
@@ -1838,7 +2029,7 @@ def manage_after_entry_enhanced(df, ind, info):
         if act == "tighten":
             STATE["trail_tightened"] = True
 
-        # إغلاق صارم عند Golden Reversal أو Hard Close
+        # إغلاق صارم عند Golden Reversal أو Hard Close أو OTC Reversal
         elif act == "close":
             close_market_strict(guard.get("why", "smart_exit_guard"))
             return
@@ -1846,7 +2037,7 @@ def manage_after_entry_enhanced(df, ind, info):
 
 # =================== ENHANCED TRADE LOOP ===================
 def trade_loop_enhanced():
-    """حلقة تداول محسنة مع Golden Zone Pro وSmart Profit AI وVWAP"""
+    """حلقة تداول محسنة مع Golden Zone Pro وSmart Profit AI وVWAP وOTC Detection"""
     global wait_for_next_signal_side
     loop_i = 0
     
@@ -1886,6 +2077,7 @@ def trade_loop_enhanced():
             council_data = council_votes_pro_enhanced(df)
             gz = council_data.get("gz")
             footprint = council_data.get("footprint", {})
+            otc = council_data.get("otc", {})
             sig = None
 
             # --- Enhanced Golden Entry Pro ---
@@ -1902,8 +2094,17 @@ def trade_loop_enhanced():
                         golden_entry = True
                         log_i(f"🎯 GOLDEN ENTRY PRO: SELL | score={gz['score']:.1f} | منطقة ذهبية مؤكدة + Footprint")
 
-            # Council Strong Entry (إذا لم يكن هناك دخول ذهبي)
-            if not golden_entry:
+            # --- OTC Enhanced Entry ---
+            if not golden_entry and otc:
+                if otc.get("otc_buy") and otc.get("strength", 0) >= 2.0:
+                    sig = "buy"
+                    log_i(f"💰 OTC ENTRY: BUY | strength={otc.get('strength',0):.1f} | سيولة شراء مخفية قوية")
+                elif otc.get("otc_sell") and otc.get("strength", 0) >= 2.0:
+                    sig = "sell"
+                    log_i(f"💰 OTC ENTRY: SELL | strength={otc.get('strength',0):.1f} | سيولة بيع مخفية قوية")
+
+            # Council Strong Entry (إذا لم يكن هناك دخول ذهبي أو OTC)
+            if not golden_entry and not sig:
                 if council_data["score_b"] > council_data["score_s"] and council_data["score_b"] >= 8.0:
                     sig = "buy"
                 elif council_data["score_s"] > council_data["score_b"] and council_data["score_s"] >= 8.0:
@@ -1920,7 +2121,8 @@ def trade_loop_enhanced():
                         if ok:
                             wait_for_next_signal_side = None
                             # تسجيل قرار المجلس المحسن
-                            log_i(f"🎯 ENHANCED COUNCIL DECISION: {sig.upper()} | "
+                            entry_type = "GOLDEN" if golden_entry else "OTC" if otc.get("otc_buy") or otc.get("otc_sell") else "COUNCIL"
+                            log_i(f"🎯 ENHANCED {entry_type} DECISION: {sig.upper()} | "
                                   f"Score B/S: {council_data['score_b']:.1f}/{council_data['score_s']:.1f} | "
                                   f"Signal Strength: {STATE.get('signal_strength', 0):.1f}")
                             for log_msg in council_data.get("logs", []):
@@ -1956,7 +2158,7 @@ def pretty_snapshot(bal, info, ind, spread_bps, reason=None, df=None):
         print("📈 INDICATORS & RF")
         print(f"   💲 Price {fmt(info.get('price'))} | RF filt={fmt(info.get('filter'))}  hi={fmt(info.get('hi'))} lo={fmt(info.get('lo'))}")
         print(f"   🧮 RSI={fmt(ind.get('rsi'))}  +DI={fmt(ind.get('plus_di'))}  -DI={fmt(ind.get('minus_di'))}  ADX={fmt(ind.get('adx'))}  ATR={fmt(ind.get('atr'))}")
-        print(f"   🎯 ENTRY: COUNCIL PRO + GOLDEN ENTRY + VWAP STRATEGY  |  spread_bps={fmt(spread_bps,2)}")
+        print(f"   🎯 ENTRY: COUNCIL PRO + GOLDEN ENTRY + VWAP STRATEGY + OTC DETECTION  |  spread_bps={fmt(spread_bps,2)}")
         print(f"   ⏱️ closes_in ≈ {left_s}s")
         print("\n🧭 POSITION")
         bal_line = f"Balance={fmt(bal,2)}  Risk={int(RISK_ALLOC*100)}%×{LEVERAGE}x  CompoundPnL={fmt(compound_pnl)}  Eq~{fmt((bal or 0)+compound_pnl,2)}"
@@ -1977,7 +2179,7 @@ app = Flask(__name__)
 @app.route("/")
 def home():
     mode='LIVE' if MODE_LIVE else 'PAPER'
-    return f"✅ Council PRO Bot — {SYMBOL} {INTERVAL} — {mode} — Enhanced Candles + Golden Zone Pro + Smart Profit AI + VWAP Strategy"
+    return f"✅ Council PRO Bot — {SYMBOL} {INTERVAL} — {mode} — Enhanced Candles + Golden Zone Pro + Smart Profit AI + VWAP Strategy + OTC Detection"
 
 @app.route("/metrics")
 def metrics():
@@ -1985,12 +2187,18 @@ def metrics():
         "symbol": SYMBOL, "interval": INTERVAL, "mode": "live" if MODE_LIVE else "paper",
         "leverage": LEVERAGE, "risk_alloc": RISK_ALLOC, "price": price_now(),
         "state": STATE, "compound_pnl": compound_pnl,
-        "entry_mode": "COUNCIL_PRO_GOLDEN_ENHANCED_VWAP", "wait_for_next_signal": wait_for_next_signal_side,
+        "entry_mode": "COUNCIL_PRO_GOLDEN_ENHANCED_VWAP_OTC", "wait_for_next_signal": wait_for_next_signal_side,
         "guards": {"max_spread_bps": MAX_SPREAD_BPS, "final_chunk_qty": FINAL_CHUNK_QTY},
         "vwap_strategy": {
             "enabled": VWAP_ENABLED,
             "scalp_band_bps": VWAP_SCALP_BAND_BPS,
             "trend_band_bps": VWAP_TREND_BAND_BPS
+        },
+        "otc_detection": {
+            "enabled": True,
+            "window_bars": OTC_WINDOW_BARS,
+            "min_move_bps": OTC_MIN_MOVE_BPS,
+            "exit_min_strength": OTC_EXIT_MIN_STRENGTH
         }
     })
 
@@ -2000,7 +2208,7 @@ def health():
         "ok": True, "mode": "live" if MODE_LIVE else "paper",
         "open": STATE["open"], "side": STATE["side"], "qty": STATE["qty"],
         "compound_pnl": compound_pnl, "timestamp": datetime.utcnow().isoformat(),
-        "entry_mode": "COUNCIL_PRO_GOLDEN_ENHANCED_VWAP", "wait_for_next_signal": wait_for_next_signal_side
+        "entry_mode": "COUNCIL_PRO_GOLDEN_ENHANCED_VWAP_OTC", "wait_for_next_signal": wait_for_next_signal_side
     }), 200
 
 def keepalive_loop():
@@ -2035,6 +2243,7 @@ if __name__ == "__main__":
     print(colored(f"GOLDEN ENTRY PRO: score≥{GOLDEN_ENTRY_SCORE} | ADX≥{GOLDEN_ENTRY_ADX}", "yellow"))
     print(colored(f"ENHANCED CANDLES: SMC Patterns + Wick exhaustion + Golden reversal", "yellow"))
     print(colored(f"FOOTPRINT ANALYSIS: Volume spikes + Absorption detection", "yellow"))
+    print(colored(f"OTC DETECTION: Hidden flow detection + Protection system", "yellow"))
     print(colored(f"SMART PROFIT AI: Dynamic profit taking + Signal strength", "yellow"))
     print(colored(f"VWAP STRATEGY: SCALP(near {VWAP_SCALP_BAND_BPS}bps) | TREND(far {VWAP_TREND_BAND_BPS}bps)", "yellow"))
     print(colored(f"EXECUTION: {'ACTIVE' if EXECUTE_ORDERS and not DRY_RUN else 'SIMULATION'}", "yellow"))
