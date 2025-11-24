@@ -177,6 +177,7 @@ def log_i(msg): print(f"ℹ️ {msg}", flush=True)
 def log_g(msg): print(f"✅ {msg}", flush=True)
 def log_w(msg): print(f"🟨 {msg}", flush=True)
 def log_e(msg): print(f"❌ {msg}", flush=True)
+def log_r(msg): print(f"🛑 {msg}", flush=True)  # Red for critical/exit
 
 def log_banner(text): print(f"\n{'—'*12} {text} {'—'*12}\n", flush=True)
 
@@ -197,6 +198,19 @@ def load_state() -> dict:
     except Exception as e:
         log_w(f"state load failed: {e}")
     return {}
+
+# =================== RF STATE (CondIni) ===================
+RF_COND_STATE = 0    # 1 = آخر إشارة BUY ، -1 = آخر إشارة SELL
+
+# =================== STATE ===================
+STATE = {
+    "open": False, "side": None, "entry": None, "qty": 0.0,
+    "pnl": 0.0, "bars": 0, "trail": None, "breakeven": None,
+    "tp1_done": False, "highest_profit_pct": 0.0,
+    "profit_targets_achieved": 0,
+}
+compound_pnl = 0.0
+wait_for_next_signal_side = None
 
 # =================== ENHANCED CANDLES MODULE WITH SMC ===================
 def _body(o,c): return abs(c-o)
@@ -1040,6 +1054,70 @@ def council_votes_pro_enhanced(df):
             "candles": {}, "footprint": {}, "liquidity_traps": {}, "otc": {}
         }
 
+# =================== COUNCIL WATCH DURING TRADE ===================
+def council_watch_in_trade(side, council):
+    """
+    استخدام مجلس الإدارة لمراقبة الصفقة المفتوحة:
+    - side: 'long' أو 'short'
+    - council: ناتج council_votes_pro_enhanced(df)
+    يرجّع:
+      risk_level: 'normal' / 'caution' / 'exit'
+      bias: 'with_position' / 'against_position' / 'neutral'
+      reason: نص لوج مختصر
+    """
+    if not council:
+        return {"risk_level": "normal", "bias": "neutral", "reason": "no_council_data"}
+
+    b = council.get("b", 0)
+    s = council.get("s", 0)
+    sb = council.get("score_b", 0.0)
+    ss = council.get("score_s", 0.0)
+
+    # فرق التصويت والسكور
+    vote_diff = b - s
+    score_diff = sb - ss
+
+    # نحدد اتجاه المجلس
+    if sb >= ss + 2 and sb >= 4:
+        council_dir = "long"
+    elif ss >= sb + 2 and ss >= 4:
+        council_dir = "short"
+    else:
+        council_dir = "neutral"
+
+    # نحدد العلاقة مع الصفقة
+    if council_dir == "neutral":
+        bias = "neutral"
+    elif council_dir == side:
+        bias = "with_position"
+    else:
+        bias = "against_position"
+
+    # نحسب درجة الخطر
+    risk_level = "normal"
+    reason = f"votes b/s={b}/{s}, score b/s={sb:.1f}/{ss:.1f}"
+
+    if bias == "against_position":
+        # لو المجلس عكس الصفقة بقوة واضحة
+        if abs(score_diff) <= -3 or (council_dir == "short" and side == "long" and ss >= 6) or (council_dir == "long" and side == "short" and sb >= 6):
+            risk_level = "exit"
+            reason = f"strong_council_against_position ({reason})"
+        else:
+            risk_level = "caution"
+            reason = f"council_headwind ({reason})"
+    elif bias == "with_position":
+        risk_level = "normal"
+        reason = f"council_supports_position ({reason})"
+    else:
+        risk_level = "normal"
+        reason = f"council_neutral ({reason})"
+
+    return {
+        "risk_level": risk_level,
+        "bias": bias,
+        "reason": reason,
+    }
+
 # =================== POSITION RECOVERY ===================
 def _normalize_side(pos):
     side = pos.get("side") or pos.get("positionSide") or ""
@@ -1541,6 +1619,19 @@ def open_market_enhanced(side, qty, price):
         })
         
         log_g(f"✅ ENHANCED POSITION OPENED: {side.upper()} | mode={mode} | signal_strength={signal_strength:.1f}")
+        
+        # --- EXTRA LOG FOR OPENING THE TRADE ---
+        if side.lower() == "buy":
+            log_g(
+                f"🟩 BUY OPENED | mode={mode.upper()} | "
+                f"entry={fmt(price,6)} | qty={fmt(qty,4)}"
+            )
+        else:
+            log_r(
+                f"🟥 SELL OPENED | mode={mode.upper()} | "
+                f"entry={fmt(price,6)} | qty={fmt(qty,4)}"
+            )
+        
         return True
     
     return False
@@ -1626,36 +1717,81 @@ def _rng_filter(src: pd.Series, rsize: pd.Series):
 def _ema(s, n): return s.ewm(span=n, adjust=False).mean()
 
 def rf_signal_live(df: pd.DataFrame):
+    """
+    Range Filter - B&S Signals (PineScript True Version)
+    BUY/SELL بنفس منطق TradingView الأصلي:
+    - longCond
+    - shortCond
+    - CondIni (RF_COND_STATE)
+    """
+    global RF_COND_STATE
+
+    # أمان لو البيانات قليلة
     if len(df) < RF_PERIOD + 3:
-        i = -1
-        price = float(df["close"].iloc[i]) if len(df) else None
-        return {"time": int(df["time"].iloc[i]) if len(df) else int(time.time()*1000),
-                "price": price or 0.0, "long": False, "short": False,
-                "filter": price or 0.0, "hi": price or 0.0, "lo": price or 0.0}
+        price = float(df["close"].iloc[-1])
+        return {
+            "time": int(df["time"].iloc[-1]),
+            "price": price,
+            "long": False,
+            "short": False,
+            "filter": price,
+            "hi": price,
+            "lo": price,
+        }
+
+    # نفس source + period + multiplier زي سكربت الباين
     src = df[RF_SOURCE].astype(float)
     hi, lo, filt = _rng_filter(src, _rng_size(src, RF_MULT, RF_PERIOD))
-    def _bps(a,b):
-        try: return abs((a-b)/b)*10000.0
-        except Exception: return 0.0
-    p_now = float(src.iloc[-1]); p_prev = float(src.iloc[-2])
-    f_now = float(filt.iloc[-1]); f_prev = float(filt.iloc[-2])
-    long_flip  = (p_prev <= f_prev and p_now > f_now and _bps(p_now, f_now) >= RF_HYST_BPS)
-    short_flip = (p_prev >= f_prev and p_now < f_now and _bps(p_now, f_now) >= RF_HYST_BPS)
-    return {
-        "time": int(df["time"].iloc[-1]), "price": p_now,
-        "long": bool(long_flip), "short": bool(short_flip),
-        "filter": f_now, "hi": float(hi.iloc[-1]), "lo": float(lo.iloc[-1])
-    }
 
-# =================== STATE ===================
-STATE = {
-    "open": False, "side": None, "entry": None, "qty": 0.0,
-    "pnl": 0.0, "bars": 0, "trail": None, "breakeven": None,
-    "tp1_done": False, "highest_profit_pct": 0.0,
-    "profit_targets_achieved": 0,
-}
-compound_pnl = 0.0
-wait_for_next_signal_side = None
+    # اتجاه الفلتر fdir (up/down)
+    fdir = 0.0
+    for i in range(1, len(filt)):
+        if filt.iloc[i] > filt.iloc[i - 1]:
+            fdir = 1.0
+        elif filt.iloc[i] < filt.iloc[i - 1]:
+            fdir = -1.0
+
+    upward   = fdir == 1.0
+    downward = fdir == -1.0
+
+    # آخر سعر
+    p_now  = float(src.iloc[-1])
+    p_prev = float(src.iloc[-2])
+    f_now  = float(filt.iloc[-1])
+
+    # ================== longCond / shortCond (حرفياً من Pine) ==================
+    longCond = (
+        (p_now > f_now and p_now > p_prev and upward) or
+        (p_now > f_now and p_now < p_prev and upward)
+    )
+
+    shortCond = (
+        (p_now < f_now and p_now < p_prev and downward) or
+        (p_now < f_now and p_now > p_prev and downward)
+    )
+
+    # ================== CondIni logic ==================
+    previous = RF_COND_STATE
+
+    if longCond:
+        RF_COND_STATE = 1
+    elif shortCond:
+        RF_COND_STATE = -1
+
+    # إشارات flip فقط
+    buy_signal  = bool(longCond  and previous == -1)
+    sell_signal = bool(shortCond and previous == 1)
+
+    # ================== OUTPUT ==================
+    return {
+        "time": int(df["time"].iloc[-1]),
+        "price": p_now,
+        "long": buy_signal,
+        "short": sell_signal,
+        "filter": f_now,
+        "hi": float(hi.iloc[-1]),
+        "lo": float(lo.iloc[-1]),
+    }
 
 # =================== WAIT FOR NEXT SIGNAL ===================
 def _arm_wait_after_close(prev_side):
@@ -1903,6 +2039,52 @@ def manage_after_entry_enhanced(df, ind, info):
 
     if pnl_pct > STATE.get("highest_profit_pct", 0.0):
         STATE["highest_profit_pct"] = pnl_pct
+
+    # ========= Council Watch During Trade =========
+    try:
+        council_live = council_votes_pro_enhanced(df)
+    except Exception as e:
+        council_live = None
+        log_w(f"council_watch_in_trade error: {e}")
+    
+    watch = council_watch_in_trade(side, council_live) if council_live else {
+        "risk_level": "normal",
+        "bias": "neutral",
+        "reason": "no_council_data"
+    }
+
+    # لوج متابعة المجلس للصفقة
+    if watch["risk_level"] != "normal":
+        log_w(f"🧐 COUNCIL WATCH | side={side} | risk={watch['risk_level']} | {watch['reason']} | pnl={pnl_pct:.2f}%")
+    else:
+        log_i(f"✅ COUNCIL OK | side={side} | {watch['reason']} | pnl={pnl_pct:.2f}%")
+
+    # لو المجلس ضد الصفقة بقوة و إحنا في ربح → إغلاق صارم لحماية الربح
+    if pnl_pct > 0 and watch["risk_level"] == "exit":
+        log_r(f"🛑 COUNCIL EXIT | side={side} | pnl={pnl_pct:.2f}% | {watch['reason']}")
+        close_market_strict("council_strong_against_position")
+        return
+
+    # لو المجلس معارض جزئياً (caution) و الصفقة في ربح → نشد الإدارة (تريل/BE أبكر)
+    if pnl_pct > 0 and watch["risk_level"] == "caution":
+        # هنعدل التفعيل المحلي لـ BE و Trail (من غير ما نغيّر STATE الأساسي)
+        management = STATE.get("management", {}).copy()
+        orig_be = management.get("be_activate_pct", BREAKEVEN_AFTER/100.0)
+        orig_trail = management.get("trail_activate_pct", TRAIL_ACTIVATE_PCT/100.0)
+        
+        # نشدّ شوية: نفعّل BE و Trail أبكر
+        management["be_activate_pct"] = max(0.1, orig_be * 0.7)
+        management["trail_activate_pct"] = max(0.2, orig_trail * 0.7)
+        management["atr_trail_mult"] = management.get("atr_trail_mult", ATR_TRAIL_MULT) * 0.85
+        
+        log_w(
+            f"⚠️ COUNCIL CAUTION TIGHTEN | "
+            f"BE {orig_be*100:.2f}%→{management['be_activate_pct']*100:.2f}%, "
+            f"TRAIL {orig_trail*100:.2f}%→{management['trail_activate_pct']*100:.2f}%"
+        )
+        
+        # نمرر الإدارة المشددة لباقي الإدارة الكلاسيك
+        STATE["management"] = management
 
     # ========= Smart Profit AI (سلم جني الأرباح الذكي) =========
     profit_decision = smart_profit_ai_decision(STATE, df, ind, mode, side, entry, px)
