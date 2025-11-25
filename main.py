@@ -1620,7 +1620,7 @@ def open_market_enhanced(side, qty, price):
         
         log_g(f"✅ ENHANCED POSITION OPENED: {side.upper()} | mode={mode} | signal_strength={signal_strength:.1f}")
         
-        # --- EXTRA LOG FOR OPENING THE TRADE ---
+        # --- EXTRA OPEN TRADE LOG ---
         if side.lower() == "buy":
             log_g(
                 f"🟩 BUY OPENED | mode={mode.upper()} | "
@@ -2040,7 +2040,7 @@ def manage_after_entry_enhanced(df, ind, info):
     if pnl_pct > STATE.get("highest_profit_pct", 0.0):
         STATE["highest_profit_pct"] = pnl_pct
 
-    # ========= Council Watch During Trade =========
+    # ===== Council Monitoring =====
     try:
         council_live = council_votes_pro_enhanced(df)
     except Exception as e:
@@ -2232,6 +2232,14 @@ def trade_loop_enhanced():
             info = rf_signal_live(df)
             ind = compute_indicators(df)
             spread_bps = orderbook_spread_bps()
+            
+            # --- LOG RF SIGNAL ---
+            if info.get("long"):
+                log_g("📡 RF SIGNAL → 🟩 BUY")
+            elif info.get("short"):
+                log_r("📡 RF SIGNAL → 🟥 SELL")
+            else:
+                log_i("📡 RF SIGNAL → ⚪ FLAT")
             
             # Enhanced Snapshots
             snap = emit_snapshots(ex, SYMBOL, df,
