@@ -458,12 +458,72 @@ def rsi_ma_context(df):
         "in_chop": in_chop
     }
 
-# =================== GOLDEN ZONE PRO ANALYSIS ===================
-def golden_zone_pro_analysis(df, current_price):
+# =================== ENHANCED GOLDEN ZONE DETECTION ===================
+def detect_swing_points(df, window=10):
     """
-    تحليل متقدم للمناطق الذهبية مع تأكيدات متعددة
+    اكتشاف نقاط التأرجح (Swing Highs/Lows) بدقة
     """
-    if len(df) < 30:
+    highs = df['high'].astype(float)
+    lows = df['low'].astype(float)
+    
+    swing_highs = []
+    swing_lows = []
+    
+    for i in range(window, len(df) - window):
+        current_high = highs.iloc[i]
+        current_low = lows.iloc[i]
+        
+        # التحقق من Swing High
+        is_swing_high = True
+        for j in range(1, window + 1):
+            if highs.iloc[i - j] >= current_high or highs.iloc[i + j] >= current_high:
+                is_swing_high = False
+                break
+        
+        # التحقق من Swing Low  
+        is_swing_low = True
+        for j in range(1, window + 1):
+            if lows.iloc[i - j] <= current_low or lows.iloc[i + j] <= current_low:
+                is_swing_low = False
+                break
+        
+        if is_swing_high:
+            swing_highs.append({
+                'index': i,
+                'price': current_high,
+                'time': df['time'].iloc[i]
+            })
+        
+        if is_swing_low:
+            swing_lows.append({
+                'index': i,
+                'price': current_low,
+                'time': df['time'].iloc[i]
+            })
+    
+    return swing_highs, swing_lows
+
+def calculate_fibonacci_levels(swing_high, swing_low):
+    """
+    حساب مستويات فيبوناتشي المتقدمة
+    """
+    diff = swing_high - swing_low
+    
+    return {
+        'f0236': swing_low + 0.236 * diff,
+        'f0382': swing_low + 0.382 * diff,
+        'f0500': swing_low + 0.500 * diff,
+        'f0618': swing_low + 0.618 * diff,
+        'f0786': swing_low + 0.786 * diff,
+        'f0886': swing_low + 0.886 * diff,
+        'f1000': swing_high
+    }
+
+def enhanced_golden_zone_pro_analysis(df, current_price):
+    """
+    تحليل محسن للمناطق الذهبية مع اكتشاف دقيق للقيعان والقمم
+    """
+    if len(df) < 50:
         return {"ok": False, "score": 0.0, "zone": None, "reasons": ["short_df"], "confirmed": False}
     
     try:
@@ -471,45 +531,65 @@ def golden_zone_pro_analysis(df, current_price):
         l = df['low'].astype(float)
         c = df['close'].astype(float)
         v = df['volume'].astype(float)
+        o = df['open'].astype(float)
         
-        # مستويات فيبوناتشي المتقدمة
-        swing_hi = h.rolling(15).max().iloc[-1]
-        swing_lo = l.rolling(15).min().iloc[-1]
+        # استخدام current_price الممرر بدلاً من last_close لمزيد من الدقة
+        last_close = current_price if current_price else float(c.iloc[-1])
+        
+        # اكتشاف نقاط التأرجح
+        swing_highs, swing_lows = detect_swing_points(df, window=8)
+        
+        if not swing_highs or not swing_lows:
+            return {"ok": False, "score": 0.0, "zone": None, "reasons": ["no_swing_points"], "confirmed": False}
+        
+        # أخذ آخر قاعين وقمتين مهمتين
+        recent_swing_lows = sorted(swing_lows, key=lambda x: x['index'])[-3:]
+        recent_swing_highs = sorted(swing_highs, key=lambda x: x['index'])[-3:]
+        
+        if not recent_swing_lows or not recent_swing_highs:
+            return {"ok": False, "score": 0.0, "zone": None, "reasons": ["insufficient_swings"], "confirmed": False}
+        
+        # أحدث قاع وقمة رئيسية
+        latest_swing_low = min(recent_swing_lows, key=lambda x: x['price'])
+        latest_swing_high = max(recent_swing_highs, key=lambda x: x['price'])
+        
+        # التأكد من أن القمة بعد القاع (للتأكد من التسلسل الزمني)
+        if latest_swing_high['index'] < latest_swing_low['index']:
+            # البحث عن قمة أحدث
+            newer_highs = [h for h in recent_swing_highs if h['index'] > latest_swing_low['index']]
+            if newer_highs:
+                latest_swing_high = max(newer_highs, key=lambda x: x['price'])
+            else:
+                return {"ok": False, "score": 0.0, "zone": None, "reasons": ["invalid_swing_sequence"], "confirmed": False}
+        
+        swing_hi = latest_swing_high['price']
+        swing_lo = latest_swing_low['price']
         
         if swing_hi <= swing_lo:
             return {"ok": False, "score": 0.0, "zone": None, "reasons": ["flat_market"], "confirmed": False}
         
-        # مستويات فيبوناتشي موسعة
-        fib_levels = {
-            'f0382': swing_lo + 0.382 * (swing_hi - swing_lo),
-            'f0500': swing_lo + 0.500 * (swing_hi - swing_lo),
-            'f0618': swing_lo + 0.618 * (swing_hi - swing_lo),
-            'f0786': swing_lo + 0.786 * (swing_hi - swing_lo),
-            'f0886': swing_lo + 0.886 * (swing_hi - swing_lo)
-        }
+        # حساب مستويات فيبوناتشي
+        fib_levels = calculate_fibonacci_levels(swing_hi, swing_lo)
         
-        last_close = float(c.iloc[-1])
-        
-        # نحسب قرب السعر من القاع والقمة
-        dist_to_low  = abs(last_close - swing_lo)
-        dist_to_high = abs(last_close - swing_hi)
-
-        # تحليل الحجم
-        vol_ma20 = v.rolling(20).mean().iloc[-1]
-        vol_ok = float(v.iloc[-1]) >= vol_ma20 * 0.8
-        volume_spike = float(v.iloc[-1]) > vol_ma20 * 1.5
+        current_low = float(l.iloc[-1])
+        current_high = float(h.iloc[-1])
+        current_open = float(o.iloc[-1])
         
         # تحليل الشمعة الحالية
-        current_open = float(df['open'].iloc[-1])
-        current_high = float(h.iloc[-1])
-        current_low = float(l.iloc[-1])
-        
         body = abs(last_close - current_open)
-        wick_up = current_high - max(last_close, current_open)
-        wick_down = min(last_close, current_open) - current_low
+        total_range = current_high - current_low
+        body_ratio = body / total_range if total_range > 0 else 0
         
-        bull_candle = (wick_down > (body * 1.2) and last_close > current_open) or (body > 0 and last_close > current_open and wick_down > wick_up)
-        bear_candle = (wick_up > (body * 1.2) and last_close < current_open) or (body > 0 and last_close < current_open and wick_up > wick_down)
+        wick_upper = current_high - max(last_close, current_open)
+        wick_lower = min(last_close, current_open) - current_low
+        
+        is_bullish = last_close > current_open
+        is_bearish = last_close < current_open
+        
+        # تحليل الحجم
+        vol_ma20 = v.rolling(20).mean().iloc[-1]
+        current_volume = float(v.iloc[-1])
+        volume_ratio = current_volume / vol_ma20 if vol_ma20 > 0 else 1
         
         # Footprint analysis
         footprint = compute_footprint_metrics(df)
@@ -519,26 +599,41 @@ def golden_zone_pro_analysis(df, current_price):
         reasons = []
         confirmed = False
         
-        # المنطقة الذهبية السفلية (شراء) — السعر داخل 0.618–0.786 وأقرب للقاع
-        if fib_levels['f0618'] <= last_close <= fib_levels['f0786'] and dist_to_low <= dist_to_high:
+        # ===== القاع الذهبي (شراء) =====
+        golden_bottom_zone = (fib_levels['f0618'] <= last_close <= fib_levels['f0786'])
+        # تحسين تحديد القرب من القاع
+        distance_to_low = abs(last_close - swing_lo) / swing_lo * 100
+        distance_to_high = abs(last_close - swing_hi) / swing_hi * 100
+        near_swing_low = distance_to_low <= distance_to_high
+        
+        if golden_bottom_zone and near_swing_low:
             score += 3.0
             reasons.append("منطقة_ذهبية_سفلية")
             
-            if bull_candle:
+            # إشارات تأكيد القاع الذهبي
+            confirmation_signals = 0
+            
+            # 1. شمعة صاعدة مع فتيلة سفلية طويلة
+            if is_bullish and wick_lower >= body * 1.5:
                 score += 2.0
-                reasons.append("شمعة_صاعدة")
+                reasons.append("شمعة_مطرقة_صاعدة")
+                confirmation_signals += 1
             
-            if volume_spike:
+            # 2. حجم مرتفع عند الدعم
+            if volume_ratio >= 1.5:
                 score += 1.5
-                reasons.append("حجم_مرتفع")
+                reasons.append("حجم_مرتفع_عند_الدعم")
+                confirmation_signals += 1
             
+            # 3. امتصاص شرائي في Footprint
             if footprint.get('ok') and footprint.get('absorption_bull'):
                 score += 2.0
-                reasons.append("امتصاص_شرائي")
+                reasons.append("امتصاص_شرائي_قوي")
+                confirmation_signals += 1
             
-            # تأكيد من الشموع السابقة داخل نفس المنطقة
+            # 4. شموع تأكيد في المنطقة الذهبية
             confirmation_bars = 0
-            for i in range(2, min(6, len(df))):
+            for i in range(1, min(6, len(df))):
                 prev_close = float(df['close'].iloc[-i])
                 if fib_levels['f0618'] <= prev_close <= fib_levels['f0786']:
                     confirmation_bars += 1
@@ -546,31 +641,58 @@ def golden_zone_pro_analysis(df, current_price):
             if confirmation_bars >= 2:
                 score += 1.5
                 reasons.append(f"تأكيد_{confirmation_bars}_شمعة")
-                confirmed = True
+                confirmation_signals += 1
+            
+            # 5. نمط SMC للقاع
+            candles_data = compute_enhanced_candles(df)
+            if candles_data.get('liquidity_trap') and candles_data.get('score_buy', 0) > 2:
+                score += 2.0
+                reasons.append("نمط_SMC_للقاع")
+                confirmation_signals += 1
+            
+            # تأكيد القاع الذهبي
+            confirmed = confirmation_signals >= 3
+            
+            if confirmed:
+                score += 2.0
+                reasons.append("قاع_ذهبي_مؤكد")
             
             if score >= GOLDEN_ENTRY_SCORE:
                 zone_type = "golden_bottom"
         
-        # المنطقة الذهبية العلوية (بيع) — السعر داخل 0.618–0.786 وأقرب للقمة
-        elif fib_levels['f0618'] <= last_close <= fib_levels['f0786'] and dist_to_high < dist_to_low:
+        # ===== القمة الذهبية (بيع) =====
+        golden_top_zone = (fib_levels['f0618'] <= last_close <= fib_levels['f0786'])
+        # تحسين تحديد القرب من القمة
+        near_swing_high = distance_to_high < distance_to_low
+        
+        if golden_top_zone and near_swing_high:
             score += 3.0
             reasons.append("منطقة_ذهبية_علوية")
             
-            if bear_candle:
+            # إشارات تأكيد القمة الذهبية
+            confirmation_signals = 0
+            
+            # 1. شمعة هابطة مع فتيلة علوية طويلة
+            if is_bearish and wick_upper >= body * 1.5:
                 score += 2.0
-                reasons.append("شمعة_هابطة")
+                reasons.append("شمعة_نجمة_هابطة")
+                confirmation_signals += 1
             
-            if volume_spike:
+            # 2. حجم مرتفع عند المقاومة
+            if volume_ratio >= 1.5:
                 score += 1.5
-                reasons.append("حجم_مرتفع")
+                reasons.append("حجم_مرتفع_عند_المقاومة")
+                confirmation_signals += 1
             
+            # 3. امتصاص بيعي في Footprint
             if footprint.get('ok') and footprint.get('absorption_bear'):
                 score += 2.0
-                reasons.append("امتصاص_بيعي")
+                reasons.append("امتصاص_بيعي_قوي")
+                confirmation_signals += 1
             
-            # تأكيد من الشموع السابقة داخل نفس المنطقة
+            # 4. شموع تأكيد في المنطقة الذهبية
             confirmation_bars = 0
-            for i in range(2, min(6, len(df))):
+            for i in range(1, min(6, len(df))):
                 prev_close = float(df['close'].iloc[-i])
                 if fib_levels['f0618'] <= prev_close <= fib_levels['f0786']:
                     confirmation_bars += 1
@@ -578,22 +700,134 @@ def golden_zone_pro_analysis(df, current_price):
             if confirmation_bars >= 2:
                 score += 1.5
                 reasons.append(f"تأكيد_{confirmation_bars}_شمعة")
-                confirmed = True
+                confirmation_signals += 1
+            
+            # 5. نمط SMC للقمة
+            candles_data = compute_enhanced_candles(df)
+            if candles_data.get('liquidity_trap') and candles_data.get('score_sell', 0) > 2:
+                score += 2.0
+                reasons.append("نمط_SMC_للقمة")
+                confirmation_signals += 1
+            
+            # تأكيد القمة الذهبية
+            confirmed = confirmation_signals >= 3
+            
+            if confirmed:
+                score += 2.0
+                reasons.append("قمة_ذهبية_مؤكد")
             
             if score >= GOLDEN_ENTRY_SCORE:
                 zone_type = "golden_top"
         
+        # معلومات إضافية للتتبع
+        zone_info = {
+            "type": zone_type,
+            "levels": fib_levels,
+            "swing_high": swing_hi,
+            "swing_low": swing_lo,
+            "current_price": last_close,
+            "distance_to_swing_low_pct": distance_to_low,
+            "distance_to_swing_high_pct": distance_to_high
+        } if zone_type else None
+        
         ok = zone_type is not None and ALLOW_GZ_ENTRY
+        
         return {
             "ok": ok,
-            "score": score,
-            "zone": {"type": zone_type, "levels": fib_levels} if zone_type else None,
+            "score": round(score, 2),
+            "zone": zone_info,
             "reasons": reasons,
-            "confirmed": confirmed
+            "confirmed": confirmed,
+            "swing_analysis": {
+                "swing_highs": recent_swing_highs[-2:],
+                "swing_lows": recent_swing_lows[-2:],
+                "fib_levels": fib_levels
+            }
         }
         
     except Exception as e:
+        log_w(f"enhanced_golden_zone error: {e}")
         return {"ok": False, "score": 0.0, "zone": None, "reasons": [f"error: {e}"], "confirmed": False}
+
+# =================== ENHANCED GOLDEN ENTRY EXECUTION ===================
+def execute_golden_zone_entry(df, zone_data, council_data):
+    """
+    تنفيذ دخول محسن في المناطق الذهبية
+    """
+    if not zone_data["ok"] or not zone_data["confirmed"]:
+        return False
+    
+    zone_type = zone_data["zone"]["type"]
+    current_price = float(df['close'].iloc[-1])
+    
+    # حساب الكمية بناء على الرصيد والسعر
+    bal = balance_usdt()
+    if not bal:
+        log_e("❌ لا يمكن حساب الكمية - رصيد غير متوفر")
+        return False
+    
+    qty = compute_size(bal, current_price)
+    if qty <= 0:
+        log_e("❌ كمية غير صالحة للدخول")
+        return False
+    
+    # تحديد اتجاه الدخول
+    if zone_type == "golden_bottom":
+        side = "buy"
+        entry_type = "القاع الذهبي"
+    elif zone_type == "golden_top":
+        side = "sell" 
+        entry_type = "القمة الذهبية"
+    else:
+        return False
+    
+    # تحليل إضافي للتأكيد - استخدام score_buy/score_sell بدلاً من buy/sell
+    candles_data = compute_enhanced_candles(df)
+    footprint_data = compute_footprint_metrics(df)
+    
+    # التأكد من توافق إشارات الشموع مع المنطقة الذهبية باستخدام score
+    buy_ok = candles_data.get("score_buy", 0) > 2.0  # عتبة أعلى للتأكيد
+    sell_ok = candles_data.get("score_sell", 0) > 2.0
+    
+    if (zone_type == "golden_bottom" and not buy_ok) or \
+       (zone_type == "golden_top" and not sell_ok):
+        log_w(f"🟨 منطقة ذهبية لكن إشارة الشموع غير متوافقة: {zone_type} (score_buy={candles_data.get('score_buy', 0):.1f}, score_sell={candles_data.get('score_sell', 0):.1f})")
+        return False
+    
+    # تنفيذ الصفقة
+    log_i(f"🎯 تنفيذ دخول {entry_type} | السعر: {current_price:.6f}")
+    log_i(f"📊 قوة المنطقة: {zone_data['score']:.1f} | الأسباب: {', '.join(zone_data['reasons'])}")
+    
+    success = open_market_enhanced(side, qty, current_price)
+    
+    if success:
+        log_g(f"✅ تم الدخول بنجاح في {entry_type}!")
+        log_i(f"💡 تفاصيل المنطقة:")
+        log_i(f"   - السعر الحالي: {current_price:.6f}")
+        log_i(f"   - القمة: {zone_data['zone']['swing_high']:.6f}")
+        log_i(f"   - القاع: {zone_data['zone']['swing_low']:.6f}")
+        log_i(f"   - مستويات فيبوناتشي: 0.618={zone_data['zone']['levels']['f0618']:.6f}, 0.786={zone_data['zone']['levels']['f0786']:.6f}")
+        
+        # تسجيل بيانات المنطقة في الحالة
+        STATE.update({
+            "golden_zone_entry": True,
+            "entry_type": zone_type,
+            "zone_score": zone_data['score'],
+            "swing_high": zone_data['zone']['swing_high'],
+            "swing_low": zone_data['zone']['swing_low'],
+            "fib_levels": zone_data['zone']['levels']
+        })
+        
+        return True
+    
+    return False
+
+# =================== GOLDEN ZONE PRO ANALYSIS ===================
+def golden_zone_pro_analysis(df, current_price):
+    """
+    تحليل متقدم للمناطق الذهبية مع تأكيدات متعددة
+    """
+    return enhanced_golden_zone_pro_analysis(df, current_price)
 
 def decide_strategy_mode_enhanced(df, adx=None, di_plus=None, di_minus=None, rsi_ctx=None, footprint=None):
     """تحديد نمط التداول المحسن: SCALP أم TREND مع VWAP + Footprint"""
@@ -1844,9 +2078,9 @@ def manage_after_entry_enhanced(df, ind, info):
             return
         # متعمدين نتجاهل "partial" هنا عشان ما نعملش TP1 مزدوج (Smart AI + Guard)
 
-# =================== ENHANCED TRADE LOOP ===================
+# =================== ENHANCED TRADE LOOP WITH GOLDEN ZONES ===================
 def trade_loop_enhanced():
-    """حلقة تداول محسنة مع Golden Zone Pro وSmart Profit AI وVWAP"""
+    """حلقة تداول محسنة مع اكتشاف متقدم للمناطق الذهبية"""
     global wait_for_next_signal_side
     loop_i = 0
     
@@ -1860,50 +2094,44 @@ def trade_loop_enhanced():
             ind = compute_indicators(df)
             spread_bps = orderbook_spread_bps()
             
-            # Enhanced Snapshots
-            snap = emit_snapshots(ex, SYMBOL, df,
-                                balance_fn=lambda: float(bal) if bal else None,
-                                pnl_fn=lambda: float(compound_pnl))
+            # الاكتشاف المحسن للمناطق الذهبية
+            golden_zone_data = golden_zone_pro_analysis(df, px or info["price"])
+            council_data = council_votes_pro_enhanced(df)
             
             # تحديث حالة الربح/الخسارة
             if STATE["open"] and px:
                 STATE["pnl"] = (px-STATE["entry"])*STATE["qty"] if STATE["side"]=="long" else (STATE["entry"]-px)*STATE["qty"]
             
-            # إدارة الصفقة المفتوحة مع Smart Profit AI
+            # إدارة الصفقة المفتوحة
             if STATE["open"]:
                 manage_after_entry_enhanced(df, ind, {
                     "price": px or info["price"], 
-                    "bm": snap["bm"],
-                    "flow": snap["flow"],
+                    "bm": None,  # سيتم تحديثها لاحقاً
+                    "flow": None,
                     **info
                 })
             
-            # قرار الدخول المحسن
+            # قرار الدخول المحسن مع الأولوية للمناطق الذهبية
             reason = None
             if spread_bps is not None and spread_bps > MAX_SPREAD_BPS:
                 reason = f"spread too high ({fmt(spread_bps,2)}bps > {MAX_SPREAD_BPS})"
             
-            council_data = council_votes_pro_enhanced(df)
-            gz = council_data.get("gz")
-            footprint = council_data.get("footprint", {})
             sig = None
-
-            # --- Enhanced Golden Entry Pro ---
-            golden_entry = False
-            if (gz and gz.get("ok") and gz.get("confirmed")):
-                if gz["zone"]["type"]=="golden_bottom" and gz["score"]>=GOLDEN_ENTRY_SCORE:
-                    if footprint.get('ok') and footprint.get('absorption_bull'):
-                        sig = "buy"
-                        golden_entry = True
-                        log_i(f"🎯 GOLDEN ENTRY PRO: BUY | score={gz['score']:.1f} | منطقة ذهبية مؤكدة + Footprint")
-                elif gz["zone"]["type"]=="golden_top" and gz["score"]>=GOLDEN_ENTRY_SCORE:
-                    if footprint.get('ok') and footprint.get('absorption_bear'):
-                        sig = "sell"
-                        golden_entry = True
-                        log_i(f"🎯 GOLDEN ENTRY PRO: SELL | score={gz['score']:.1f} | منطقة ذهبية مؤكدة + Footprint")
-
-            # Council Strong Entry (إذا لم يكن هناك دخول ذهبي)
-            if not golden_entry:
+            entry_priority = "council"  # council أو golden_zone
+            
+            # الأولوية للمناطق الذهبية المؤكدة
+            if golden_zone_data["ok"] and golden_zone_data["confirmed"]:
+                if golden_zone_data["zone"]["type"] == "golden_bottom":
+                    sig = "buy"
+                    entry_priority = "golden_zone"
+                    log_i(f"🎯 اكتشاف قاع ذهبي مؤكد | قوة: {golden_zone_data['score']:.1f}")
+                elif golden_zone_data["zone"]["type"] == "golden_top":
+                    sig = "sell" 
+                    entry_priority = "golden_zone"
+                    log_i(f"🎯 اكتشاف قمة ذهبية مؤكدة | قوة: {golden_zone_data['score']:.1f}")
+            
+            # إذا لم يكن هناك منطقة ذهبية، نستخدم مجلس القرارات
+            if not sig:
                 if council_data["score_b"] > council_data["score_s"] and council_data["score_b"] >= 8.0:
                     sig = "buy"
                 elif council_data["score_s"] > council_data["score_b"] and council_data["score_s"] >= 8.0:
@@ -1916,15 +2144,15 @@ def trade_loop_enhanced():
                 else:
                     qty = compute_size(bal, px or info["price"])
                     if qty > 0:
-                        ok = open_market_enhanced(sig, qty, px or info["price"])
+                        if entry_priority == "golden_zone":
+                            # استخدام المنطق المحسن للمناطق الذهبية
+                            ok = execute_golden_zone_entry(df, golden_zone_data, council_data)
+                        else:
+                            # استخدام المنطق العادي
+                            ok = open_market_enhanced(sig, qty, px or info["price"])
+                        
                         if ok:
                             wait_for_next_signal_side = None
-                            # تسجيل قرار المجلس المحسن
-                            log_i(f"🎯 ENHANCED COUNCIL DECISION: {sig.upper()} | "
-                                  f"Score B/S: {council_data['score_b']:.1f}/{council_data['score_s']:.1f} | "
-                                  f"Signal Strength: {STATE.get('signal_strength', 0):.1f}")
-                            for log_msg in council_data.get("logs", []):
-                                log_i(f"   - {log_msg}")
                     else:
                         reason = "qty<=0"
             
@@ -1934,17 +2162,7 @@ def trade_loop_enhanced():
             
         except Exception as e:
             log_e(f"loop error: {e}\n{traceback.format_exc()}")
-            logging.error(f"trade_loop error: {e}\n{traceback.format_exc()}")
             time.sleep(BASE_SLEEP)
-
-# استبدال الدوال الأساسية بالمحسنة
-compute_candles = compute_enhanced_candles
-council_votes_pro = council_votes_pro_enhanced
-manage_after_entry = manage_after_entry_enhanced
-open_market = open_market_enhanced
-trade_loop = trade_loop_enhanced
-decide_strategy_mode = decide_strategy_mode_enhanced
-golden_zone_check = golden_zone_pro_analysis
 
 # =================== LOOP / LOG ===================
 def pretty_snapshot(bal, info, ind, spread_bps, reason=None, df=None):
@@ -2044,6 +2262,6 @@ if __name__ == "__main__":
     signal.signal(signal.SIGINT,  lambda *_: sys.exit(0))
     
     import threading
-    threading.Thread(target=trade_loop, daemon=True).start()
+    threading.Thread(target=trade_loop_enhanced, daemon=True).start()
     threading.Thread(target=keepalive_loop, daemon=True).start()
     app.run(host="0.0.0.0", port=PORT, debug=False, use_reloader=False)
