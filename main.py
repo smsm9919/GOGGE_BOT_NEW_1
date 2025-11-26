@@ -249,7 +249,7 @@ def detect_liquidity_pools(df, window=20, sensitivity=2.0):
                 if strength >= SMC_PIVOT_STRENGTH_THRESHOLD:
                     pivot_highs.append({
                         'price': float(highs.iloc[i]),
-                        'time': int(df['time'].iloc[i]),
+                        'time': int(df.index[i].timestamp() if hasattr(df.index[i], 'timestamp') else int(time.time())),
                         'strength': strength,
                         'type': 'liquidity_pool_high'
                     })
@@ -259,7 +259,7 @@ def detect_liquidity_pools(df, window=20, sensitivity=2.0):
                 if strength >= SMC_PIVOT_STRENGTH_THRESHOLD:
                     pivot_lows.append({
                         'price': float(lows.iloc[i]),
-                        'time': int(df['time'].iloc[i]),
+                        'time': int(df.index[i].timestamp() if hasattr(df.index[i], 'timestamp') else int(time.time())),
                         'strength': strength,
                         'type': 'liquidity_pool_low'
                     })
@@ -357,7 +357,7 @@ def identify_supply_demand_zones(df):
                 zones.append({
                     'type': 'demand',
                     'price': float(df['low'].iloc[i]),
-                    'time': int(df['time'].iloc[i]),
+                    'time': int(df.index[i].timestamp() if hasattr(df.index[i], 'timestamp') else int(time.time())),
                     'strength': strength,
                     'width': calculate_zone_width(df, i, 'demand')
                 })
@@ -371,7 +371,7 @@ def identify_supply_demand_zones(df):
                 zones.append({
                     'type': 'supply',
                     'price': float(df['high'].iloc[i]),
-                    'time': int(df['time'].iloc[i]),
+                    'time': int(df.index[i].timestamp() if hasattr(df.index[i], 'timestamp') else int(time.time())),
                     'strength': strength,
                     'width': calculate_zone_width(df, i, 'supply')
                 })
@@ -445,7 +445,7 @@ def detect_fair_value_gaps(df):
                         'type': 'bullish_fvg',
                         'top': current_low,
                         'bottom': max(prev_high, next_high),
-                        'time': int(df['time'].iloc[i]),
+                        'time': int(df.index[i].timestamp() if hasattr(df.index[i], 'timestamp') else int(time.time())),
                         'size_bps': gap_size
                     })
             
@@ -457,7 +457,7 @@ def detect_fair_value_gaps(df):
                         'type': 'bearish_fvg',
                         'top': min(prev_low, next_low),
                         'bottom': current_high,
-                        'time': int(df['time'].iloc[i]),
+                        'time': int(df.index[i].timestamp() if hasattr(df.index[i], 'timestamp') else int(time.time())),
                         'size_bps': gap_size
                     })
         
@@ -484,7 +484,7 @@ def identify_order_blocks(df):
                     'high': float(df['high'].iloc[i]),
                     'low': float(df['low'].iloc[i]),
                     'entry': float(df['low'].iloc[i]),
-                    'time': int(df['time'].iloc[i]),
+                    'time': int(df.index[i].timestamp() if hasattr(df.index[i], 'timestamp') else int(time.time())),
                     'strength': calculate_block_strength(df, i, 'buy')
                 })
             
@@ -498,7 +498,7 @@ def identify_order_blocks(df):
                     'high': float(df['high'].iloc[i]),
                     'low': float(df['low'].iloc[i]),
                     'entry': float(df['high'].iloc[i]),
-                    'time': int(df['time'].iloc[i]),
+                    'time': int(df.index[i].timestamp() if hasattr(df.index[i], 'timestamp') else int(time.time())),
                     'strength': calculate_block_strength(df, i, 'sell')
                 })
         
@@ -1393,7 +1393,7 @@ def adjust_take_profits_based_on_strength(state, council_decision):
 # =================== ENHANCED TRADE LOOP WITH QUALITY ENGINE ===================
 def trade_loop_enhanced_with_smc():
     """حلقة تداول محسنة مع نظام جودة الدخول المتكامل"""
-    global wait_for_next_signal_side
+    global wait_for_next_signal_side, STATE
     loop_i = 0
     
     while True:
@@ -1880,8 +1880,9 @@ def fetch_ohlcv(limit=100):
     try:
         if ex:
             ohlcv = ex.fetch_ohlcv(SYMBOL, INTERVAL, limit=limit)
-            df = pd.DataFrame(ohlcv, columns=['time', 'open', 'high', 'low', 'close', 'volume'])
-            df['time'] = pd.to_datetime(df['time'], unit='ms')
+            df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+            df['time'] = pd.to_datetime(df['timestamp'], unit='ms')
+            df.set_index('time', inplace=True)
             return df
         return pd.DataFrame()
     except Exception as e:
@@ -2085,7 +2086,7 @@ def time_to_candle_close(df):
         if len(df) == 0:
             return 60
         
-        last_time = pd.to_datetime(df['time'].iloc[-1])
+        last_time = df.index[-1]
         if INTERVAL.endswith('m'):
             minutes = int(INTERVAL[:-1])
             next_close = last_time + pd.Timedelta(minutes=minutes)
