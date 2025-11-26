@@ -703,42 +703,42 @@ def _normalize_side(pos):
     return "LONG" if qty > 0 else ("SHORT" if qty < 0 else "")
 
 def fetch_live_position(exchange, symbol: str):
-    """Read live position from exchange (generic for ccxt)."""
+    """Read live position from exchange - BingX compatible version"""
     try:
-        if hasattr(exchange, "fetch_positions"):
-            arr = exchange.fetch_positions([symbol])
-            for p in arr or []:
-                sym = p.get("symbol") or p.get("info", {}).get("symbol")
-                if sym and symbol.replace(":", "") in sym.replace(":", ""):
-                    side = _normalize_side(p)
-                    qty = abs(float(
-                        p.get("contracts")
-                        or p.get("positionAmt")
-                        or p.get("info", {}).get("size", 0)
-                        or 0
-                    ))
-                    if qty > 0:
-                        entry = float(p.get("entryPrice") or p.get("info", {}).get("entryPrice") or 0.0)
-                        lev   = float(p.get("leverage") or p.get("info", {}).get("leverage") or 0.0)
-                        unr   = float(p.get("unrealizedPnl") or 0.0)
+        # طريقة بديلة لقراءة البوزيشن من الرصيد
+        if hasattr(exchange, "fetch_balance"):
+            balance = exchange.fetch_balance({'type': 'future'})
+            if 'positions' in balance:
+                for pos in balance['positions']:
+                    sym = pos.get("symbol")
+                    if sym and symbol.replace(":", "") in sym.replace(":", ""):
+                        contracts = float(pos.get("contracts", 0))
+                        if abs(contracts) > 0:
+                            return {
+                                "ok": True,
+                                "side": "LONG" if contracts > 0 else "SHORT",
+                                "qty": abs(contracts),
+                                "entry": float(pos.get("entryPrice", 0)),
+                                "unrealized": float(pos.get("unrealizedPnl", 0)),
+                                "leverage": float(pos.get("leverage", LEVERAGE)),
+                                "raw": pos,
+                            }
+            
+            # محاولة بديلة باستخدام fetch_positions
+            if hasattr(exchange, "fetch_positions"):
+                positions = exchange.fetch_positions([symbol])
+                for pos in positions:
+                    contracts = float(pos.get("contracts", 0))
+                    if abs(contracts) > 0:
                         return {
                             "ok": True,
-                            "side": side,
-                            "qty": qty,
-                            "entry": entry,
-                            "unrealized": unr,
-                            "leverage": lev,
-                            "raw": p,
+                            "side": "LONG" if contracts > 0 else "SHORT",
+                            "qty": abs(contracts),
+                            "entry": float(pos.get("entryPrice", 0)),
+                            "unrealized": float(pos.get("unrealizedPnl", 0)),
+                            "leverage": float(pos.get("leverage", LEVERAGE)),
+                            "raw": pos,
                         }
-        if hasattr(exchange, "fetch_position"):
-            p = exchange.fetch_position(symbol)
-            side = _normalize_side(p)
-            qty  = abs(float(p.get("size") or 0))
-            if qty > 0:
-                entry = float(p.get("entryPrice") or 0.0)
-                lev   = float(p.get("leverage") or 0.0)
-                unr   = float(p.get("unrealizedPnl") or 0.0)
-                return {"ok": True, "side": side, "qty": qty, "entry": entry, "unrealized": unr, "leverage": lev, "raw": p}
     except Exception as e:
         log_w(f"fetch_live_position error: {e}")
     return {"ok": False, "why": "no_open_position"}
@@ -813,20 +813,21 @@ def compute_size(balance: float, price: float) -> float:
         qty = MIN_QTY
     return safe_qty(qty)
 
-# =================== ORDER EXECUTION (OPEN / CLOSE) ===================
+# =================== ORDER EXECUTION (OPEN / CLOSE) - BINGX FIX ===================
 
 def _params_open(side: str):
-    """Exchange-specific params for opening a position."""
-    return {"positionSide": "LONG" if side == "buy" else "SHORT"}
+    """Exchange-specific params for opening a position - BingX One-way mode fix"""
+    # في وضع One-way mode لا نستخدم positionSide
+    return {}
 
 def _params_close():
-    """Params for closing (reduceOnly, etc.)."""
+    """Params for closing (reduceOnly, etc.) - BingX One-way mode fix"""
+    # في وضع One-way mode نستخدم reduceOnly للإغلاق
     return {"reduceOnly": True}
 
 def open_market_enhanced(side: str, qty: float, price: float = None, reason: str = "COUNCIL"):
     """
-    Unified market order open with logging + STATE update.
-    side = 'buy' (long) أو 'sell' (short)
+    Unified market order open with logging + STATE update - BingX compatible
     """
     global STATE
     qty = safe_qty(qty)
@@ -842,7 +843,11 @@ def open_market_enhanced(side: str, qty: float, price: float = None, reason: str
     params = _params_open(order_side)
     try:
         if MODE_LIVE and EXECUTE_ORDERS and not DRY_RUN:
+            # إعداد الرافعة أولاً
+            ex.set_leverage(LEVERAGE, SYMBOL, params={"side": "BOTH"})
+            # تنفيذ الأمر بدون positionSide
             ex.create_order(SYMBOL, "market", order_side, qty, None, params)
+        
         px = price or (price_now() or 0.0)
         STATE.update({
             "open": True,
@@ -855,6 +860,8 @@ def open_market_enhanced(side: str, qty: float, price: float = None, reason: str
             "trail": None,
             "breakeven": None,
             "tp1_done": False,
+            "tp2_done": False,
+            "tp3_done": False,
             "highest_profit_pct": 0.0,
             "profit_targets_achieved": 0,
             "trail_tightened": False,
@@ -948,52 +955,141 @@ def _reset_after_close(reason: str, prev_side: str = None):
         "trail": None,
         "breakeven": None,
         "tp1_done": False,
+        "tp2_done": False,
+        "tp3_done": False,
         "highest_profit_pct": 0.0,
         "profit_targets_achieved": 0,
         "trail_tightened": False,
         "partial_taken": False,
         "trailing_active": False,
         "breakeven_activated": False,
+        "breakeven_armed": False,
     })
     save_state(STATE)
     log_i(f"🔄 STATE reset after close: {reason} (prev_side={prev_side})")
 
-# =================== ENHANCED POSITION MANAGEMENT ===================
+# =================== MULTI-STAGE TP ENGINE ===================
 
-def manage_after_entry_enhanced(df, current_price, council_decision):
-    """Basic smart management using pnl%, TP1, breakeven, trail and smart exit."""
+def auto_tp_stages(score, tierA, tierB):
+    """
+    Decide TP stages based on signal strength.
+    Returns tuple: (tp_count, tp1_pct, tp2_pct, tp3_pct)
+    """
+
+    # Weak scalp → 1 stage only
+    if score < 7 and tierA == 0:
+        return (1, 0.40, None, None)
+
+    # Good scalp / moderate entry → 2 stages
+    if score >= 7 and score < 10:
+        return (2, 0.40, 0.80, None)
+
+    # Trend-level strong signals → 3 stages
+    if tierA >= 1 and score >= 10:
+        return (3, 0.40, 1.20, 2.00)
+
+    # Default fallback
+    return (1, 0.40, None, None)
+
+def manage_after_entry_pro(df, current_price, council_decision):
+    """Enhanced position management with Multi-Stage TP"""
     if not STATE.get("open") or STATE.get("qty", 0) <= 0:
         return "hold"
 
-    px    = current_price
+    px = current_price
     entry = STATE["entry"]
-    side  = STATE["side"]
-    qty   = STATE["qty"]
+    side = STATE["side"]
+    qty = STATE["qty"]
 
     pnl_pct = (px - entry) / entry * 100 * (1 if side == "long" else -1)
     STATE["pnl"] = pnl_pct
     if pnl_pct > STATE.get("highest_profit_pct", 0.0):
         STATE["highest_profit_pct"] = pnl_pct
 
-    # TP1 بسيط
-    if not STATE.get("tp1_done") and pnl_pct >= TP1_PCT_BASE:
-        close_position_partial(TP1_CLOSE_FRAC, why=f"TP1 {TP1_PCT_BASE:.2f}%")
+    # === DETERMINE TP TIERS ===
+    # استخراج معلومات الجودة من قرار المجلس
+    strategies = council_decision.get("strategies", {})
+    
+    # حساب Tier A (إشارات قوية - score >= 8)
+    tier_a = [s for s in strategies.values() if s.get('score', 0) >= 8]
+    
+    # حساب Tier B (إشارات متوسطة - score >= 6)  
+    tier_b = [s for s in strategies.values() if s.get('score', 0) >= 6]
+    
+    # حساب النقاط الإجمالية (0-10)
+    total_score = council_decision.get("confidence_score", 0) / 10
+    
+    tp_count, tp1_pct, tp2_pct, tp3_pct = auto_tp_stages(
+        total_score,
+        len(tier_a),
+        len(tier_b),
+    )
+
+    # === TP1 ===
+    if tp_count >= 1 and not STATE.get("tp1_done") and pnl_pct >= tp1_pct:
+        close_position_partial(0.30, why=f"TP1 ({tp1_pct:.2f}%)")
         STATE["tp1_done"] = True
         STATE["profit_targets_achieved"] = STATE.get("profit_targets_achieved", 0) + 1
+        log_g(f"🎯 TP1 HIT: {pnl_pct:.2f}% - Partial Close 30%")
         return "partial_close"
 
-    # Breakeven
+    # === TP2 ===
+    if tp_count >= 2 and STATE.get("tp1_done") and not STATE.get("tp2_done") and pnl_pct >= tp2_pct:
+        close_position_partial(0.30, why=f"TP2 ({tp2_pct:.2f}%)")
+        STATE["tp2_done"] = True
+        STATE["profit_targets_achieved"] = STATE.get("profit_targets_achieved", 0) + 1
+        
+        # تفعيل التريلينج ستوب بعد TP2
+        if not STATE.get("trail_tightened"):
+            STATE["trail_tightened"] = True
+            STATE["trailing_active"] = True
+            log_g("🎯 TRAILING STOP Activated after TP2")
+            
+        log_g(f"🎯 TP2 HIT: {pnl_pct:.2f}% - Partial Close 30%")
+        return "partial_close"
+
+    # === TP3 (Final) ===
+    if tp_count == 3 and STATE.get("tp2_done") and not STATE.get("tp3_done") and pnl_pct >= tp3_pct:
+        close_position_partial(0.40, why=f"TP3 ({tp3_pct:.2f}%)")
+        STATE["tp3_done"] = True
+        STATE["profit_targets_achieved"] = STATE.get("profit_targets_achieved", 0) + 1
+        log_g(f"🎯 TP3 HIT: {pnl_pct:.2f}% - Final Close 40%")
+        return "partial_close"
+
+    # === BREAKEVEN PROTECTION ===
     if not STATE.get("breakeven_armed") and pnl_pct >= BREAKEVEN_AFTER:
         STATE["breakeven_armed"] = True
         STATE["breakeven"] = entry
         STATE["current_sl"] = entry
-        log_i("🔒 BREAKEVEN ARMED")
+        log_i("🔒 BREAKEVEN ARMED - Risk Free Trade")
 
-    # وقف خسارة صارم
+    # === INTELLIGENT TRAILING STOP ===
+    if STATE.get("trailing_active"):
+        if STATE["side"] == "long":
+            STATE["highest_price"] = max(STATE.get("highest_price", px), px)
+            new_sl = STATE["highest_price"] * (1 - 0.3 / 100)  # 0.3% trailing
+        else:
+            STATE["lowest_price"] = min(STATE.get("lowest_price", px), px)
+            new_sl = STATE["lowest_price"] * (1 + 0.3 / 100)  # 0.3% trailing
+        
+        if (STATE["side"] == "long" and new_sl > STATE.get("current_sl", 0)) or \
+           (STATE["side"] == "short" and new_sl < STATE.get("current_sl", float('inf'))):
+            STATE["current_sl"] = new_sl
+            log_i(f"🔼 Trailing SL Updated: {new_sl:.6f}")
+
+    # === HARD STOP LOSS ===
     if pnl_pct <= -3.0:  # -3% خسارة
-        log_w("🚨 HARD STOP: pnl<=-3%")
+        log_w(f"🚨 HARD STOP: pnl<=-3% ({pnl_pct:.2f}%)")
         close_market_strict("hard_stop_loss")
         return "close"
+
+    # === TRAILING STOP CHECK ===
+    if STATE.get("current_sl"):
+        if (STATE["side"] == "long" and px <= STATE["current_sl"]) or \
+           (STATE["side"] == "short" and px >= STATE["current_sl"]):
+            log_g(f"🛡️ Trailing SL Hit: {pnl_pct:.2f}%")
+            close_market_strict("trailing_stop")
+            return "close"
 
     return "hold"
 
@@ -1170,6 +1266,8 @@ STATE = {
     "trail": None,
     "breakeven": None,
     "tp1_done": False,
+    "tp2_done": False,
+    "tp3_done": False,
     "highest_profit_pct": 0.0,
     "profit_targets_achieved": 0,
     "trail_tightened": False,
@@ -1250,13 +1348,20 @@ def supreme_trade_loop():
             
             # إدارة الصفقة المفتوحة
             if STATE["open"]:
-                # استخدام نظام الإدارة المحسن
-                exit_signal = manage_after_entry_enhanced(df, px, council_decision)
+                # استخدام نظام الإدارة المحترف مع Multi-Stage TP
+                exit_signal = manage_after_entry_pro(df, px, council_decision)
                 
                 if exit_signal == "close":
-                    close_market_strict("smart_management_exit")
-                    log_g("🎯 Smart Management - Position Closed")
+                    log_g("🎯 Professional Management - Position Closed")
                     continue
+                    
+                # تسجيل حالة TP للمراقبة
+                if STATE.get("tp1_done") or STATE.get("tp2_done") or STATE.get("tp3_done"):
+                    tp_status = []
+                    if STATE.get("tp1_done"): tp_status.append("TP1✓")
+                    if STATE.get("tp2_done"): tp_status.append("TP2✓") 
+                    if STATE.get("tp3_done"): tp_status.append("TP3✓")
+                    log_i(f"📊 TP Progress: {' → '.join(tp_status)} | PnL: {STATE.get('pnl', 0):.2f}%")
             
             # قرار الدخول الجديد
             trade_rec = council_decision["final_decision"]
