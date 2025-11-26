@@ -10,7 +10,6 @@ RF Futures Bot — RF-LIVE ONLY (BingX Perp via CCXT)
 • Advanced Smart Money Concepts (Liquidity Pools, Order Blocks, FVGs)
 • Professional Price Structure Analysis
 • Intelligent Entry Logic with Risk Management
-• Advanced Entry Quality Engine with Tier System
 """
 
 import os, time, math, random, signal, sys, traceback, logging, json
@@ -45,7 +44,7 @@ SHADOW_MODE_DASHBOARD = False
 DRY_RUN = False
 
 # ==== Addon: Logging + Recovery Settings ====
-BOT_VERSION = "DOGE Council PRO v7.0 — Smart Money Concepts Pro + Advanced Council Decision + Entry Quality Engine"
+BOT_VERSION = "DOGE Council PRO v6.0 — Smart Money Concepts Pro + Advanced Council Decision"
 print("🔁 Booting:", BOT_VERSION, flush=True)
 
 STATE_PATH = "./bot_state.json"
@@ -67,25 +66,6 @@ INTERVAL   = os.getenv("INTERVAL", "15m")
 LEVERAGE   = int(os.getenv("LEVERAGE", 10))
 RISK_ALLOC = float(os.getenv("RISK_ALLOC", 0.60))
 POSITION_MODE = os.getenv("BINGX_POSITION_MODE", "oneway")
-
-# ================== ENTRY QUALITY ENGINE (TIERS) ==================
-
-# أوزان الطبقات
-TIER_A_WEIGHT = 4      # Golden / SMC قوي / Liquidity Sweep كبيرة
-TIER_B_WEIGHT = 2      # FVG / OB / VWAP / Structure / Flow
-TIER_C_WEIGHT = 1      # RSI / ADX / Candles
-
-# عتبات الدخول
-TREND_MIN_SCORE = 10      # أقل Score لصفقة ترند
-SCALP_MIN_SCORE = 5       # أقل Score لسكالب محترم
-
-TREND_NEED_TIER_A = True  # لازم إشارة Tier A لصفقة ترند
-SCALP_NEED_TIER_A = False # السكالب ممكن بدون Tier A لو النقاط كفاية
-
-# درجات الثقة المطلوبة لكل نمط
-CONFIDENCE_TREND_STRONG = 8.5
-CONFIDENCE_STUDIED_SCALP = 7.5
-CONFIDENCE_CAUTIOUS_SCALP = 6.5
 
 # RF Settings
 RF_SOURCE = "close"
@@ -960,248 +940,6 @@ def check_trend_alignment(analyses):
     except:
         return {"ok": False, "alignments": [], "strength": 0}
 
-# =================== ENTRY QUALITY ENGINE ===================
-def evaluate_entry_quality(mode, council_data, current_price=None):
-    """
-    تحوّل كل الإستراتيجيات (Golden / SMC / Liquidity / FVG / VWAP / RSI / ADX / Candles)
-    إلى Score واحد + سبب واضح في اللوج.
-    """
-    score = 0
-    tier_a_hits = []
-    tier_b_hits = []
-    tier_c_hits = []
-    
-    # استخراج البيانات من قرار المجلس المحسن
-    details = council_data.get('details', {})
-    golden = details.get('golden_zone', {})
-    smc_data = details.get('smc_analysis', {})
-    indicators = details.get('indicators', {})
-    price_structure = details.get('price_structure', {})
-    vwap_analysis = details.get('vwap_analysis', {})
-    footprint = details.get('footprint_analysis', {})
-    candles = details.get('candle_signals', {})
-    
-    # -------- Tier A: أقوى الإشارات (لازم واحد منها للترند) --------
-    
-    # Golden Zone قوية
-    if golden.get("ok") and golden.get("score", 0) >= 6:
-        score += TIER_A_WEIGHT * 2
-        zone_type = golden.get('zone', {}).get('type', 'unknown')
-        tier_a_hits.append(f"golden_{zone_type}({golden.get('score',0):.1f})")
-    
-    # SMC قوي (Liquidity Pools + Order Blocks قوية)
-    liquidity_pools = smc_data.get('liquidity_pools', {})
-    order_blocks = smc_data.get('order_blocks', [])
-    supply_demand = smc_data.get('supply_demand_zones', [])
-    
-    smc_strength = 0
-    if liquidity_pools.get('ok'):
-        pools = liquidity_pools
-        if len(pools.get('pivot_highs', [])) >= 2 or len(pools.get('pivot_lows', [])) >= 2:
-            smc_strength += 2
-    
-    if len(order_blocks) >= 2:
-        smc_strength += 2
-    
-    if len(supply_demand) >= 3:
-        avg_strength = sum([z.get('strength', 0) for z in supply_demand]) / len(supply_demand)
-        if avg_strength >= 3:
-            smc_strength += 2
-    
-    if smc_strength >= 5:
-        score += TIER_A_WEIGHT
-        tier_a_hits.append(f"smc_strong({smc_strength})")
-    
-    # Liquidity sweep واضح (تحليل مناطق السيولة)
-    current_liquidity = liquidity_pools.get('current_strength', {})
-    if current_liquidity.get('ok'):
-        if current_liquidity.get('near_supply') or current_liquidity.get('near_demand'):
-            score += TIER_A_WEIGHT
-            tier_a_hits.append(f"liq_sweep(zones={len(supply_demand)})")
-    
-    # -------- Tier B: إشارات قوية داعمة --------
-    
-    # FVG في نفس اتجاه الصفقة
-    fvgs = smc_data.get('fair_value_gaps', [])
-    if fvgs:
-        recent_fvg = fvgs[-1] if fvgs else {}
-        if recent_fvg.get('size_bps', 0) >= 8:  # FVG كبير
-            score += TIER_B_WEIGHT
-            tier_b_hits.append(f"fvg({recent_fvg.get('size_bps',0):.1f}bps)")
-    
-    # Order Block في نفس الإتجاه
-    if order_blocks:
-        recent_block = order_blocks[-1]
-        if recent_block.get('strength', 0) >= 3:
-            score += TIER_B_WEIGHT
-            tier_b_hits.append(f"ob_{recent_block.get('type','')}({recent_block.get('strength',0)})")
-    
-    # VWAP aligned
-    if vwap_analysis.get('ok') and vwap_analysis.get('aligned'):
-        score += TIER_B_WEIGHT
-        side = "above" if vwap_analysis.get('above_vwap') else "below"
-        tier_b_hits.append(f"vwap_{side}")
-    
-    # تدفّق السيولة (Footprint / Volume Analysis)
-    if footprint.get('ok'):
-        if footprint.get('volume_spike') or footprint.get('absorption_bull') or footprint.get('absorption_bear'):
-            score += TIER_B_WEIGHT
-            tier_b_hits.append(f"flow_spike")
-    
-    # هيكل السوق مع الإتجاه
-    if price_structure.get('ok'):
-        trend_strength = price_structure.get('trend_strength', 0)
-        if trend_strength >= 3:
-            score += TIER_B_WEIGHT
-            trend = price_structure.get('trend', 'sideways')
-            tier_b_hits.append(f"struct_{trend}({trend_strength})")
-    
-    # -------- Tier C: فلتر وتحسين (RSI / ADX / شموع) --------
-    
-    # RSI Context
-    rsi_value = indicators.get('rsi', 50)
-    if (rsi_value < 30 and mode in ['buy', 'trend_buy']) or (rsi_value > 70 and mode in ['sell', 'trend_sell']):
-        score += TIER_C_WEIGHT
-        tier_c_hits.append(f"rsi_extreme({rsi_value:.1f})")
-    elif 40 <= rsi_value <= 60:  # منطقة محايدة - جيدة للدخول
-        score += TIER_C_WEIGHT
-        tier_c_hits.append(f"rsi_neutral({rsi_value:.1f})")
-    
-    # ADX فوق حد معين
-    adx_value = indicators.get('adx', 0)
-    if adx_value >= 20:
-        score += TIER_C_WEIGHT
-        tier_c_hits.append(f"adx={adx_value:.1f}")
-    
-    # شمعة انعكاس/استمرار في نفس الإتجاه
-    candle_score_buy = candles.get('score_buy', 0)
-    candle_score_sell = candles.get('score_sell', 0)
-    candle_strength = max(candle_score_buy, candle_score_sell)
-    
-    if candle_strength >= 4:
-        score += TIER_C_WEIGHT
-        direction = "buy" if candle_score_buy > candle_score_sell else "sell"
-        tier_c_hits.append(f"candle_strong({candle_strength:.1f})_{direction}")
-    
-    # -------- قرار السماح بالدخول --------
-    has_tier_a = len(tier_a_hits) > 0
-    council_confidence = council_data.get('confidence_score', 0)
-
-    if mode == "trend":
-        need_tier_a = TREND_NEED_TIER_A
-        min_score = TREND_MIN_SCORE
-        # للترند نطلب ثقة عالية من المجلس
-        if council_confidence < CONFIDENCE_TREND_STRONG:
-            allow = False
-            reasons = [f"low_council_confidence({council_confidence:.1f} < {CONFIDENCE_TREND_STRONG})"]
-        else:
-            allow = True
-            reasons = []
-    else:  # scalp
-        need_tier_a = SCALP_NEED_TIER_A
-        min_score = SCALP_MIN_SCORE
-        allow = True
-        reasons = []
-
-    if score < min_score:
-        allow = False
-        reasons.append(f"low_score({score:.1f} < {min_score})")
-
-    if need_tier_a and not has_tier_a:
-        allow = False
-        reasons.append("no_tier_A_signal")
-
-    details = {
-        "score": score,
-        "tier_a": tier_a_hits,
-        "tier_b": tier_b_hits,
-        "tier_c": tier_c_hits,
-        "allow": allow,
-        "reasons": reasons,
-        "council_confidence": council_confidence,
-        "mode": mode
-    }
-    return details
-
-# =================== INTELLIGENT ENTRY LOGIC WITH QUALITY ENGINE ===================
-def enhanced_entry_logic_with_quality(council_decision, current_price):
-    """منطق دخول محسن مع نظام جودة الدخول"""
-    decision_level = council_decision['decision_level']
-    confidence = council_decision['confidence_score']
-    details = council_decision['details']
-    
-    # تحديد وضع التداول من قرار المجلس
-    if decision_level == "ترند":
-        mode = "trend"
-    elif decision_level == "سكالب مدروس":
-        mode = "studied_scalp" 
-    elif decision_level == "سكالب بحذر":
-        mode = "cautious_scalp"
-    else:
-        mode = "scalp"
-    
-    # تحديد اتجاه الدخول من تحليل المجلس
-    entry_signal = None
-    if details['golden_zone']['ok']:
-        zone_type = details['golden_zone']['zone']['type']
-        if zone_type == "golden_bottom":
-            entry_signal = "buy"
-        elif zone_type == "golden_top":
-            entry_signal = "sell"
-    
-    # إذا لم يكن هناك إشارة ذهبية، نستخدم تحليل الشموع والمؤشرات
-    if not entry_signal:
-        candle_score_buy = details['candle_signals']['score_buy']
-        candle_score_sell = details['candle_signals']['score_sell']
-        if candle_score_buy > candle_score_sell and candle_score_buy >= 4:
-            entry_signal = "buy"
-        elif candle_score_sell > candle_score_buy and candle_score_sell >= 4:
-            entry_signal = "sell"
-    
-    # إذا لم يكن هناك إشارة واضحة، ننتظر
-    if not entry_signal:
-        return {
-            "action": "wait", 
-            "confidence": 0, 
-            "reasons": ["لا توجد إشارة دخول واضحة"],
-            "trade_mode": None,
-            "quality_check": {"allow": False, "reasons": ["no_clear_signal"]}
-        }
-    
-    # 🔥 تطبيق نظام جودة الدخول الجديد
-    quality = evaluate_entry_quality(mode, council_decision, current_price)
-    
-    if not quality["allow"]:
-        return {
-            "action": "wait",
-            "confidence": confidence,
-            "reasons": quality["reasons"],
-            "trade_mode": None,
-            "quality_check": quality
-        }
-    
-    # ✅ إذا تم اجتياز فحص الجودة
-    trade_mode = mode
-    entry_confidence = min(confidence, quality["score"] / 10.0 * confidence)
-    
-    reasons = [
-        f"جودة دخول عالية: {quality['score']:.1f} نقطة",
-        f"إشارات Tier A: {', '.join(quality['tier_a']) or 'لا يوجد'}",
-        f"إشارات Tier B: {', '.join(quality['tier_b']) or 'لا يوجد'}", 
-        f"إشارات Tier C: {', '.join(quality['tier_c']) or 'لا يوجد'}"
-    ]
-    
-    return {
-        "action": entry_signal,
-        "confidence": entry_confidence,
-        "reasons": reasons,
-        "trade_mode": trade_mode,
-        "quality_check": quality
-    }
-
-# استبدال الدالة الأصلية
-enhanced_entry_logic = enhanced_entry_logic_with_quality
-
 # =================== VWAP & OTC ANALYSIS ===================
 def analyze_vwap_context(df, current_price):
     """تحليل سياق VWAP المتقدم"""
@@ -1304,6 +1042,82 @@ def analyze_otc_flow(df):
     except Exception as e:
         return {"ok": False, "significant": False, "why": str(e)}
 
+# =================== INTELLIGENT ENTRY LOGIC ===================
+def enhanced_entry_logic(council_decision, current_price):
+    """منطق دخول محسن بناء على قرارات مجلس الإدارة"""
+    decision_level = council_decision['decision_level']
+    confidence = council_decision['confidence_score']
+    details = council_decision['details']
+    
+    entry_signal = None
+    entry_confidence = 0
+    reasons = []
+    trade_mode = "scalp"  # default
+    
+    if decision_level == "تجنب":
+        return {
+            "action": "wait", 
+            "confidence": 0, 
+            "reasons": ["ثقة منخفضة - تجنب الدخول"],
+            "trade_mode": None
+        }
+    
+    # تحليل SMC للمناطق الذهبية
+    smc_signals = analyze_smc_for_entry(details['smc_analysis'], current_price)
+    
+    # الدخول بحذر للمناطق الذهبية ذات الثقة المتوسطة
+    if decision_level == "سكالب بحذر" and details['golden_zone']['ok']:
+        if details['golden_zone']['score'] >= 6.0 and smc_signals['alignment']:
+            entry_signal = "buy" if details['golden_zone']['zone']['type'] == "golden_bottom" else "sell"
+            entry_confidence = confidence
+            trade_mode = "cautious_scalp"
+            reasons.append("سكالب بحذر في منطقة ذهبية مع تأكيد SMC")
+    
+    # السكالب المدروس في المناطق الذهبية مع إشارات جيدة
+    elif decision_level == "سكالب مدروس":
+        golden_ok = details['golden_zone']['ok']
+        candle_strength = max(details['candle_signals']['score_buy'], details['candle_signals']['score_sell'])
+        
+        if golden_ok and candle_strength >= 4.0 and smc_signals['strong_confirmation']:
+            entry_signal = "buy" if details['golden_zone']['zone']['type'] == "golden_bottom" else "sell"
+            entry_confidence = confidence
+            trade_mode = "studied_scalp"
+            reasons.extend([
+                "سكالب مدروس في منطقة ذهبية",
+                f"قوة شموع: {candle_strength:.1f}",
+                "تأكيد SMC قوي"
+            ])
+    
+    # الترند القوي يحتاج ثقة عالية وإشارات متعددة
+    elif decision_level == "ترند" and confidence >= CONFIDENCE_TREND:
+        trend_alignment = check_trend_alignment(details)
+        if trend_alignment['ok'] and smc_signals['very_strong']:
+            # تحديد اتجاه الترند من الهيكل السعري
+            if details['price_structure']['ok']:
+                if details['price_structure']['trend'] == "uptrend":
+                    entry_signal = "buy"
+                elif details['price_structure']['trend'] == "downtrend":
+                    entry_signal = "sell"
+            
+            if entry_signal:
+                entry_confidence = confidence
+                trade_mode = "trend"
+                reasons.extend([
+                    "ترند قوي متعدد المؤشرات",
+                    f"ثقة مجلس الإدارة: {confidence:.1f}",
+                    f"محاذاة SMC: {trend_alignment['strength']} إشارات",
+                    f"هيكل سعري: {details['price_structure']['trend']}"
+                ])
+    
+    return {
+        "action": entry_signal if entry_signal else "wait",
+        "confidence": entry_confidence,
+        "reasons": reasons,
+        "trade_mode": trade_mode if entry_signal else None,
+        "decision_level": decision_level,
+        "smc_alignment": smc_signals
+    }
+
 # =================== DYNAMIC POSITION MANAGEMENT ===================
 def dynamic_position_management(state, council_decision, market_data):
     """إدارة ديناميكية متقدمة للمراكز"""
@@ -1390,9 +1204,9 @@ def adjust_take_profits_based_on_strength(state, council_decision):
     except:
         return SCALP_TPS if state.get("mode") != "trend" else TREND_TPS
 
-# =================== ENHANCED TRADE LOOP WITH QUALITY ENGINE ===================
+# =================== ENHANCED TRADE LOOP WITH SMART MONEY CONCEPTS ===================
 def trade_loop_enhanced_with_smc():
-    """حلقة تداول محسنة مع نظام جودة الدخول المتكامل"""
+    """حلقة تداول محسنة مع Smart Money Concepts المتكاملة"""
     global wait_for_next_signal_side
     loop_i = 0
     
@@ -1415,7 +1229,7 @@ def trade_loop_enhanced_with_smc():
             # Advanced Council Decision with Smart Money Concepts
             council_decision = council_pro_advanced_decision(df, px or info["price"])
             
-            # Enhanced Entry Logic with Quality Engine
+            # Enhanced Entry Logic
             entry_decision = enhanced_entry_logic(council_decision, px or info["price"])
             
             # Enhanced Snapshots with SMC
@@ -1444,7 +1258,7 @@ def trade_loop_enhanced_with_smc():
                     "liquidity_zones": council_decision['details']['smc_analysis'].get('liquidity_pools', {}).get('liquidity_zones', [])
                 })
             
-            # قرار الدخول المحسن مع نظام جودة الدخول
+            # قرار الدخول المحسن مع Smart Money Concepts
             reason = None
             if spread_bps is not None and spread_bps > MAX_SPREAD_BPS:
                 reason = f"spread too high ({fmt(spread_bps,2)}bps > {MAX_SPREAD_BPS})"
@@ -1452,19 +1266,7 @@ def trade_loop_enhanced_with_smc():
             sig = entry_decision["action"]
             trade_mode = entry_decision["trade_mode"]
             
-            # 🔥 تطبيق فحص الجودة النهائي قبل التنفيذ
             if not STATE["open"] and sig not in ["wait", None] and reason is None:
-                quality = entry_decision.get("quality_check", {})
-                
-                if not quality.get("allow", False):
-                    log_w(f"⛔ ENTRY BLOCKED | side={sig} mode={trade_mode} | "
-                          f"score={quality.get('score', 0):.1f} | "
-                          f"tierA={','.join(quality.get('tier_a', [])) or 'none'} | "
-                          f"reasons={','.join(quality.get('reasons', []))}")
-                    # تخطي هذه الصفقة والانتظار للإشارة التالية
-                    time.sleep(BASE_SLEEP)
-                    continue
-                
                 allow_wait, wait_reason = wait_gate_allow(df, info)
                 if not allow_wait:
                     reason = wait_reason
@@ -1477,13 +1279,6 @@ def trade_loop_enhanced_with_smc():
                         elif trade_mode == "studied_scalp":
                             qty = qty * 0.75  # 75% position size for studied scalp
                         # trend mode uses full position size
-                        
-                        # ✅ تسجيل نجاح فحص الجودة
-                        log_i(f"✅ ENTRY PASSED | side={sig} mode={trade_mode} | "
-                              f"score={quality.get('score', 0):.1f} | "
-                              f"tierA={','.join(quality.get('tier_a', [])) or 'none'} | "
-                              f"tierB={','.join(quality.get('tier_b', [])) or 'none'} | "
-                              f"tierC={','.join(quality.get('tier_c', [])) or 'none'}")
                         
                         ok = open_market_enhanced_with_smc(sig, qty, px or info["price"], trade_mode, council_decision)
                         if ok:
@@ -1516,9 +1311,8 @@ def log_council_decision(council_decision, entry_decision):
         decision_level = council_decision['decision_level']
         confidence = council_decision['confidence_score']
         action = entry_decision['action']
-        quality = entry_decision.get('quality_check', {})
         
-        print(f"🏛️ COUNCIL DECISION: {decision_level} | Confidence: {confidence:.1f}/10 | Action: {action} | Quality Score: {quality.get('score', 0):.1f}", flush=True)
+        print(f"🏛️ COUNCIL DECISION: {decision_level} | Confidence: {confidence:.1f}/10 | Action: {action}", flush=True)
         
         # تفاصيل SMC
         smc_data = council_decision['details']['smc_analysis']
@@ -1599,9 +1393,8 @@ def emit_snapshots_enhanced(exchange, symbol, df, council_decision, entry_decisi
             # Council Decision Summary
             cd = council_decision
             ed = entry_decision
-            quality = ed.get('quality_check', {})
             
-            print(f"🏛️ COUNCIL | {cd['decision_level']} | Confidence: {cd['confidence_score']:.1f}/10 | Action: {ed['action']} | Quality: {quality.get('score', 0):.1f}", flush=True)
+            print(f"🏛️ COUNCIL | {cd['decision_level']} | Confidence: {cd['confidence_score']:.1f}/10 | Action: {ed['action']}", flush=True)
             
             # SMC Summary
             smc = cd['details']['smc_analysis']
@@ -1610,10 +1403,6 @@ def emit_snapshots_enhanced(exchange, symbol, df, council_decision, entry_decisi
                 print(f"💧 LIQUIDITY | Pivot Highs: {len(lp['pivot_highs'])} | Pivot Lows: {len(lp['pivot_lows'])}", flush=True)
             
             print(f"📊 SMC ZONES | Supply/Demand: {len(smc['supply_demand_zones'])} | FVGs: {len(smc['fair_value_gaps'])} | Order Blocks: {len(smc['order_blocks'])}", flush=True)
-            
-            # Quality Engine Summary
-            if quality:
-                print(f"🎯 QUALITY | Score: {quality.get('score', 0):.1f} | Tier A: {len(quality.get('tier_a', []))} | Tier B: {len(quality.get('tier_b', []))} | Tier C: {len(quality.get('tier_c', []))}", flush=True)
             
             # Trading Context
             if ed['action'] != 'wait':
@@ -1663,11 +1452,9 @@ def verify_execution_environment():
     print(f"⚙️ ENHANCED EXECUTION ENVIRONMENT", flush=True)
     print(f"🔧 EXECUTE_ORDERS: {EXECUTE_ORDERS} | SHADOW_MODE: {SHADOW_MODE_DASHBOARD} | DRY_RUN: {DRY_RUN}", flush=True)
     print(f"🏛️ ADVANCED COUNCIL: Confidence Levels [Avoid<{CONFIDENCE_AVOID}, Cautious<{CONFIDENCE_CAUTIOUS_SCALP}, Studied<{CONFIDENCE_STUDIED_SCALP}, Trend>={CONFIDENCE_TREND}]", flush=True)
-    print(f"🎯 ENTRY QUALITY ENGINE: Tier System [A={TIER_A_WEIGHT}, B={TIER_B_WEIGHT}, C={TIER_C_WEIGHT}]", flush=True)
-    print(f"🎯 MIN SCORES: Trend={TREND_MIN_SCORE}, Scalp={SCALP_MIN_SCORE}", flush=True)
     print(f"💧 SMART MONEY CONCEPTS: Liquidity Pools + Order Blocks + FVGs + Supply/Demand", flush=True)
     print(f"📊 PRICE STRUCTURE: HH/HL/LH/LL Analysis + Trend Strength", flush=True)
-    print(f"🎯 INTELLIGENT ENTRY: Studied Scalp + Trend Recognition + Quality Filter", flush=True)
+    print(f"🎯 INTELLIGENT ENTRY: Studied Scalp + Trend Recognition", flush=True)
     
     if not EXECUTE_ORDERS:
         print("🟡 WARNING: EXECUTE_ORDERS=False - البوت في وضع التحليل فقط!", flush=True)
@@ -1676,7 +1463,7 @@ def verify_execution_environment():
 
 # =================== MAIN EXECUTION ===================
 if __name__ == "__main__":
-    log_banner("ADVANCED COUNCIL PRO - SMART MONEY CONCEPTS + ENTRY QUALITY ENGINE")
+    log_banner("ADVANCED COUNCIL PRO - SMART MONEY CONCEPTS")
     state = load_state() or {}
     state.setdefault("in_position", False)
 
@@ -1690,15 +1477,13 @@ if __name__ == "__main__":
 
     print(colored(f"MODE: {'LIVE' if MODE_LIVE else 'PAPER'}  •  {SYMBOL}  •  {INTERVAL}", "yellow"))
     print(colored(f"RISK: {int(RISK_ALLOC*100)}% × {LEVERAGE}x  •  COUNCIL_PRO=ADVANCED_SMC", "yellow"))
-    print(colored(f"ENTRY QUALITY: Tier System [A={TIER_A_WEIGHT}, B={TIER_B_WEIGHT}, C={TIER_C_WEIGHT}]", "yellow"))
-    print(colored(f"MIN SCORES: Trend={TREND_MIN_SCORE}, Scalp={SCALP_MIN_SCORE}", "yellow"))
     print(colored(f"SMART MONEY: Liquidity Pools + Order Blocks + FVGs + Supply/Demand", "yellow"))
     print(colored(f"PRICE STRUCTURE: Advanced HH/HL/LH/LL Analysis", "yellow"))
-    print(colored(f"INTELLIGENT ENTRY: Studied Scalp + Trend Recognition + Quality Filter", "yellow"))
+    print(colored(f"INTELLIGENT ENTRY: Studied Scalp + Trend Recognition", "yellow"))
     print(colored(f"CONFIDENCE LEVELS: Avoid({CONFIDENCE_AVOID}) | Cautious({CONFIDENCE_CAUTIOUS_SCALP}) | Studied({CONFIDENCE_STUDIED_SCALP}) | Trend({CONFIDENCE_TREND})", "yellow"))
     print(colored(f"EXECUTION: {'ACTIVE' if EXECUTE_ORDERS and not DRY_RUN else 'SIMULATION'}", "yellow"))
     
-    logging.info("advanced council pro with smart money concepts and entry quality engine starting…")
+    logging.info("advanced council pro with smart money concepts starting…")
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
     signal.signal(signal.SIGINT,  lambda *_: sys.exit(0))
     
