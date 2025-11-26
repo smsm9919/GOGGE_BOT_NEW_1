@@ -47,6 +47,18 @@ INTERVAL   = os.getenv("INTERVAL", "15m")
 LEVERAGE   = int(os.getenv("LEVERAGE", 10))
 RISK_ALLOC = float(os.getenv("RISK_ALLOC", 0.60))
 
+# =================== POSITION MANAGEMENT SETTINGS ===================
+MIN_QTY = 30
+FINAL_CHUNK_QTY = 50
+CLOSE_RETRY_ATTEMPTS = 3
+CLOSE_VERIFY_WAIT_S = 1
+RESUME_LOOKBACK_SECS = 3600  # ساعة واحدة
+
+# إعدادات إدارة الصفقة
+TP1_PCT_BASE = 0.5  # 0.5%
+TP1_CLOSE_FRAC = 0.3  # إغلاق 30% عند TP1
+BREAKEVEN_AFTER = 0.3  # تفعيل Breakeven بعد تحقيق 0.3% ربح
+
 # =================== STRATEGY CONFIGURATION ===================
 TRADE_MIN_CONFIDENCE = 75
 STRONG_TRADE_CONFIDENCE = 85
@@ -681,6 +693,310 @@ def intelligent_trailing_stop(current_price, pnl_pct, management_config, df):
         log_w(f"intelligent_trailing_stop error: {e}")
         return "hold"
 
+# =================== EXCHANGE / POSITION API (from old DOGE bot) ===================
+
+def _normalize_side(pos):
+    side = pos.get("side") or pos.get("positionSide") or ""
+    if side:
+        return side.upper()
+    qty = float(pos.get("contracts") or pos.get("positionAmt") or pos.get("size") or 0)
+    return "LONG" if qty > 0 else ("SHORT" if qty < 0 else "")
+
+def fetch_live_position(exchange, symbol: str):
+    """Read live position from exchange (generic for ccxt)."""
+    try:
+        if hasattr(exchange, "fetch_positions"):
+            arr = exchange.fetch_positions([symbol])
+            for p in arr or []:
+                sym = p.get("symbol") or p.get("info", {}).get("symbol")
+                if sym and symbol.replace(":", "") in sym.replace(":", ""):
+                    side = _normalize_side(p)
+                    qty = abs(float(
+                        p.get("contracts")
+                        or p.get("positionAmt")
+                        or p.get("info", {}).get("size", 0)
+                        or 0
+                    ))
+                    if qty > 0:
+                        entry = float(p.get("entryPrice") or p.get("info", {}).get("entryPrice") or 0.0)
+                        lev   = float(p.get("leverage") or p.get("info", {}).get("leverage") or 0.0)
+                        unr   = float(p.get("unrealizedPnl") or 0.0)
+                        return {
+                            "ok": True,
+                            "side": side,
+                            "qty": qty,
+                            "entry": entry,
+                            "unrealized": unr,
+                            "leverage": lev,
+                            "raw": p,
+                        }
+        if hasattr(exchange, "fetch_position"):
+            p = exchange.fetch_position(symbol)
+            side = _normalize_side(p)
+            qty  = abs(float(p.get("size") or 0))
+            if qty > 0:
+                entry = float(p.get("entryPrice") or 0.0)
+                lev   = float(p.get("leverage") or 0.0)
+                unr   = float(p.get("unrealizedPnl") or 0.0)
+                return {"ok": True, "side": side, "qty": qty, "entry": entry, "unrealized": unr, "leverage": lev, "raw": p}
+    except Exception as e:
+        log_w(f"fetch_live_position error: {e}")
+    return {"ok": False, "why": "no_open_position"}
+
+def resume_open_position(exchange, symbol: str, state: dict) -> dict:
+    """Try to resume open position after restart."""
+    if not RESUME_ON_RESTART:
+        log_i("resume disabled")
+        return state
+
+    live = fetch_live_position(exchange, symbol)
+    if not live.get("ok"):
+        log_i("no live position to resume")
+        return state
+
+    ts = int(time.time())
+    prev = load_state() or {}
+    if prev.get("ts") and (ts - int(prev["ts"])) > RESUME_LOOKBACK_SECS:
+        log_w("found old local state — will override with exchange live snapshot")
+
+    state.update({
+        "open": True,
+        "side": live["side"].lower(),      # long/short
+        "entry": live["entry"],
+        "size": live["qty"],
+        "qty": live["qty"],
+    })
+    STATE["open"] = True
+    STATE["side"] = live["side"].lower()
+    STATE["entry"] = live["entry"]
+    STATE["size"] = live["qty"]
+    STATE["qty"] = live["qty"]
+    log_i(f"RESUMED position from exchange: side={STATE['side']} qty={STATE['qty']} entry={STATE['entry']}")
+    return state
+
+# =================== SIZE / POSITION HELPERS ===================
+
+def safe_qty(qty: float) -> float:
+    """Clamp quantity to exchange precision + avoid tiny dust."""
+    try:
+        q = float(qty)
+    except Exception:
+        return 0.0
+    if q <= 0:
+        return 0.0
+    # BingX DOGE الحد الأدنى عادة 1
+    return max(round(q), 0.0)
+
+def _read_position():
+    """Read position from STATE first, fallback to exchange if needed."""
+    try:
+        if STATE.get("open") and STATE.get("qty", 0) > 0:
+            return STATE["qty"], STATE["side"], STATE["entry"]
+        live = fetch_live_position(ex, SYMBOL)
+        if live.get("ok"):
+            side = "long" if live["side"] == "LONG" else "short"
+            return live["qty"], side, live["entry"]
+    except Exception as e:
+        log_w(f"_read_position error: {e}")
+    return 0.0, None, None
+
+def compute_size(balance: float, price: float) -> float:
+    """
+    Fixed risk: RISK_ALLOC × balance × LEVERAGE, converted to qty.
+    Same spirit as old DOGE bot.
+    """
+    if balance <= 0 or price <= 0:
+        return 0.0
+    notional = balance * RISK_ALLOC * LEVERAGE
+    qty = notional / price
+    if qty < MIN_QTY:
+        qty = MIN_QTY
+    return safe_qty(qty)
+
+# =================== ORDER EXECUTION (OPEN / CLOSE) ===================
+
+def _params_open(side: str):
+    """Exchange-specific params for opening a position."""
+    return {"positionSide": "LONG" if side == "buy" else "SHORT"}
+
+def _params_close():
+    """Params for closing (reduceOnly, etc.)."""
+    return {"reduceOnly": True}
+
+def open_market_enhanced(side: str, qty: float, price: float = None, reason: str = "COUNCIL"):
+    """
+    Unified market order open with logging + STATE update.
+    side = 'buy' (long) أو 'sell' (short)
+    """
+    global STATE
+    qty = safe_qty(qty)
+    if qty <= 0:
+        log_w("open_market_enhanced: qty<=0, skip")
+        return False
+
+    if STATE.get("open"):
+        log_w("open_market_enhanced: already in position, skip")
+        return False
+
+    order_side = side.lower()
+    params = _params_open(order_side)
+    try:
+        if MODE_LIVE and EXECUTE_ORDERS and not DRY_RUN:
+            ex.create_order(SYMBOL, "market", order_side, qty, None, params)
+        px = price or (price_now() or 0.0)
+        STATE.update({
+            "open": True,
+            "side": "long" if order_side == "buy" else "short",
+            "entry": px,
+            "size": qty,
+            "qty": qty,
+            "pnl": 0.0,
+            "bars": 0,
+            "trail": None,
+            "breakeven": None,
+            "tp1_done": False,
+            "highest_profit_pct": 0.0,
+            "profit_targets_achieved": 0,
+            "trail_tightened": False,
+            "partial_taken": False,
+        })
+        save_state(STATE)
+        log_i(f"✅ OPEN {STATE['side'].upper()} qty={qty:.4f} px={px:.6f} reason={reason}")
+        return True
+    except Exception as e:
+        log_e(f"❌ open_market_enhanced error: {e}")
+        return False
+
+def close_market_strict(reason: str = "STRICT"):
+    """
+    Strict full close with retries + compound_pnl update.
+    """
+    global compound_pnl
+    exch_qty, exch_side, exch_entry = _read_position()
+    if exch_qty <= 0:
+        if STATE.get("open"):
+            _reset_after_close(reason)
+        return
+
+    side_to_close = "sell" if exch_side == "long" else "buy"
+    qty_to_close  = safe_qty(exch_qty)
+    attempts = 0
+    last_error = None
+
+    while attempts < CLOSE_RETRY_ATTEMPTS:
+        try:
+            if MODE_LIVE and EXECUTE_ORDERS and not DRY_RUN:
+                params = _params_close()
+                ex.create_order(SYMBOL, "market", side_to_close, qty_to_close, None, params)
+            time.sleep(CLOSE_VERIFY_WAIT_S)
+            left_qty, _, _ = _read_position()
+            if left_qty <= 0:
+                px = price_now() or STATE.get("entry") or exch_entry
+                entry_px = STATE.get("entry") or exch_entry or px
+                side = STATE.get("side") or exch_side or ("long" if side_to_close == "sell" else "short")
+                qty = exch_qty
+                pnl_pct = (px - entry_px) / entry_px * 100 * (1 if side == "long" else -1)
+                compound_pnl += pnl_pct
+                log_i(f"STRICT CLOSE {side} reason={reason} pnl={pnl_pct:.2f}% total={compound_pnl:.2f}%")
+                _reset_after_close(reason, prev_side=side)
+                return
+            qty_to_close = safe_qty(left_qty)
+            attempts += 1
+            log_w(f"strict close retry {attempts}/{CLOSE_RETRY_ATTEMPTS} — residual={left_qty:.4f}")
+            time.sleep(CLOSE_VERIFY_WAIT_S)
+        except Exception as e:
+            last_error = e
+            log_e(f"close_market_strict attempt {attempts+1}: {e}")
+            attempts += 1
+            time.sleep(CLOSE_VERIFY_WAIT_S)
+
+    log_e(f"STRICT CLOSE FAILED after {CLOSE_RETRY_ATTEMPTS} attempts — last error: {last_error}")
+
+def close_position_partial(close_fraction: float, why: str = "partial"):
+    """
+    Simple partial close using reduceOnly market orders.
+    close_fraction = نسبة الكمية (مثلاً 0.3 = 30%)
+    """
+    if not STATE.get("open") or STATE.get("qty", 0) <= 0:
+        return
+    qty = STATE["qty"]
+    partial_qty = safe_qty(qty * close_fraction)
+    if partial_qty <= 0:
+        return
+
+    close_side = "sell" if STATE["side"] == "long" else "buy"
+    try:
+        if MODE_LIVE and EXECUTE_ORDERS and not DRY_RUN:
+            ex.create_order(SYMBOL, "market", close_side, partial_qty, None, _params_close())
+        STATE["qty"] = safe_qty(qty - partial_qty)
+        STATE["size"] = STATE["qty"]
+        log_i(f"✅ PARTIAL CLOSE {partial_qty:.4f} | {why}")
+    except Exception as e:
+        log_e(f"❌ close_position_partial error: {e}")
+
+def _reset_after_close(reason: str, prev_side: str = None):
+    """Reset STATE after closing a position."""
+    global STATE
+    STATE.update({
+        "open": False,
+        "side": None,
+        "entry": 0.0,
+        "size": 0.0,
+        "qty": 0.0,
+        "pnl": 0.0,
+        "bars": 0,
+        "trail": None,
+        "breakeven": None,
+        "tp1_done": False,
+        "highest_profit_pct": 0.0,
+        "profit_targets_achieved": 0,
+        "trail_tightened": False,
+        "partial_taken": False,
+        "trailing_active": False,
+        "breakeven_activated": False,
+    })
+    save_state(STATE)
+    log_i(f"🔄 STATE reset after close: {reason} (prev_side={prev_side})")
+
+# =================== ENHANCED POSITION MANAGEMENT ===================
+
+def manage_after_entry_enhanced(df, current_price, council_decision):
+    """Basic smart management using pnl%, TP1, breakeven, trail and smart exit."""
+    if not STATE.get("open") or STATE.get("qty", 0) <= 0:
+        return "hold"
+
+    px    = current_price
+    entry = STATE["entry"]
+    side  = STATE["side"]
+    qty   = STATE["qty"]
+
+    pnl_pct = (px - entry) / entry * 100 * (1 if side == "long" else -1)
+    STATE["pnl"] = pnl_pct
+    if pnl_pct > STATE.get("highest_profit_pct", 0.0):
+        STATE["highest_profit_pct"] = pnl_pct
+
+    # TP1 بسيط
+    if not STATE.get("tp1_done") and pnl_pct >= TP1_PCT_BASE:
+        close_position_partial(TP1_CLOSE_FRAC, why=f"TP1 {TP1_PCT_BASE:.2f}%")
+        STATE["tp1_done"] = True
+        STATE["profit_targets_achieved"] = STATE.get("profit_targets_achieved", 0) + 1
+        return "partial_close"
+
+    # Breakeven
+    if not STATE.get("breakeven_armed") and pnl_pct >= BREAKEVEN_AFTER:
+        STATE["breakeven_armed"] = True
+        STATE["breakeven"] = entry
+        STATE["current_sl"] = entry
+        log_i("🔒 BREAKEVEN ARMED")
+
+    # وقف خسارة صارم
+    if pnl_pct <= -3.0:  # -3% خسارة
+        log_w("🚨 HARD STOP: pnl<=-3%")
+        close_market_strict("hard_stop_loss")
+        return "close"
+
+    return "hold"
+
 # =================== SUPREME TRADE EXECUTION ===================
 def execute_supreme_trade(action, qty, price, position_info, council_decision):
     """تنفيذ الصفقة العليا - الإصدار النهائي"""
@@ -717,6 +1033,7 @@ def execute_supreme_trade(action, qty, price, position_info, council_decision):
             "side": action,
             "entry": price,
             "size": qty,
+            "qty": qty,
             "pnl": 0,
             "trade_type": position_info["trade_type"],
             "management_config": position_info["management_config"],
@@ -741,104 +1058,6 @@ def execute_supreme_trade(action, qty, price, position_info, council_decision):
     except Exception as e:
         log_e(f"execute_supreme_trade error: {e}")
         return False
-
-# =================== MAIN TRADING LOOP ===================
-def supreme_trade_loop():
-    """حلقة التداول العليا - الذكاء المتكامل"""
-    global STATE, compound_pnl
-    
-    loop_i = 0
-    
-    while True:
-        try:
-            # جمع البيانات الشاملة
-            bal = balance_usdt()
-            px = price_now()
-            df = fetch_ohlcv()
-            orderbook = fetch_orderbook()
-            
-            if df.empty:
-                log_w("No data fetched, skipping iteration")
-                time.sleep(5)
-                continue
-            
-            # حساب المؤشرات
-            indicators = compute_indicators(df)
-            
-            # قرار المجلس الأعلى
-            council_decision = supreme_council_decision(df, px, orderbook)
-            
-            # 🎯 التسجيل المحترف
-            if loop_i % 3 == 0:
-                try:
-                    trade_rec = council_decision["final_decision"]
-                    action = trade_rec.get("action", "wait")
-                    trade_type = trade_rec.get("trade_type", "scalp")
-                    confidence = council_decision.get("confidence_score", 0)
-                    
-                    # حساب الأصوات
-                    strategies = council_decision.get("strategies", {})
-                    votes_for = sum(1 for s in strategies.values() if s.get('score', 0) >= 7)
-                    votes_against = len(strategies) - votes_for
-                    
-                    # بيانات Bookmap و Flow
-                    bookmap_data = {
-                        "imbalance": council_decision.get("strategies", {}).get("market_flow", {}).get("orderbook_imbalance", 1.0),
-                        "bids": orderbook.get('bids', [])[:3] if orderbook else [],
-                        "asks": orderbook.get('asks', [])[:3] if orderbook else []
-                    }
-                    
-                    flow_data = {
-                        "flow": council_decision.get("strategies", {}).get("market_flow", {}).get("orderbook_imbalance", 0) * 10000,
-                        "delta": council_decision.get("strategies", {}).get("market_flow", {}).get("orderbook_imbalance", 0) * 5000,
-                        "z_score": 0,
-                        "cvd": council_decision.get("strategies", {}).get("market_flow", {}).get("orderbook_imbalance", 0) * 100000
-                    }
-                    
-                    # 🔥 التسجيل بالشكل المطلوب
-                    log_strategy_line(action, trade_type, bal or 0, compound_pnl or 0)
-                    log_snap_line(action, votes_for, votes_against, confidence/10, 
-                                indicators.get('adx',0), indicators.get('plus_di',0)-indicators.get('minus_di',0),
-                                0, bookmap_data.get("imbalance",1.0))
-                    log_addons_live()
-                    log_bookmap_line(bookmap_data)
-                    flow_side = log_flow_line(flow_data)
-                    log_dash_hint_line(flow_side or action, council_decision, indicators)
-                    
-                except Exception as e:
-                    log_w(f"Professional logging error: {e}")
-            
-            # إدارة الصفقة المفتوحة
-            if STATE["open"]:
-                position_info = intelligent_position_management(council_decision, px, bal)
-                exit_signal = ai_exit_strategy(df, px, position_info, council_decision)
-                
-                if exit_signal == "close":
-                    close_position()
-                    log_g("🎯 AI Exit Strategy - Position Closed")
-                    continue
-            
-            # قرار الدخول الجديد
-            trade_rec = council_decision["final_decision"]
-            
-            if not STATE["open"] and trade_rec["action"] != "wait":
-                if council_decision["confidence_score"] >= TRADE_MIN_CONFIDENCE:
-                    position_info = intelligent_position_management(council_decision, px, bal)
-                    qty = position_info["position_size"]
-                    
-                    if qty > 0:
-                        success = execute_supreme_trade(trade_rec["action"], qty, px, position_info, council_decision)
-                        if success:
-                            log_g("🚀 SUPREME TRADE EXECUTED - AI Powered Entry")
-                    else:
-                        log_w(f"⚠️ Quantity too small: {qty}")
-            
-            loop_i += 1
-            time.sleep(5)
-            
-        except Exception as e:
-            log_e(f"supreme_trade_loop error: {e}\n{traceback.format_exc()}")
-            time.sleep(10)
 
 # =================== BASIC EXCHANGE FUNCTIONS ===================
 def fetch_ohlcv(limit=100):
@@ -916,14 +1135,6 @@ def close_position():
     except Exception as e:
         log_e(f"close_position error: {e}")
 
-def _params_open(side):
-    """معلمات فتح الصفقة"""
-    return {"positionSide": "LONG" if side == "buy" else "SHORT"}
-
-def _params_close():
-    """معلمات إغلاق الصفقة"""
-    return {"positionSide": "LONG" if STATE["side"] == "short" else "SHORT"}
-
 # =================== EXCHANGE SETUP ===================
 try:
     ex = ccxt.bingx({
@@ -942,6 +1153,7 @@ STATE = {
     "side": None,
     "entry": 0,
     "size": 0,
+    "qty": 0,
     "pnl": 0,
     "trade_type": "scalp",
     "management_config": None,
@@ -953,10 +1165,130 @@ STATE = {
     "highest_price": 0,
     "lowest_price": 0,
     "current_sl": 0,
-    "breakeven_activated": False
+    "breakeven_activated": False,
+    "bars": 0,
+    "trail": None,
+    "breakeven": None,
+    "tp1_done": False,
+    "highest_profit_pct": 0.0,
+    "profit_targets_achieved": 0,
+    "trail_tightened": False,
+    "partial_taken": False,
+    "breakeven_armed": False,
 }
 
 compound_pnl = 0.0
+
+# محاولة استئناف البوزيشن المفتوح من المنصة
+STATE = resume_open_position(ex, SYMBOL, STATE)
+
+# =================== MAIN TRADING LOOP ===================
+def supreme_trade_loop():
+    """حلقة التداول العليا - الذكاء المتكامل"""
+    global STATE, compound_pnl
+    
+    loop_i = 0
+    
+    while True:
+        try:
+            # جمع البيانات الشاملة
+            bal = balance_usdt()
+            px = price_now()
+            df = fetch_ohlcv()
+            orderbook = fetch_orderbook()
+            
+            if df.empty:
+                log_w("No data fetched, skipping iteration")
+                time.sleep(5)
+                continue
+            
+            # حساب المؤشرات
+            indicators = compute_indicators(df)
+            
+            # قرار المجلس الأعلى
+            council_decision = supreme_council_decision(df, px, orderbook)
+            
+            # 🎯 التسجيل المحترف
+            if loop_i % 3 == 0:
+                try:
+                    trade_rec = council_decision["final_decision"]
+                    action = trade_rec.get("action", "wait")
+                    trade_type = trade_rec.get("trade_type", "scalp")
+                    confidence = council_decision.get("confidence_score", 0)
+                    
+                    # حساب الأصوات
+                    strategies = council_decision.get("strategies", {})
+                    votes_for = sum(1 for s in strategies.values() if s.get('score', 0) >= 7)
+                    votes_against = len(strategies) - votes_for
+                    
+                    # بيانات Bookmap و Flow
+                    bookmap_data = {
+                        "imbalance": council_decision.get("strategies", {}).get("market_flow", {}).get("orderbook_imbalance", 1.0),
+                        "bids": orderbook.get('bids', [])[:3] if orderbook else [],
+                        "asks": orderbook.get('asks', [])[:3] if orderbook else []
+                    }
+                    
+                    flow_data = {
+                        "flow": council_decision.get("strategies", {}).get("market_flow", {}).get("orderbook_imbalance", 0) * 10000,
+                        "delta": council_decision.get("strategies", {}).get("market_flow", {}).get("orderbook_imbalance", 0) * 5000,
+                        "z_score": 0,
+                        "cvd": council_decision.get("strategies", {}).get("market_flow", {}).get("orderbook_imbalance", 0) * 100000
+                    }
+                    
+                    # 🔥 التسجيل بالشكل المطلوب
+                    log_strategy_line(action, trade_type, bal or 0, compound_pnl or 0)
+                    log_snap_line(action, votes_for, votes_against, confidence/10, 
+                                indicators.get('adx',0), indicators.get('plus_di',0)-indicators.get('minus_di',0),
+                                0, bookmap_data.get("imbalance",1.0))
+                    log_addons_live()
+                    log_bookmap_line(bookmap_data)
+                    flow_side = log_flow_line(flow_data)
+                    log_dash_hint_line(flow_side or action, council_decision, indicators)
+                    
+                except Exception as e:
+                    log_w(f"Professional logging error: {e}")
+            
+            # إدارة الصفقة المفتوحة
+            if STATE["open"]:
+                # استخدام نظام الإدارة المحسن
+                exit_signal = manage_after_entry_enhanced(df, px, council_decision)
+                
+                if exit_signal == "close":
+                    close_market_strict("smart_management_exit")
+                    log_g("🎯 Smart Management - Position Closed")
+                    continue
+            
+            # قرار الدخول الجديد
+            trade_rec = council_decision["final_decision"]
+            
+            if not STATE["open"] and trade_rec["action"] != "wait":
+                if council_decision["confidence_score"] >= TRADE_MIN_CONFIDENCE:
+                    # استخدام compute_size الموحدة من البوت القديم
+                    qty = compute_size(bal, px)
+                    
+                    if qty > 0:
+                        # استخدام open_market_enhanced بدلاً من execute_supreme_trade
+                        success = open_market_enhanced(trade_rec["action"], qty, px, reason="COUNCIL_PRO_TIER")
+                        if success:
+                            # تحديث معلومات إضافية في STATE
+                            STATE.update({
+                                "trade_type": trade_rec.get("trade_type", "scalp"),
+                                "management_config": intelligent_position_management(council_decision, px, bal)["management_config"],
+                                "entry_council": council_decision,
+                                "entry_time": time.time(),
+                            })
+                            log_g("🚀 SUPREME TRADE EXECUTED - AI Powered Entry")
+                            log_g(f"📊 Trade Type: {trade_rec.get('trade_type', 'scalp').upper()}")
+                            log_g(f"💪 Confidence: {council_decision['confidence_score']:.1f}%")
+                    else:
+                        log_w(f"⚠️ Quantity too small: {qty}")
+            
+            loop_i += 1
+            time.sleep(5)
+            
+        except Exception as e:
+            log_e(f"supreme_trade_loop error: {e}\n{traceback.format_exc()}")
+            time.sleep(10)
 
 # =================== FLASK APP ===================
 app = Flask(__name__)
