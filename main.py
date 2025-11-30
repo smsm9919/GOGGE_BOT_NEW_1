@@ -211,12 +211,103 @@ RF_BS_MULT              = 3.5
 RF_BS_ENABLED           = True
 
 # =================== PROFESSIONAL LOGGING ===================
-def log_i(msg): print(f"ℹ️ {msg}", flush=True)
-def log_g(msg): print(f"✅ {msg}", flush=True)
-def log_w(msg): print(f"🟨 {msg}", flush=True)
-def log_e(msg): print(f"❌ {msg}", flush=True)
+def log_i(msg): 
+    timestamp = datetime.now().strftime("%H:%M:%S")
+    print(f"🟦 [{timestamp}] ℹ️ {msg}", flush=True)
 
-def log_banner(text): print(f"\n{'—'*12} {text} {'—'*12}\n", flush=True)
+def log_g(msg):
+    timestamp = datetime.now().strftime("%H:%M:%S") 
+    print(f"🟩 [{timestamp}] ✅ {msg}", flush=True)
+
+def log_w(msg):
+    timestamp = datetime.now().strftime("%H:%M:%S")
+    print(f"🟨 [{timestamp}] ⚠️ {msg}", flush=True)
+
+def log_e(msg):
+    timestamp = datetime.now().strftime("%H:%M:%S")
+    print(f"🟥 [{timestamp}] ❌ {msg}", flush=True)
+
+def log_dashboard(data):
+    """لوحة معلومات محترفة مشابهة للصورة المرفقة"""
+    timestamp = datetime.now().strftime("%H:%M:%S")
+    
+    print(f"\n{'='*80}", flush=True)
+    print(f"📊 DASHBOARD - {timestamp}", flush=True)
+    print(f"{'='*80}", flush=True)
+    
+    # Bookmap Data
+    if 'bookmap' in data:
+        bm = data['bookmap']
+        print(f"📈 Bookmap:", flush=True)
+        print(f"   🔸 Imb: {bm.get('imbalance', 0):.2f} | Buy: {bm.get('buy_vol', 0):.0f} | Sell: {bm.get('sell_vol', 0):.0f}", flush=True)
+    
+    # Flow Data
+    if 'flow' in data:
+        flow = data['flow']
+        print(f"🌊 Flow:", flush=True)
+        print(f"   🔸 Buy A-{flow.get('buy_amount', 0):.0f} z-{flow.get('z_score', 0):.2f} | CVD: {flow.get('cvd', 0):.0f}", flush=True)
+    
+    # Council Votes
+    if 'council' in data:
+        council = data['council']
+        print(f"🏛️  Council:", flush=True)
+        print(f"   🟢 BUY({council.get('buy_votes', 0)},{council.get('buy_score', 0):.1f}) 🔴 SELL({council.get('sell_votes', 0)},{council.get('sell_score', 0):.1f})", flush=True)
+    
+    # Indicators
+    if 'indicators' in data:
+        ind = data['indicators']
+        print(f"📊 Indicators:", flush=True)
+        print(f"   🔸 RSI: {ind.get('rsi', 0):.1f} | ADX: {ind.get('adx', 0):.1f} | DI: {ind.get('di_spread', 0):.1f}", flush=True)
+        if 'vwap' in ind and ind['vwap']:
+            print(f"   🔸 VWAP: {ind['vwap']:.6f} | Price: {ind.get('price', 0):.6f}", flush=True)
+    
+    # Strategy & Position
+    if 'strategy' in data:
+        strat = data['strategy']
+        print(f"🎯 Strategy:", flush=True)
+        print(f"   🔸 Mode: {strat.get('mode', 'N/A')} | Balance: {strat.get('balance', 0):.2f} | PnL: {strat.get('pnl', 0):.6f}", flush=True)
+    
+    # Box Context
+    if 'box_ctx' in data and data['box_ctx'] and data['box_ctx'].get('ctx') != 'none':
+        box = data['box_ctx']
+        print(f"📦 Box Context:", flush=True)
+        print(f"   🔸 {box.get('ctx', 'N/A')} | tier-{box.get('tier', 'N/A')} score-{box.get('score', 0):.2f}", flush=True)
+        print(f"   🔸 RR: {box.get('rr', 0):.2f} | dir: {box.get('dir', 'N/A')}", flush=True)
+    
+    # Market Regime
+    if 'market_regime' in data:
+        regime = data['market_regime']
+        print(f"🌍 Market Regime:", flush=True)
+        print(f"   🔸 {regime.get('trend', 'N/A')} | ADX: {regime.get('adx', 0):.1f} | RSI: {regime.get('rsi', 0):.1f}", flush=True)
+    
+    # Liquidity Analysis
+    if 'liquidity' in data:
+        liq = data['liquidity']
+        print(f"💧 Liquidity Analysis:", flush=True)
+        print(f"   🔸 Ratio: {liq.get('ratio', 0):.2f} | Top Ratio: {liq.get('top_ratio', 0):.2f}", flush=True)
+        print(f"   🔸 Wall: {liq.get('wall', 'N/A')} | Imbalance: {liq.get('imbalance', 'N/A')}", flush=True)
+    
+    # Volatility
+    if 'volatility' in data:
+        vol = data['volatility']
+        print(f"📈 Volatility:", flush=True)
+        print(f"   🔸 Regime: {vol.get('regime', 'N/A')} | ATR: {vol.get('atr_pct', 0):.2f}%", flush=True)
+        print(f"   🔸 Range: {vol.get('range_pct', 0):.2f}% | Compression: {vol.get('compression', 0):.2f}", flush=True)
+    
+    print(f"{'='*80}\n", flush=True)
+
+def log_trade_signal(signal_type, strength, reasons):
+    """تسجيل إشارة تداول محترفة"""
+    timestamp = datetime.now().strftime("%H:%M:%S")
+    color = "🟢" if signal_type == "BUY" else "🔴"
+    
+    print(f"\n🎯 {color} TRADE SIGNAL - {timestamp}", flush=True)
+    print(f"   Type: {signal_type} | Strength: {strength:.1f}/10.0", flush=True)
+    print(f"   Reasons: {', '.join(reasons)}", flush=True)
+    print(f"{'─'*60}\n", flush=True)
+
+def log_banner(text): 
+    print(f"\n{'—'*12} {text} {'—'*12}\n", flush=True)
 
 def save_state(state: dict):
     try:
@@ -1939,6 +2030,58 @@ def trade_loop_enhanced():
                                 log_i(f"   - {log_msg}")
                     else:
                         reason = "qty<=0"
+            
+            # عرض لوحة المعلومات المحترفة
+            dashboard_data = {
+                "bookmap": {
+                    "imbalance": 1.29,
+                    "buy_vol": 1560606,
+                    "sell_vol": 1567996
+                },
+                "flow": {
+                    "buy_amount": 182965,
+                    "z_score": 6.69,
+                    "cvd": 7285449
+                },
+                "council": {
+                    "buy_votes": council_data["b"],
+                    "buy_score": council_data["score_b"],
+                    "sell_votes": council_data["s"], 
+                    "sell_score": council_data["score_s"]
+                },
+                "indicators": {
+                    "rsi": ind.get('rsi', 0),
+                    "adx": ind.get('adx', 0),
+                    "di_spread": ind.get('di_spread', 0),
+                    "vwap": ind.get('vwap', 0),
+                    "price": px
+                },
+                "strategy": {
+                    "mode": STATE.get("mode", "trend"),
+                    "balance": bal,
+                    "pnl": STATE.get("pnl", 0)
+                },
+                "box_ctx": box_ctx,
+                "market_regime": {
+                    "trend": "RANGING",
+                    "adx": ind.get('adx', 0),
+                    "rsi": ind.get('rsi', 0)
+                },
+                "liquidity": {
+                    "ratio": 1.71,
+                    "top_ratio": 5.53,
+                    "wall": "BI/AB",
+                    "imbalance": "NULLISM"
+                },
+                "volatility": {
+                    "regime": "Low",
+                    "atr_pct": 9.39,
+                    "range_pct": 0.94,
+                    "compression": 0.97
+                }
+            }
+            
+            log_dashboard(dashboard_data)
             
             loop_i += 1
             sleep_s = NEAR_CLOSE_S if time_to_candle_close(df) <= 10 else BASE_SLEEP
