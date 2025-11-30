@@ -1437,7 +1437,9 @@ def apply_smart_profit_strategy(entry_price, side, box_context, market_context):
     profile = PROFIT_SYSTEM.determine_tp_profile(box_strength, market_context, signal_strength)
     tp_levels = PROFIT_SYSTEM.calculate_dynamic_tp(entry_price, side, profile, LEVERAGE)
     
-    log_i(f"🎯 SMART PROFIT: {profile} | TP levels: {[f'{tp['pct']*100:.1f}%' for tp in tp_levels]}")
+    # إصلاح الخطأ: استخدام double quotes للـ f-string الداخلية
+    tp_strs = [f"{tp['pct']*100:.1f}%" for tp in tp_levels]
+    log_i(f"🎯 SMART PROFIT: {profile} | TP levels: {tp_strs}")
     
     return {
         'profile': profile,
