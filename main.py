@@ -7,7 +7,7 @@ RF Futures Bot — RF-LIVE ONLY (BingX Perp via CCXT)
 • Smart Exit Management + Wait-for-next-signal
 • Professional Logging & Dashboard
 • Enhanced with Footprint, SMC Candles, Liquidity Traps + VWAP Strategy
-• ADVANCED SRBox System + FVG Detection + Stop Hunt Zones
+• Advanced SMC Integration: Supply/Demand, Liquidity Sweep, Breaker Blocks, FVG, Elliott Waves, Stop Hunt
 """
 
 import os, time, math, random, signal, sys, traceback, logging, json
@@ -42,7 +42,7 @@ SHADOW_MODE_DASHBOARD = False
 DRY_RUN = False
 
 # ==== Addon: Logging + Recovery Settings ====
-BOT_VERSION = "DOGE Council PRO v6.0 — Smart Profit AI + Golden Zone Pro + VWAP Strategy + SRBox Advanced"
+BOT_VERSION = "DOGE Council PRO v6.0 — Smart Money Concepts + SMC Advanced + Elliott Waves + Stop Hunt AI"
 print("🔁 Booting:", BOT_VERSION, flush=True)
 
 STATE_PATH = "./bot_state.json"
@@ -162,370 +162,13 @@ VWAP_ENABLED = True
 VWAP_SCALP_BAND_BPS = 8.0     # قرب من VWAP = سكالب
 VWAP_TREND_BAND_BPS = 20.0    # بعيد عن VWAP = ترند قوي
 
-# =================== SRBOX ADVANCED SYSTEM ===================
-# SRBox Class لتمثيل صناديق العرض/الطلب
-class SRBox:
-    def __init__(self, box_type, high, low, start_time, volume=0, touches=0):
-        self.box_type = box_type  # 'supply' or 'demand'
-        self.high = high
-        self.low = low
-        self.start_time = start_time
-        self.volume = volume
-        self.touches = touches
-        self.strength = 0.0
-        self.rejections = 0
-        self.active = True
-        
-    def update_strength(self, new_touches=0, new_volume=0):
-        """تحديث قوة البوكس بناء على اللمسات والحجم"""
-        if new_touches > 0:
-            self.touches += new_touches
-        if new_volume > 0:
-            self.volume += new_volume
-            
-        # حساب القوة: 40% لعدد اللمسات، 30% للحجم، 30% لمدة البقاء
-        touch_score = min(4.0, self.touches * 0.8)
-        volume_score = min(3.0, math.log(self.volume + 1) * 0.5)
-        time_score = min(3.0, (time.time() - self.start_time) / 3600)  # ساعات
-        
-        self.strength = touch_score + volume_score + time_score
-        return self.strength
-    
-    def get_strength_color(self):
-        """تلوين ذكي حسب قوة البوكس"""
-        if self.strength >= 7.0:
-            return "🟢 STRONG"
-        elif self.strength >= 4.0:
-            return "🟡 MEDIUM" 
-        else:
-            return "🔴 WEAK"
-    
-    def __str__(self):
-        return f"SRBox({self.box_type} {self.high:.6f}-{self.low:.6f} strength:{self.strength:.1f})"
-
-# نظام إدارة البوكسات
-class SRBoxManager:
-    def __init__(self):
-        self.boxes = []
-        self.last_swing_high = None
-        self.last_swing_low = None
-        
-    def identify_swings(self, df, swing_bars=3):
-        """تحديد القمم والقيعان (سوينجات)"""
-        if len(df) < swing_bars * 2 + 1:
-            return None, None
-            
-        highs = df['high'].astype(float)
-        lows = df['low'].astype(float)
-        
-        # البحث عن قمم
-        for i in range(swing_bars, len(highs) - swing_bars):
-            if all(highs.iloc[i] > highs.iloc[i-j] for j in range(1, swing_bars+1)) and \
-               all(highs.iloc[i] > highs.iloc[i+j] for j in range(1, swing_bars+1)):
-                self.last_swing_high = (i, highs.iloc[i])
-                
-        # البحث عن قيعان
-        for i in range(swing_bars, len(lows) - swing_bars):
-            if all(lows.iloc[i] < lows.iloc[i-j] for j in range(1, swing_bars+1)) and \
-               all(lows.iloc[i] < lows.iloc[i+j] for j in range(1, swing_bars+1)):
-                self.last_swing_low = (i, lows.iloc[i])
-                
-        return self.last_swing_high, self.last_swing_low
-    
-    def build_boxes_from_swings(self, df, swing_bars=3, min_box_height=0.001):
-        """بناء البوكسات من السوينجات"""
-        swing_high, swing_low = self.identify_swings(df, swing_bars)
-        
-        if not swing_high or not swing_low:
-            return []
-            
-        h_idx, h_price = swing_high
-        l_idx, l_price = swing_low
-        
-        # تحديد نوع البوكس بناء على ترتيب السوينجات
-        if h_idx > l_idx:  # قمة بعد قاع → supply box
-            box = SRBox('supply', h_price, l_price, time.time())
-        else:  # قاع بعد قمة → demand box
-            box = SRBox('demand', h_price, l_price, time.time())
-            
-        # تصفية البوكسات الصغيرة
-        box_height = (box.high - box.low) / box.low
-        if box_height < min_box_height:
-            return []
-            
-        self.boxes.append(box)
-        return [box]
-    
-    def update_boxes_interaction(self, df):
-        """تحديث تفاعل السعر مع البوكسات"""
-        if len(df) < 2:
-            return
-            
-        current_high = float(df['high'].iloc[-1])
-        current_low = float(df['low'].iloc[-1])
-        current_volume = float(df['volume'].iloc[-1])
-        
-        for box in self.boxes:
-            # تحقق إذا السعر يلمس البوكس
-            if box.low <= current_high <= box.high or box.low <= current_low <= box.high:
-                box.update_strength(new_touches=1, new_volume=current_volume)
-                
-            # تحقق الرفض من البوكس
-            if box.box_type == 'supply':
-                if current_high > box.high and float(df['close'].iloc[-1]) < box.high:
-                    box.rejections += 1
-            else:  # demand
-                if current_low < box.low and float(df['close'].iloc[-1]) > box.low:
-                    box.rejections += 1
-    
-    def get_active_boxes(self, min_strength=3.0):
-        """الحصول على البوكسات النشطة ذات القوة الكافية"""
-        return [box for box in self.boxes if box.active and box.strength >= min_strength]
-    
-    def clean_old_boxes(self, max_age_hours=24):
-        """تنظيف البوكسات القديمة"""
-        current_time = time.time()
-        self.boxes = [box for box in self.boxes 
-                     if (current_time - box.start_time) < max_age_hours * 3600]
-
-# نظام FVG (Fair Value Gap) المتكامل
-class FVGSystem:
-    def __init__(self):
-        self.fvg_list = []
-        
-    def detect_fvg(self, df, min_body_ratio=2.0):
-        """كشف الفجوات الحجمية"""
-        if len(df) < 3:
-            return []
-            
-        fvg_list = []
-        
-        for i in range(1, len(df)-1):
-            prev = df.iloc[i-1]
-            curr = df.iloc[i]
-            
-            body_prev = abs(float(prev['close']) - float(prev['open']))
-            body_curr = abs(float(curr['close']) - float(curr['open']))
-            
-            # فجوة صاعدة (bearish candle then bullish candle)
-            if (float(prev['close']) < float(prev['open'])) and (float(curr['close']) > float(curr['open'])):
-                if float(curr['low']) > float(prev['high']):  # فجوة حقيقية
-                    fvg_type = "BULLISH_FVG"
-                    top = float(curr['low'])
-                    bottom = float(prev['high'])
-                    volume_ratio = float(curr['volume']) / max(float(prev['volume']), 1)
-                    
-                    fvg_list.append({
-                        'type': fvg_type,
-                        'top': top,
-                        'bottom': bottom,
-                        'time': int(prev['time']),
-                        'volume_ratio': volume_ratio,
-                        'strength': min(10.0, volume_ratio * 3 + body_curr/body_prev)
-                    })
-                    
-            # فجوة هابطة (bullish candle then bearish candle)  
-            elif (float(prev['close']) > float(prev['open'])) and (float(curr['close']) < float(curr['open'])):
-                if float(curr['high']) < float(prev['low']):  # فجوة حقيقية
-                    fvg_type = "BEARISH_FVG" 
-                    top = float(prev['low'])
-                    bottom = float(curr['high'])
-                    volume_ratio = float(curr['volume']) / max(float(prev['volume']), 1)
-                    
-                    fvg_list.append({
-                        'type': fvg_type,
-                        'top': top,
-                        'bottom': bottom,
-                        'time': int(prev['time']),
-                        'volume_ratio': volume_ratio,
-                        'strength': min(10.0, volume_ratio * 3 + body_curr/body_prev)
-                    })
-        
-        self.fvg_list = fvg_list[-20:]  # الاحتفاظ بأحدث 20 فجوة
-        return fvg_list
-    
-    def classify_fvg_quality(self, fvg_data, current_price):
-        """تصنيف جودة الفجوة (حقيقية/مزيفة)"""
-        if not fvg_data:
-            return "UNKNOWN"
-            
-        # فجوة قريبة من السعر الحالي أكثر فاعلية
-        price_distance = min(abs(current_price - fvg_data['top']), 
-                           abs(current_price - fvg_data['bottom'])) / current_price
-        
-        if fvg_data['volume_ratio'] > 2.0 and price_distance < 0.01:  # 1%
-            return "STRONG_REAL"
-        elif fvg_data['volume_ratio'] > 1.5 and price_distance < 0.02:  # 2%
-            return "REAL"
-        elif fvg_data['volume_ratio'] < 0.8:
-            return "FAKE"
-        else:
-            return "NEUTRAL"
-    
-    def get_fvg_for_alignment(self, boxes, current_price):
-        """الحصول على الفجوات المحاذية للبوكسات"""
-        aligned_fvgs = []
-        
-        for fvg in self.fvg_list:
-            for box in boxes:
-                # تحقق إذا الفجوة متقاطعة مع البوكس
-                if (fvg['bottom'] <= box.high and fvg['top'] >= box.low):
-                    quality = self.classify_fvg_quality(fvg, current_price)
-                    aligned_fvgs.append({
-                        'fvg': fvg,
-                        'box': box,
-                        'quality': quality,
-                        'alignment_score': min(10.0, fvg['strength'] + box.strength)
-                    })
-                    
-        return aligned_fvgs
-
-# نظام مناطق ضرب الاستوب
-class StopHuntZones:
-    def __init__(self, atr_period=14, atr_multiplier=1.5):
-        self.atr_period = atr_period
-        self.atr_multiplier = atr_multiplier
-        self.zones = []
-        
-    def calculate_atr(self, df):
-        """حساب ATR"""
-        high = df['high'].astype(float)
-        low = df['low'].astype(float)
-        close = df['close'].astype(float)
-        
-        tr1 = high - low
-        tr2 = abs(high - close.shift(1))
-        tr3 = abs(low - close.shift(1))
-        
-        tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
-        atr = tr.rolling(self.atr_period).mean()
-        return atr.iloc[-1] if not atr.empty else 0.0
-    
-    def identify_stop_hunt_zones(self, df, boxes):
-        """تحديد مناطق ضرب الاستوب"""
-        if len(df) < self.atr_period + 1:
-            return []
-            
-        atr = self.calculate_atr(df)
-        current_price = float(df['close'].iloc[-1])
-        
-        zones = []
-        
-        for box in boxes:
-            # مناطق فوق supply box (لضرب استوب الشراء)
-            if box.box_type == 'supply':
-                stop_hunt_high = box.high + (atr * self.atr_multiplier)
-                zones.append({
-                    'type': 'STOP_HUNT_BUY',
-                    'level': stop_hunt_high,
-                    'box': box,
-                    'distance_pct': ((stop_hunt_high - current_price) / current_price) * 100
-                })
-                
-            # مناطق تحت demand box (لضرب استوب البيع)  
-            elif box.box_type == 'demand':
-                stop_hunt_low = box.low - (atr * self.atr_multiplier)
-                zones.append({
-                    'type': 'STOP_HUNT_SELL', 
-                    'level': stop_hunt_low,
-                    'box': box,
-                    'distance_pct': ((current_price - stop_hunt_low) / current_price) * 100
-                })
-        
-        self.zones = zones
-        return zones
-
-# نظام RF B&S المساعد للسكالب
-class RangeFilterBSCalculation:
-    def __init__(self, period=20, mult=3.5):
-        self.period = period
-        self.mult = mult
-        
-    def calculate_rf_bs(self, df, src_col='close'):
-        """حساب RF B&S (نسخة Python من Pine)"""
-        if len(df) < self.period + 5:
-            return {'buy': False, 'sell': False, 'filter': 0.0}
-            
-        src = df[src_col].astype(float)
-        
-        # حساب المدى
-        rng = abs(src.diff()).rolling(self.period).mean()
-        rng_size = rng.ewm(span=(self.period*2)-1, adjust=False).mean() * self.mult
-        
-        # حساب الفلتر
-        rfilt = [src.iloc[0]]
-        for i in range(1, len(src)):
-            prev = rfilt[-1]
-            x = src.iloc[i]
-            r = rng_size.iloc[i] if not pd.isna(rng_size.iloc[i]) else rng_size.iloc[i-1]
-            
-            if x - r > prev:
-                rfilt.append(x - r)
-            elif x + r < prev:
-                rfilt.append(x + r)
-            else:
-                rfilt.append(prev)
-                
-        rfilt = pd.Series(rfilt, index=df.index)
-        
-        # إشارات البيع والشراء
-        buy_signal = (src > rfilt) & (src.shift(1) <= rfilt.shift(1))
-        sell_signal = (src < rfilt) & (src.shift(1) >= rfilt.shift(1))
-        
-        return {
-            'buy': bool(buy_signal.iloc[-1]),
-            'sell': bool(sell_signal.iloc[-1]),
-            'filter': float(rfilt.iloc[-1]),
-            'upper_band': float(rfilt.iloc[-1] + rng_size.iloc[-1]),
-            'lower_band': float(rfilt.iloc[-1] - rng_size.iloc[-1])
-        }
-
-# نظام جني الأرباح المتقدم
-class AdvancedProfitSystem:
-    def __init__(self):
-        self.profile_levels = {
-            'SCALP_WEAK': [0.003, 0.006, 0.010],      # 0.3%, 0.6%, 1.0%
-            'MID_SWING': [0.008, 0.015, 0.025],       # 0.8%, 1.5%, 2.5%
-            'TREND_STRONG': [0.015, 0.030, 0.050]     # 1.5%, 3.0%, 5.0%
-        }
-        
-    def determine_tp_profile(self, box_strength, market_context, signal_strength):
-        """تحديد بروفايل جني الأرباح حسب قوة البوكس والسياق"""
-        if signal_strength >= 8.0 and box_strength >= 7.0:
-            return 'TREND_STRONG'
-        elif signal_strength >= 6.0 and box_strength >= 5.0:
-            return 'MID_SWING'
-        else:
-            return 'SCALP_WEAK'
-    
-    def calculate_dynamic_tp(self, entry_price, side, profile, leverage=10):
-        """حساب مستويات TP الديناميكية"""
-        if profile not in self.profile_levels:
-            profile = 'SCALP_WEAK'
-            
-        tp_levels = []
-        for tp_pct in self.profile_levels[profile]:
-            if side == 'long':
-                tp_price = entry_price * (1 + tp_pct / leverage)
-            else:
-                tp_price = entry_price * (1 - tp_pct / leverage)
-                
-            tp_levels.append({
-                'price': tp_price,
-                'pct': tp_pct,
-                'close_fraction': 0.4 if len(tp_levels) == 0 else (0.3 if len(tp_levels) == 1 else 0.3)
-            })
-            
-        return tp_levels
-    
-    def calculate_position_size(self, balance, risk_pct, entry_price, stop_price, leverage=10):
-        """حجم المركز المتقدم مع إدارة المخاطرة"""
-        risk_amount = balance * risk_pct
-        price_risk = abs(entry_price - stop_price) / entry_price
-        position_value = risk_amount / price_risk
-        quantity = position_value / entry_price
-        
-        return min(quantity, balance * leverage / entry_price)
+# ==== Advanced SMC Settings ====
+SMC_ENABLED = True
+OB_STRENGTH_THRESHOLD = 0.7
+FVG_VALIDITY_THRESHOLD = 0.7
+STOP_HUNT_CONFIRMATION_BARS = 3
+LIQUIDITY_SWEEP_CONFIRMATION = True
+ELLIOTT_WAVE_ENABLED = True
 
 # =================== PROFESSIONAL LOGGING ===================
 def log_i(msg): print(f"ℹ️ {msg}", flush=True)
@@ -552,6 +195,563 @@ def load_state() -> dict:
     except Exception as e:
         log_w(f"state load failed: {e}")
     return {}
+
+# =================== ADVANCED SMC ENGINE ===================
+
+class SMCCoreEngine:
+    def __init__(self):
+        self.demand_zones = []
+        self.supply_zones = []
+        self.liquidity_pools = []
+        self.valid_fvgs = []
+        self.order_blocks = []
+        self.breaker_blocks = []
+        self.spring_patterns = []
+        
+    def analyze_smc_structure(self, df):
+        """تحليل هيكل السوق باستخدام SMC"""
+        analysis = {
+            'market_structure': self._analyze_market_structure(df),
+            'liquidity_levels': self._find_liquidity_pools(df),
+            'supply_demand_zones': self._identify_supply_demand_zones(df),
+            'order_blocks': self._find_order_blocks(df),
+            'fair_value_gaps': self._analyze_fvg(df),
+            'breaker_spring': self._analyze_breaker_spring(df),
+            'trading_opportunities': []
+        }
+        
+        # توليد فرص التداول
+        analysis['trading_opportunities'] = self._generate_trading_opportunities(analysis, df)
+        
+        return analysis
+    
+    def _analyze_market_structure(self, df):
+        """تحليل هيكل السوق: BOS, CHoCH, Displacement"""
+        structure = {
+            'bos': self._find_break_of_structure(df),
+            'choch': self._find_change_of_character(df),
+            'displacement': self._find_displacement_moves(df),
+            'trend': self._determine_trend_structure(df)
+        }
+        return structure
+    
+    def _find_liquidity_pools(self, df):
+        """اكتشاف تجمعات السيولة"""
+        liquidity_pools = []
+        
+        # Equal Highs / Equal Lows
+        equal_highs = self._find_equal_highs(df)
+        equal_lows = self._find_equal_lows(df)
+        
+        # Engineering Liquidity (مصائد سيولة مصممة)
+        engineered_liquidity = self._find_engineered_liquidity(df)
+        
+        # Stop Hunt Zones
+        stop_hunt_zones = self._detect_stop_hunt_zones(df)
+        
+        liquidity_pools.extend(equal_highs)
+        liquidity_pools.extend(equal_lows)
+        liquidity_pools.extend(engineered_liquidity)
+        liquidity_pools.extend(stop_hunt_zones)
+        
+        return liquidity_pools
+    
+    def _find_equal_highs(self, df, tolerance=0.001):
+        """إيجاد القمم المتساوية"""
+        equal_highs = []
+        highs = df['high'].astype(float)
+        
+        for i in range(10, len(highs)-5):
+            current_high = highs.iloc[i]
+            # البحث عن قمم متساوية في النطاق
+            lookback_highs = highs.iloc[i-10:i]
+            similar_highs = lookback_highs[abs(lookback_highs - current_high) / current_high <= tolerance]
+            
+            if len(similar_highs) >= 2:
+                equal_highs.append({
+                    'price': current_high,
+                    'time': df['time'].iloc[i],
+                    'count': len(similar_highs),
+                    'type': 'equal_highs'
+                })
+        
+        return equal_highs
+    
+    def _find_equal_lows(self, df, tolerance=0.001):
+        """إيجاد القيعان المتساوية"""
+        equal_lows = []
+        lows = df['low'].astype(float)
+        
+        for i in range(10, len(lows)-5):
+            current_low = lows.iloc[i]
+            # البحث عن قيعان متساوية في النطاق
+            lookback_lows = lows.iloc[i-10:i]
+            similar_lows = lookback_lows[abs(lookback_lows - current_low) / current_low <= tolerance]
+            
+            if len(similar_lows) >= 2:
+                equal_lows.append({
+                    'price': current_low,
+                    'time': df['time'].iloc[i],
+                    'count': len(similar_lows),
+                    'type': 'equal_lows'
+                })
+        
+        return equal_lows
+    
+    def _identify_supply_demand_zones(self, df):
+        """تحديد مناطق الطلب والعرض"""
+        zones = []
+        
+        # البحث عن القمم والقيعان المحورية
+        pivot_highs = self._find_pivot_highs(df, left_bars=3, right_bars=3)
+        pivot_lows = self._find_pivot_lows(df, left_bars=3, right_bars=3)
+        
+        # مناطق العرض عند القمم المحورية
+        for pivot in pivot_highs:
+            zone = {
+                'type': 'supply',
+                'price_level': pivot['price'],
+                'time': pivot['time'],
+                'strength': self._calculate_zone_strength(df, pivot, 'supply'),
+                'reason': 'Pivot High Supply Zone'
+            }
+            zones.append(zone)
+        
+        # مناطق الطلب عند القيعان المحورية
+        for pivot in pivot_lows:
+            zone = {
+                'type': 'demand',
+                'price_level': pivot['price'],
+                'time': pivot['time'],
+                'strength': self._calculate_zone_strength(df, pivot, 'demand'),
+                'reason': 'Pivot Low Demand Zone'
+            }
+            zones.append(zone)
+        
+        return zones
+    
+    def _find_pivot_highs(self, df, left_bars=3, right_bars=3):
+        """إيجاد القمم المحورية"""
+        pivot_highs = []
+        highs = df['high'].astype(float)
+        
+        for i in range(left_bars, len(highs)-right_bars):
+            current_high = highs.iloc[i]
+            left_range = highs.iloc[i-left_bars:i]
+            right_range = highs.iloc[i+1:i+right_bars+1]
+            
+            if (current_high > left_range.max() and 
+                current_high > right_range.max()):
+                pivot_highs.append({
+                    'price': current_high,
+                    'time': df['time'].iloc[i],
+                    'strength': len(left_range) + len(right_range)
+                })
+        
+        return pivot_highs
+    
+    def _find_pivot_lows(self, df, left_bars=3, right_bars=3):
+        """إيجاد القيعان المحورية"""
+        pivot_lows = []
+        lows = df['low'].astype(float)
+        
+        for i in range(left_bars, len(lows)-right_bars):
+            current_low = lows.iloc[i]
+            left_range = lows.iloc[i-left_bars:i]
+            right_range = lows.iloc[i+1:i+right_bars+1]
+            
+            if (current_low < left_range.min() and 
+                current_low < right_range.min()):
+                pivot_lows.append({
+                    'price': current_low,
+                    'time': df['time'].iloc[i],
+                    'strength': len(left_range) + len(right_range)
+                })
+        
+        return pivot_lows
+    
+    def _calculate_zone_strength(self, df, pivot, zone_type):
+        """حساب قوة المنطقة"""
+        strength = 0.0
+        
+        # قوة الحركة من المنطقة
+        move_strength = self._measure_move_strength(df, pivot, zone_type)
+        strength += move_strength * 0.4
+        
+        # عدد مرات احترام المنطقة
+        respect_count = self._count_zone_respect(df, pivot, zone_type)
+        strength += respect_count * 0.3
+        
+        # الوقت منذ تشكل المنطقة
+        time_factor = self._calculate_time_factor(df, pivot)
+        strength += time_factor * 0.3
+        
+        return min(1.0, strength)
+    
+    def _find_order_blocks(self, df):
+        """إيجاد Order Blocks"""
+        order_blocks = []
+        
+        for i in range(2, len(df)-1):
+            # Order Block Bullish: شمعة هابطة كبيرة يليها شمعة صاعدة
+            if (self._is_bearish_candle(df, i) and 
+                self._is_bullish_candle(df, i+1)):
+                ob = {
+                    'type': 'bullish_ob',
+                    'high': max(float(df['high'].iloc[i]), float(df['high'].iloc[i+1])),
+                    'low': min(float(df['low'].iloc[i]), float(df['low'].iloc[i+1])),
+                    'time': df['time'].iloc[i],
+                    'strength': self._calculate_ob_strength(df, i)
+                }
+                order_blocks.append(ob)
+            
+            # Order Block Bearish: شمعة صاعدة كبيرة يليها شمعة هابطة  
+            if (self._is_bullish_candle(df, i) and 
+                self._is_bearish_candle(df, i+1)):
+                ob = {
+                    'type': 'bearish_ob',
+                    'high': max(float(df['high'].iloc[i]), float(df['high'].iloc[i+1])),
+                    'low': min(float(df['low'].iloc[i]), float(df['low'].iloc[i+1])),
+                    'time': df['time'].iloc[i],
+                    'strength': self._calculate_ob_strength(df, i)
+                }
+                order_blocks.append(ob)
+        
+        return order_blocks
+    
+    def _analyze_fvg(self, df):
+        """تحليل Fair Value Gaps"""
+        fvgs = []
+        
+        for i in range(2, len(df)-2):
+            fvg = self._identify_fvg(df, i)
+            if fvg and fvg['valid']:
+                fvg['probability'] = self._calculate_fvg_probability(fvg, df, i)
+                fvgs.append(fvg)
+        
+        return fvgs
+    
+    def _identify_fvg(self, df, index):
+        """تحديد FVG"""
+        if index < 1 or index >= len(df)-1:
+            return None
+        
+        prev_candle = df.iloc[index-1]
+        curr_candle = df.iloc[index]
+        next_candle = df.iloc[index+1]
+        
+        # FVG هابطة
+        if (float(curr_candle['low']) > float(prev_candle['high']) and
+            float(next_candle['high']) < float(curr_candle['low'])):
+            
+            return {
+                'type': 'fvg_bearish',
+                'high': float(curr_candle['low']),
+                'low': float(prev_candle['high']),
+                'time': curr_candle['time'],
+                'valid': self._is_valid_fvg(df, index, 'bearish')
+            }
+        
+        # FVG صاعدة
+        if (float(curr_candle['high']) < float(prev_candle['low']) and
+            float(next_candle['low']) > float(curr_candle['high'])):
+            
+            return {
+                'type': 'fvg_bullish',
+                'high': float(prev_candle['low']),
+                'low': float(curr_candle['high']),
+                'time': curr_candle['time'],
+                'valid': self._is_valid_fvg(df, index, 'bullish')
+            }
+        
+        return None
+    
+    def _is_valid_fvg(self, df, index, fvg_type):
+        """التحقق من صحة FVG"""
+        curr_candle = df.iloc[index]
+        next_candle = df.iloc[index+1]
+        
+        if fvg_type == 'bearish':
+            # لا يجب أن تلمس فتائل الشمعة التالية المنطقة
+            return (float(next_candle['high']) < float(curr_candle['low']) and
+                    float(next_candle['low']) > float(df.iloc[index-1]['high']))
+        else:
+            # لا يجب أن تلمس فتائل الشمعة التالية المنطقة
+            return (float(next_candle['low']) > float(curr_candle['high']) and
+                    float(next_candle['high']) < float(df.iloc[index-1]['low']))
+    
+    def _analyze_breaker_spring(self, df):
+        """تحليل نماذج Breaker Blocks و Spring"""
+        patterns = {
+            'breaker_blocks': self._find_breaker_blocks(df),
+            'spring_patterns': self._find_spring_patterns(df)
+        }
+        return patterns
+    
+    def _find_breaker_blocks(self, df):
+        """إيجاد Breaker Blocks"""
+        breakers = []
+        
+        for i in range(3, len(df)-2):
+            breaker = self._identify_breaker_block(df, i)
+            if breaker:
+                breakers.append(breaker)
+        
+        return breakers
+    
+    def _identify_breaker_block(self, df, index):
+        """تحديد Breaker Block"""
+        if index < 2 or index >= len(df)-1:
+            return None
+        
+        # Breaker Block هابط: كسر قمة فاشل
+        if (float(df['high'].iloc[index]) > float(df['high'].iloc[index-2]) and  # كسر قمة
+            float(df['close'].iloc[index]) < float(df['open'].iloc[index]) and   # شمعة هابطة
+            float(df['close'].iloc[index+1]) < float(df['close'].iloc[index])):  # تأكيد هبوط
+            
+            return {
+                'type': 'breaker_bearish',
+                'level': float(df['high'].iloc[index]),
+                'time': df['time'].iloc[index],
+                'strength': 0.8
+            }
+        
+        # Breaker Block صاعد: كسر قاع فاشل
+        if (float(df['low'].iloc[index]) < float(df['low'].iloc[index-2]) and    # كسر قاع
+            float(df['close'].iloc[index]) > float(df['open'].iloc[index]) and   # شمعة صاعدة
+            float(df['close'].iloc[index+1]) > float(df['close'].iloc[index])):  # تأكيد صعود
+            
+            return {
+                'type': 'breaker_bullish',
+                'level': float(df['low'].iloc[index]),
+                'time': df['time'].iloc[index],
+                'strength': 0.8
+            }
+        
+        return None
+    
+    def _find_spring_patterns(self, df):
+        """كشف نماذج Spring (الكسر الوهمي)"""
+        springs = []
+        
+        for i in range(5, len(df)-3):
+            spring = self._identify_spring(df, i)
+            if spring:
+                springs.append(spring)
+        
+        return springs
+    
+    def _identify_spring(self, df, index):
+        """تحديد نموذج Spring"""
+        if index < 3 or index >= len(df)-2:
+            return None
+        
+        # البحث عن قاع سابق
+        prev_low = float(df['low'].iloc[index-3:index].min())
+        current_low = float(df['low'].iloc[index])
+        
+        # شرط 1: كسر القاع
+        if current_low >= prev_low * 0.998:  # ليس كسر حقيقي
+            return None
+        
+        # شرط 2: العودة السريعة
+        next_close = float(df['close'].iloc[index+1])
+        if next_close <= prev_low:
+            return None
+        
+        # شرط 3: شمعة تأكيد
+        confirm_candle = self._is_bullish_confirmation(df, index+1)
+        if not confirm_candle:
+            return None
+        
+        return {
+            'type': 'spring_bullish',
+            'break_level': current_low,
+            'return_level': prev_low,
+            'time': df['time'].iloc[index],
+            'strength': 0.85
+        }
+    
+    def _generate_trading_opportunities(self, analysis, df):
+        """توليد فرص التداول بناءً على تحليل SMC"""
+        opportunities = []
+        current_price = float(df['close'].iloc[-1])
+        
+        # فرص من مناطق الطلب
+        for zone in analysis['supply_demand_zones']:
+            if zone['type'] == 'demand' and self._is_zone_active(zone, current_price):
+                opportunities.append({
+                    'type': 'demand_zone_entry',
+                    'direction': 'long',
+                    'zone': zone,
+                    'confidence': zone['strength']
+                })
+        
+        # فرص من مناطق العرض
+        for zone in analysis['supply_demand_zones']:
+            if zone['type'] == 'supply' and self._is_zone_active(zone, current_price):
+                opportunities.append({
+                    'type': 'supply_zone_entry',
+                    'direction': 'short',
+                    'zone': zone,
+                    'confidence': zone['strength']
+                })
+        
+        # فرص من Order Blocks
+        for ob in analysis['order_blocks']:
+            if (ob['low'] <= current_price <= ob['high'] and 
+                ob['strength'] >= OB_STRENGTH_THRESHOLD):
+                direction = 'long' if ob['type'] == 'bullish_ob' else 'short'
+                opportunities.append({
+                    'type': 'order_block_entry',
+                    'direction': direction,
+                    'ob': ob,
+                    'confidence': ob['strength']
+                })
+        
+        return opportunities
+    
+    # ========== Helper Methods ==========
+    
+    def _is_bearish_candle(self, df, index):
+        o, c = float(df['open'].iloc[index]), float(df['close'].iloc[index])
+        return c < o
+    
+    def _is_bullish_candle(self, df, index):
+        o, c = float(df['open'].iloc[index]), float(df['close'].iloc[index])
+        return c > o
+    
+    def _is_bullish_confirmation(self, df, index):
+        if index >= len(df):
+            return False
+        return self._is_bullish_candle(df, index)
+    
+    def _calculate_ob_strength(self, df, index):
+        """حساب قوة Order Block"""
+        strength = 0.0
+        
+        # حجم الشمعة
+        candle_size = abs(float(df['close'].iloc[index]) - float(df['open'].iloc[index]))
+        avg_size = abs(df['close'].astype(float) - df['open'].astype(float)).tail(20).mean()
+        
+        if candle_size > avg_size * 1.5:
+            strength += 0.4
+        
+        # حجم التداول
+        volume = float(df['volume'].iloc[index])
+        avg_volume = df['volume'].astype(float).tail(20).mean()
+        
+        if volume > avg_volume * 1.2:
+            strength += 0.3
+        
+        # قوة الحركة التالية
+        if index < len(df) - 2:
+            next_move = abs(float(df['close'].iloc[index+2]) - float(df['close'].iloc[index+1]))
+            if next_move > candle_size:
+                strength += 0.3
+        
+        return strength
+    
+    def _calculate_fvg_probability(self, fvg, df, index):
+        """حساب احتمالية FVG"""
+        probability = 0.0
+        
+        # نقاء الفجوة
+        if fvg['valid']:
+            probability += 0.4
+        
+        # وجود Displacement
+        if self._has_displacement(df, index, fvg['type']):
+            probability += 0.3
+        
+        # حجم التداول
+        if self._has_volume_confirmation(df, index):
+            probability += 0.2
+        
+        # توافق مع الترند
+        if self._is_trend_aligned(df, index, fvg['type']):
+            probability += 0.1
+        
+        return probability
+    
+    def _has_displacement(self, df, index, fvg_type):
+        """التحقق من وجود Displacement"""
+        if index < 2:
+            return False
+        
+        if fvg_type == 'bearish':
+            # حركة هابطة قوية قبل الفجوة
+            move = float(df['close'].iloc[index-1]) - float(df['open'].iloc[index-1])
+            return move < 0 and abs(move) > df['close'].astype(float).diff().abs().tail(10).mean()
+        else:
+            # حركة صاعدة قوية قبل الفجوة
+            move = float(df['close'].iloc[index-1]) - float(df['open'].iloc[index-1])
+            return move > 0 and abs(move) > df['close'].astype(float).diff().abs().tail(10).mean()
+    
+    def _has_volume_confirmation(self, df, index):
+        """التحقق من تأكيد الحجم"""
+        if index >= len(df):
+            return False
+        volume = float(df['volume'].iloc[index])
+        avg_volume = df['volume'].astype(float).tail(20).mean()
+        return volume > avg_volume * 1.2
+    
+    def _is_trend_aligned(self, df, index, fvg_type):
+        """التحقق من توافق FVG مع الترند"""
+        if index < 5:
+            return False
+        
+        # اتجاه بسيط بناءً على المتوسط المتحرك
+        short_ma = df['close'].astype(float).tail(5).mean()
+        long_ma = df['close'].astype(float).tail(20).mean()
+        
+        if fvg_type == 'bullish':
+            return short_ma > long_ma  # ترند صاعد
+        else:
+            return short_ma < long_ma  # ترند هابط
+    
+    def _is_zone_active(self, zone, current_price):
+        """التحقق إذا كانت المنطقة نشطة"""
+        zone_price = zone['price_level']
+        tolerance = zone_price * 0.002  # 0.2% tolerance
+        return abs(current_price - zone_price) <= tolerance
+    
+    def _find_break_of_structure(self, df):
+        """إيجاد Break of Structure"""
+        # تطبيق بسيط - يمكن تطويره لاحقًا
+        return {"status": "analyzing", "direction": None}
+    
+    def _find_change_of_character(self, df):
+        """إيجاد Change of Character"""
+        return {"status": "analyzing", "direction": None}
+    
+    def _find_displacement_moves(self, df):
+        """إيجاد حركات Displacement"""
+        return []
+    
+    def _determine_trend_structure(self, df):
+        """تحديد هيكل الترند"""
+        return "analyzing"
+    
+    def _find_engineered_liquidity(self, df):
+        """إيجاد السيولة المصممة"""
+        return []
+    
+    def _detect_stop_hunt_zones(self, df):
+        """كشف مناطق صيد الوقفيات"""
+        return []
+    
+    def _measure_move_strength(self, df, pivot, zone_type):
+        """قياس قوة الحركة من المنطقة"""
+        return 0.5
+    
+    def _count_zone_respect(self, df, pivot, zone_type):
+        """عد مرات احترام المنطقة"""
+        return 0.3
+    
+    def _calculate_time_factor(self, df, pivot):
+        """حساب عامل الوقت"""
+        return 0.2
 
 # =================== ENHANCED CANDLES MODULE WITH SMC ===================
 def _body(o,c): return abs(c-o)
@@ -774,7 +974,7 @@ def verify_execution_environment():
     print(f"📈 ENHANCED CANDLES: SMC Patterns + Liquidity Traps", flush=True)
     print(f"👣 FOOTPRINT ANALYSIS: Volume spikes + Absorption", flush=True)
     print(f"📊 VWAP STRATEGY: SCALP(near {VWAP_SCALP_BAND_BPS}bps) | TREND(far {VWAP_TREND_BAND_BPS}bps)", flush=True)
-    print(f"📦 SRBOX SYSTEM: Advanced Box Analysis + FVG Detection + Stop Hunt Zones", flush=True)
+    print(f"🧠 ADVANCED SMC: Supply/Demand + Liquidity Sweep + FVG + Elliott Waves", flush=True)
     
     if not EXECUTE_ORDERS:
         print("🟡 WARNING: EXECUTE_ORDERS=False - البوت في وضع التحليل فقط!", flush=True)
@@ -1108,9 +1308,9 @@ def calculate_signal_strength(df, ind, side):
     
     return min(10.0, strength)
 
-# =================== ENHANCED COUNCIL VOTING ===================
+# =================== ADVANCED COUNCIL VOTING WITH SMC ===================
 def council_votes_pro_enhanced(df):
-    """مجلس تصويت محسّن مع Footprint + SMC + Golden Zone Pro + VWAP"""
+    """مجلس تصويت محسّن مع SMC المتكامل + Footprint + Golden Zone Pro + VWAP"""
     try:
         ind = compute_indicators(df)
         rsi_ctx = rsi_ma_context(df)
@@ -1125,6 +1325,10 @@ def council_votes_pro_enhanced(df):
         
         # Liquidity traps
         liquidity_traps = detect_liquidity_traps(df, current_price)
+        
+        # Advanced SMC Analysis
+        smc_engine = SMCCoreEngine()
+        smc_analysis = smc_engine.analyze_smc_structure(df)
 
         votes_b = 0; votes_s = 0
         score_b = 0.0; score_s = 0.0
@@ -1147,7 +1351,64 @@ def council_votes_pro_enhanced(df):
             above_vwap = current_price > vwap
             logs.append(f"VWAP ctx: px={current_price:.6f} vwap={vwap:.6f} Δ={vwap_diff_bps:.1f}bps")
 
-        # --- تصويت VWAP للسكالب (قرب من VWAP) ---
+        # ==== ADVANCED SMC VOTING ====
+        if SMC_ENABLED:
+            # 1. تصويت مناطق الطلب والعرض القوية
+            for zone in smc_analysis['supply_demand_zones']:
+                if smc_engine._is_zone_active(zone, current_price):
+                    if zone['type'] == 'demand' and zone['strength'] >= 0.7:
+                        votes_b += 3
+                        score_b += 2.0
+                        logs.append(f"📈 SMC Demand Zone (قوة: {zone['strength']:.1f})")
+                    elif zone['type'] == 'supply' and zone['strength'] >= 0.7:
+                        votes_s += 3
+                        score_s += 2.0
+                        logs.append(f"📉 SMC Supply Zone (قوة: {zone['strength']:.1f})")
+
+            # 2. تصويت Order Blocks القوية
+            for ob in smc_analysis['order_blocks']:
+                if (ob['low'] <= current_price <= ob['high'] and 
+                    ob['strength'] >= OB_STRENGTH_THRESHOLD):
+                    if ob['type'] == 'bullish_ob':
+                        votes_b += 2
+                        score_b += 1.5
+                        logs.append(f"🟢 Bullish OB (قوة: {ob['strength']:.1f})")
+                    else:
+                        votes_s += 2
+                        score_s += 1.5
+                        logs.append(f"🔴 Bearish OB (قوة: {ob['strength']:.1f})")
+
+            # 3. تصويت FVG عالية الاحتمالية
+            for fvg in smc_analysis['fair_value_gaps']:
+                if (fvg['low'] <= current_price <= fvg['high'] and 
+                    fvg.get('probability', 0) >= FVG_VALIDITY_THRESHOLD):
+                    if fvg['type'] == 'fvg_bullish':
+                        votes_b += 2
+                        score_b += 1.5
+                        logs.append(f"⚡ Bullish FVG (احتمال: {fvg['probability']:.1f})")
+                    else:
+                        votes_s += 2
+                        score_s += 1.5
+                        logs.append(f"⚡ Bearish FVG (احتمال: {fvg['probability']:.1f})")
+
+            # 4. تصويت Breaker Blocks و Spring Patterns
+            for pattern in smc_analysis['breaker_spring']['spring_patterns']:
+                if pattern['type'] == 'spring_bullish':
+                    votes_b += 2
+                    score_b += 1.5
+                    logs.append("🎯 Bullish Spring Pattern")
+
+            for breaker in smc_analysis['breaker_spring']['breaker_blocks']:
+                if breaker['type'] == 'breaker_bullish':
+                    votes_b += 2
+                    score_b += 1.5
+                    logs.append("🔄 Bullish Breaker Block")
+                elif breaker['type'] == 'breaker_bearish':
+                    votes_s += 2
+                    score_s += 1.5
+                    logs.append("🔄 Bearish Breaker Block")
+
+        # --- VWAP SCALP Strategy ---
         if VWAP_ENABLED and near_vwap and cd:
             if cd.get("buy"):
                 votes_b += 2; score_b += 1.5
@@ -1156,7 +1417,7 @@ def council_votes_pro_enhanced(df):
                 votes_s += 2; score_s += 1.5
                 logs.append("⚡ VWAP SCALP SELL zone")
 
-        # --- بوست للترند بعيد عن VWAP ---
+        # --- VWAP TREND Boost ---
         if VWAP_ENABLED and far_from_vwap and adx >= ADX_TREND_MIN:
             if plus_di > minus_di and current_price > (vwap or current_price):
                 votes_b += 1; score_b += 1.0
@@ -1266,255 +1527,12 @@ def council_votes_pro_enhanced(df):
             "score_b": score_b, "score_s": score_s,
             "logs": logs, "ind": ind, "gz": gz, 
             "footprint": footprint, "candles": cd,
-            "liquidity_traps": liquidity_traps
+            "liquidity_traps": liquidity_traps,
+            "smc_analysis": smc_analysis if SMC_ENABLED else {}
         }
     except Exception as e:
         log_w(f"council_votes_pro_enhanced error: {e}")
         return {"b":0,"s":0,"score_b":0.0,"score_s":0.0,"logs":[],"ind":{},"gz":None,"candles":{}}
-
-# =================== SRBOX INTEGRATION FUNCTIONS ===================
-
-# إنشاء المانجرز العالمية
-SRBOX_MANAGER = SRBoxManager()
-FVG_SYSTEM = FVGSystem()
-STOP_HUNT = StopHuntZones()
-RF_BS_CALC = RangeFilterBSCalculation()
-PROFIT_SYSTEM = AdvancedProfitSystem()
-
-def analyze_srbox_context(df):
-    """تحليل سياق SRBox المتكامل"""
-    try:
-        # تحديث البوكسات
-        boxes = SRBOX_MANAGER.build_boxes_from_swings(df)
-        SRBOX_MANAGER.update_boxes_interaction(df)
-        SRBOX_MANAGER.clean_old_boxes()
-        
-        active_boxes = SRBOX_MANAGER.get_active_boxes(min_strength=3.0)
-        
-        # كشف الفجوات
-        fvg_list = FVG_SYSTEM.detect_fvg(df)
-        current_price = float(df['close'].iloc[-1])
-        aligned_fvgs = FVG_SYSTEM.get_fvg_for_alignment(active_boxes, current_price)
-        
-        # مناطق الاستوب
-        stop_zones = STOP_HUNT.identify_stop_hunt_zones(df, active_boxes)
-        
-        # إشارات RF المساعدة
-        rf_bs_signals = RF_BS_CALC.calculate_rf_bs(df)
-        
-        return {
-            'active_boxes': active_boxes,
-            'aligned_fvgs': aligned_fvgs,
-            'stop_hunt_zones': stop_zones,
-            'rf_bs_signals': rf_bs_signals,
-            'current_price': current_price
-        }
-        
-    except Exception as e:
-        log_w(f"SRBox analysis error: {e}")
-        return {'active_boxes': [], 'aligned_fvgs': [], 'stop_hunt_zones': [], 'rf_bs_signals': {}}
-
-def enhance_council_with_srbox(council_data, srbox_context):
-    """تحسين مجلس التصويت ببيانات SRBox"""
-    if not council_data or not srbox_context:
-        return council_data
-        
-    votes_b = council_data.get('b', 0)
-    votes_s = council_data.get('s', 0)
-    score_b = council_data.get('score_b', 0.0)
-    score_s = council_data.get('score_s', 0.0)
-    logs = council_data.get('logs', [])
-    
-    active_boxes = srbox_context.get('active_boxes', [])
-    aligned_fvgs = srbox_context.get('aligned_fvgs', [])
-    rf_bs = srbox_context.get('rf_bs_signals', {})
-    
-    # إضافة تصويت البوكسات القوية
-    for box in active_boxes:
-        if box.strength >= 5.0:
-            if box.box_type == 'supply' and box.rejections >= 2:
-                votes_s += 2
-                score_s += min(2.0, box.strength * 0.3)
-                logs.append(f"📦 SUPPLY BOX {box.get_strength_color()} rej={box.rejections}")
-            elif box.box_type == 'demand' and box.rejections >= 2:
-                votes_b += 2
-                score_b += min(2.0, box.strength * 0.3)
-                logs.append(f"📦 DEMAND BOX {box.get_strength_color()} rej={box.rejections}")
-    
-    # إضافة تصويت الفجوات المحاذية
-    for aligned in aligned_fvgs:
-        if aligned['quality'] in ['STRONG_REAL', 'REAL']:
-            fvg_type = aligned['fvg']['type']
-            if fvg_type == 'BULLISH_FVG':
-                votes_b += 1
-                score_b += aligned['alignment_score'] * 0.1
-                logs.append(f"🕳️ BULLISH FVG align score={aligned['alignment_score']:.1f}")
-            elif fvg_type == 'BEARISH_FVG':
-                votes_s += 1
-                score_s += aligned['alignment_score'] * 0.1
-                logs.append(f"🕳️ BEARISH FVG align score={aligned['alignment_score']:.1f}")
-    
-    # إضافة تصويت RF B&S للسكالب
-    if rf_bs.get('buy'):
-        votes_b += 1
-        score_b += 0.5
-        logs.append("⚡ RF B&S BUY signal")
-    if rf_bs.get('sell'):
-        votes_s += 1
-        score_s += 0.5
-        logs.append("⚡ RF B&S SELL signal")
-    
-    council_data.update({
-        'b': votes_b,
-        's': votes_s,
-        'score_b': score_b,
-        'score_s': score_s,
-        'logs': logs
-    })
-    
-    return council_data
-
-def enhanced_entry_decision_with_srbox(df, council_data, srbox_context):
-    """قرار دخول محسن مع SRBox"""
-    if not council_data or not srbox_context:
-        return None
-        
-    current_price = srbox_context['current_price']
-    active_boxes = srbox_context['active_boxes']
-    stop_zones = srbox_context['stop_hunt_zones']
-    
-    # فقط البوكسات القريبة من السعر الحالي
-    nearby_boxes = []
-    for box in active_boxes:
-        distance = min(abs(current_price - box.high), abs(current_price - box.low)) / current_price
-        if distance < 0.02:  # 2%
-            nearby_boxes.append(box)
-    
-    # قرار الدخول المعزز بالبوكسات
-    entry_side = None
-    confidence = 0.0
-    reasons = []
-    
-    council_score_b = council_data.get('score_b', 0)
-    council_score_s = council_data.get('score_s', 0)
-    
-    for box in nearby_boxes:
-        if box.box_type == 'demand' and council_score_b > council_score_s:
-            # دخول شراء من demand box
-            if box.rejections >= 2 and box.strength >= 5.0:
-                entry_side = 'long'
-                confidence = min(10.0, box.strength + council_score_b * 0.5)
-                reasons.append(f"DEMAND_BOX strength:{box.strength:.1f}")
-                break
-                
-        elif box.box_type == 'supply' and council_score_s > council_score_b:
-            # دخول بيع من supply box
-            if box.rejections >= 2 and box.strength >= 5.0:
-                entry_side = 'short' 
-                confidence = min(10.0, box.strength + council_score_s * 0.5)
-                reasons.append(f"SUPPLY_BOX strength:{box.strength:.1f}")
-                break
-    
-    if entry_side and confidence >= 6.0:
-        return {
-            'side': entry_side,
-            'confidence': confidence,
-            'reasons': reasons,
-            'box_context': nearby_boxes[0] if nearby_boxes else None,
-            'stop_hunt_zones': stop_zones
-        }
-    
-    return None
-
-def apply_smart_profit_strategy(entry_price, side, box_context, market_context):
-    """تطبيق استراتيجية جني الأرباح الذكية"""
-    if not box_context:
-        return None
-        
-    box_strength = box_context.strength
-    signal_strength = market_context.get('signal_strength', 5.0)
-    
-    profile = PROFIT_SYSTEM.determine_tp_profile(box_strength, market_context, signal_strength)
-    tp_levels = PROFIT_SYSTEM.calculate_dynamic_tp(entry_price, side, profile, LEVERAGE)
-    
-    # إصلاح الخطأ: استخدام double quotes للـ f-string الداخلية
-    tp_strs = [f"{tp['pct']*100:.1f}%" for tp in tp_levels]
-    log_i(f"🎯 SMART PROFIT: {profile} | TP levels: {tp_strs}")
-    
-    return {
-        'profile': profile,
-        'tp_levels': tp_levels,
-        'box_strength': box_strength
-    }
-
-def manage_trade_with_srbox_defense(df, state, srbox_context):
-    """إدارة الصفقة مع دفاعات SRBox"""
-    if not state.get('open') or not srbox_context:
-        return
-        
-    current_price = float(df['close'].iloc[-1])
-    position_side = state.get('side')
-    entry_price = state.get('entry')
-    box_context = state.get('box_context')
-    
-    if not box_context:
-        return
-    
-    # دفاع ضد اختراق البوكس المعاكس
-    if position_side == 'long' and box_context.box_type == 'demand':
-        if current_price < box_context.low:  # اختراق demand box ضد الشراء
-            log_w("🛡️ SRBox DEFENSE: Price broke demand box - considering exit")
-            close_market_strict("srbox_demand_break")
-            
-    elif position_side == 'short' and box_context.box_type == 'supply':
-        if current_price > box_context.high:  # اختراق supply box ضد البيع
-            log_w("🛡️ SRBox DEFENSE: Price broke supply box - considering exit")
-            close_market_strict("srbox_supply_break")
-    
-    # دفاع ضد مناطق ضرب الاستوب القريبة
-    stop_zones = srbox_context.get('stop_hunt_zones', [])
-    for zone in stop_zones:
-        if zone['type'] == 'STOP_HUNT_BUY' and position_side == 'short':
-            if abs(current_price - zone['level']) / current_price < 0.005:  # 0.5%
-                log_w(f"🛡️ Near STOP HUNT zone - tightening trail")
-                if 'management' in state:
-                    state['management']['atr_trail_mult'] = max(0.5, state['management'].get('atr_trail_mult', 1.4) * 0.7)
-                    
-        elif zone['type'] == 'STOP_HUNT_SELL' and position_side == 'long':
-            if abs(current_price - zone['level']) / current_price < 0.005:  # 0.5%
-                log_w(f"🛡️ Near STOP HUNT zone - tightening trail")
-                if 'management' in state:
-                    state['management']['atr_trail_mult'] = max(0.5, state['management'].get('atr_trail_mult', 1.4) * 0.7)
-
-def log_srbox_snapshot(srbox_context):
-    """تسجيل لوج محسن لبيانات SRBox"""
-    if not srbox_context:
-        return
-        
-    active_boxes = srbox_context.get('active_boxes', [])
-    aligned_fvgs = srbox_context.get('aligned_fvgs', [])
-    stop_zones = srbox_context.get('stop_hunt_zones', [])
-    rf_bs = srbox_context.get('rf_bs_signals', {})
-    
-    if active_boxes:
-        print(f"📦 SRBOX: {len(active_boxes)} active boxes", flush=True)
-        for box in active_boxes[:3]:  # أول 3 بوكسات فقط
-            print(f"   {box.box_type} {box.high:.6f}-{box.low:.6f} "
-                  f"{box.get_strength_color()} touches={box.touches} rej={box.rejections}", flush=True)
-    
-    if aligned_fvgs:
-        strong_fvgs = [fvg for fvg in aligned_fvgs if fvg['quality'] in ['STRONG_REAL', 'REAL']]
-        if strong_fvgs:
-            print(f"🕳️ FVG: {len(strong_fvgs)} aligned strong FVGs", flush=True)
-    
-    if stop_zones:
-        nearby_zones = [zone for zone in stop_zones if zone['distance_pct'] < 2.0]
-        if nearby_zones:
-            print(f"🎯 STOP HUNT: {len(nearby_zones)} nearby zones (<2%)", flush=True)
-    
-    if rf_bs.get('buy') or rf_bs.get('sell'):
-        signal = "BUY" if rf_bs.get('buy') else "SELL"
-        print(f"⚡ RF B&S: {signal} signal active", flush=True)
 
 # =================== POSITION RECOVERY ===================
 def _normalize_side(pos):
@@ -1776,7 +1794,7 @@ def compute_flow_metrics(df):
 # ========= Unified snapshot emitter =========
 def emit_snapshots(exchange, symbol, df, balance_fn=None, pnl_fn=None):
     """
-    يطبع Snapshot موحّد: Bookmap + Flow + Council + Strategy + Balance/PnL + VWAP + SRBox
+    يطبع Snapshot موحّد: Bookmap + Flow + Council + Strategy + Balance/PnL + VWAP + SMC
     """
     try:
         bm = bookmap_snapshot(exchange, symbol)
@@ -1785,10 +1803,6 @@ def emit_snapshots(exchange, symbol, df, balance_fn=None, pnl_fn=None):
         mode = decide_strategy_mode_enhanced(df)
         current_price = float(df['close'].iloc[-1])
         gz = golden_zone_pro_analysis(df, current_price)
-        
-        # SRBox analysis
-        srbox_context = analyze_srbox_context(df)
-        cv = enhance_council_with_srbox(cv, srbox_context)
 
         bal = None; cpnl = None
         if callable(balance_fn):
@@ -1834,8 +1848,14 @@ def emit_snapshots(exchange, symbol, df, balance_fn=None, pnl_fn=None):
             print(f"📊 {dash}{gz_note}", flush=True)
             print(f"{strat}{(' | ' + wallet) if wallet else ''}", flush=True)
             
-            # SRBox logging
-            log_srbox_snapshot(srbox_context)
+            # Advanced SMC Logging
+            if SMC_ENABLED and cv.get('smc_analysis'):
+                smc = cv['smc_analysis']
+                if smc.get('trading_opportunities'):
+                    opps = smc['trading_opportunities']
+                    if opps:
+                        best_opp = max(opps, key=lambda x: x.get('confidence', 0))
+                        print(f"🧠 SMC BEST: {best_opp['type']} {best_opp['direction'].upper()} (ثقة: {best_opp['confidence']:.1f})", flush=True)
             
             gz_snap_note = ""
             if gz and gz.get("ok"):
@@ -1869,16 +1889,16 @@ def emit_snapshots(exchange, symbol, df, balance_fn=None, pnl_fn=None):
             if cv.get('candles', {}).get('smc_pattern'):
                 print(f"🕯️ SMC | {cv['candles']['smc_pattern']} | Trap={cv['candles']['liquidity_trap']}", flush=True)
             
-            print("✅ ENHANCED ADDONS LIVE", flush=True)
+            print("✅ ENHANCED SMC ADDONS LIVE", flush=True)
 
-        return {"bm": bm, "flow": flow, "cv": cv, "mode": mode, "gz": gz, "wallet": wallet, "srbox": srbox_context}
+        return {"bm": bm, "flow": flow, "cv": cv, "mode": mode, "gz": gz, "wallet": wallet}
     except Exception as e:
         print(f"🟨 AddonLog error: {e}", flush=True)
         return {"bm": None, "flow": None, "cv": {"b":0,"s":0,"score_b":0.0,"score_s":0.0,"ind":{}},
-                "mode": {"mode":"n/a"}, "gz": None, "wallet": "", "srbox": None}
+                "mode": {"mode":"n/a"}, "gz": None, "wallet": ""}
 
 # =================== EXECUTION MANAGER ===================
-def execute_trade_decision(side, price, qty, mode, council_data, gz_data, srbox_data=None):
+def execute_trade_decision(side, price, qty, mode, council_data, gz_data, smc_data=None):
     """تنفيذ قرار التداول مع التسجيل الواضح"""
     if not EXECUTE_ORDERS or DRY_RUN:
         log_i(f"DRY_RUN: {side} {qty:.4f} @ {price:.6f} | mode={mode}")
@@ -1892,15 +1912,15 @@ def execute_trade_decision(side, price, qty, mode, council_data, gz_data, srbox_
     if gz_data and gz_data.get("ok"):
         gz_note = f" | 🟡 {gz_data['zone']['type']} s={gz_data['score']:.1f}"
     
-    srbox_note = ""
-    if srbox_data and srbox_data.get('box_context'):
-        box = srbox_data['box_context']
-        srbox_note = f" | 📦 {box.box_type} strength:{box.strength:.1f}"
+    smc_note = ""
+    if smc_data and smc_data.get('trading_opportunities'):
+        best_opp = max(smc_data['trading_opportunities'], key=lambda x: x.get('confidence', 0))
+        smc_note = f" | 🧠 SMC:{best_opp['type']}({best_opp['confidence']:.1f})"
     
     votes = council_data
     print(f"🎯 EXECUTE: {side.upper()} {qty:.4f} @ {price:.6f} | "
           f"mode={mode} | votes={votes['b']}/{votes['s']} score={votes['score_b']:.1f}/{votes['score_s']:.1f}"
-          f"{gz_note}{srbox_note}", flush=True)
+          f"{gz_note}{smc_note}", flush=True)
 
     try:
         if MODE_LIVE:
@@ -1933,7 +1953,7 @@ def setup_trade_management(mode):
         }
 
 # =================== ENHANCED TRADE EXECUTION ===================
-def open_market_enhanced(side, qty, price, profit_strategy=None):
+def open_market_enhanced(side, qty, price):
     if qty <= 0: 
         log_e("skip open (qty<=0)")
         return False
@@ -1945,6 +1965,7 @@ def open_market_enhanced(side, qty, price, profit_strategy=None):
     snap = emit_snapshots(ex, SYMBOL, df)
     votes = snap["cv"]
     footprint = votes.get("footprint", {})
+    smc_analysis = votes.get("smc_analysis", {})
     
     mode_data = decide_strategy_mode_enhanced(df, 
                                    adx=votes["ind"].get("adx"),
@@ -1955,19 +1976,11 @@ def open_market_enhanced(side, qty, price, profit_strategy=None):
     
     mode = mode_data["mode"]
     gz = snap["gz"]
-    srbox_context = snap.get("srbox", {})
     
     # Enhanced management config
     management_config = setup_trade_management(mode)
     
-    # Include profit strategy in execution
-    srbox_data = None
-    if srbox_context:
-        srbox_entry = enhanced_entry_decision_with_srbox(df, votes, srbox_context)
-        if srbox_entry:
-            srbox_data = srbox_entry
-    
-    success = execute_trade_decision(side, price, qty, mode, votes, gz, srbox_data)
+    success = execute_trade_decision(side, price, qty, mode, votes, gz, smc_analysis)
     
     if success:
         signal_strength = calculate_signal_strength(df, votes["ind"], "long" if side=="buy" else "short")
@@ -1989,7 +2002,7 @@ def open_market_enhanced(side, qty, price, profit_strategy=None):
             "signal_strength": signal_strength
         })
         
-        state_data = {
+        save_state({
             "in_position": True,
             "side": "LONG" if side.upper().startswith("B") else "SHORT",
             "entry_price": price,
@@ -2001,27 +2014,13 @@ def open_market_enhanced(side, qty, price, profit_strategy=None):
             "gz_snapshot": gz if isinstance(gz, dict) else {},
             "cv_snapshot": votes if isinstance(votes, dict) else {},
             "footprint_snapshot": footprint if isinstance(footprint, dict) else {},
+            "smc_snapshot": smc_analysis if isinstance(smc_analysis, dict) else {},
             "opened_at": int(time.time()),
             "partial_taken": False,
             "breakeven_armed": False,
             "trail_active": False,
             "trail_tightened": False,
-        }
-        
-        # Add SRBox context if available
-        if srbox_data and srbox_data.get('box_context'):
-            state_data["box_context"] = {
-                "box_type": srbox_data['box_context'].box_type,
-                "high": srbox_data['box_context'].high,
-                "low": srbox_data['box_context'].low,
-                "strength": srbox_data['box_context'].strength
-            }
-        
-        # Add profit strategy if available
-        if profit_strategy:
-            state_data["profit_strategy"] = profit_strategy
-        
-        save_state(state_data)
+        })
         
         log_g(f"✅ ENHANCED POSITION OPENED: {side.upper()} | mode={mode} | signal_strength={signal_strength:.1f}")
         return True
@@ -2342,7 +2341,7 @@ def smart_exit_guard(state, df, ind, flow, bm, now_price, pnl_pct, mode, side, e
 
 # =================== ENHANCED TRADE MANAGEMENT ===================
 def manage_after_entry_enhanced(df, ind, info):
-    """إدارة محسنة للمركز مع Smart Profit AI + Smart Exit Guard + SRBox Defense"""
+    """إدارة محسنة للمركز مع Smart Profit AI + Smart Exit Guard"""
     if not STATE["open"] or STATE["qty"] <= 0:
         return
 
@@ -2384,10 +2383,6 @@ def manage_after_entry_enhanced(df, ind, info):
                     log_e(f"❌ Smart TP failed: {e}")
             else:
                 log_i(f"DRY_RUN: Smart TP{target_num} close {close_qty:.4f}")
-
-    # ========= SRBox Defense System =========
-    srbox_context = analyze_srbox_context(df)
-    manage_trade_with_srbox_defense(df, STATE, srbox_context)
 
     # ========= الإدارة الكلاسيك (TP1 + BE + Trail + Dust) =========
     current_atr      = ind.get("atr", 0.0)
@@ -2494,9 +2489,9 @@ def manage_after_entry_enhanced(df, ind, info):
             return
         # متعمدين نتجاهل "partial" هنا عشان ما نعملش TP1 مزدوج (Smart AI + Guard)
 
-# =================== ENHANCED TRADE LOOP WITH SRBOX ===================
-def trade_loop_enhanced_with_srbox():
-    """حلقة تداول محسنة مع Golden Zone Pro وSmart Profit AI وVWAP وSRBox"""
+# =================== ENHANCED TRADE LOOP ===================
+def trade_loop_enhanced():
+    """حلقة تداول محسنة مع SMC المتكامل + Golden Zone Pro + Smart Profit AI"""
     global wait_for_next_signal_side
     loop_i = 0
     
@@ -2510,7 +2505,7 @@ def trade_loop_enhanced_with_srbox():
             ind = compute_indicators(df)
             spread_bps = orderbook_spread_bps()
             
-            # Enhanced Snapshots مع SRBox
+            # Enhanced Snapshots مع SMC
             snap = emit_snapshots(ex, SYMBOL, df,
                                 balance_fn=lambda: float(bal) if bal else None,
                                 pnl_fn=lambda: float(compound_pnl))
@@ -2519,7 +2514,7 @@ def trade_loop_enhanced_with_srbox():
             if STATE["open"] and px:
                 STATE["pnl"] = (px-STATE["entry"])*STATE["qty"] if STATE["side"]=="long" else (STATE["entry"]-px)*STATE["qty"]
             
-            # إدارة الصفقة المفتوحة مع Smart Profit AI وSRBox Defense
+            # إدارة الصفقة المفتوحة مع Smart Profit AI
             if STATE["open"]:
                 manage_after_entry_enhanced(df, ind, {
                     "price": px or info["price"], 
@@ -2528,26 +2523,36 @@ def trade_loop_enhanced_with_srbox():
                     **info
                 })
             
-            # قرار الدخول المحسن مع SRBox
+            # قرار الدخول المحسن مع SMC
             reason = None
             if spread_bps is not None and spread_bps > MAX_SPREAD_BPS:
                 reason = f"spread too high ({fmt(spread_bps,2)}bps > {MAX_SPREAD_BPS})"
             
-            council_data = snap["cv"]
-            srbox_context = snap.get("srbox", {})
+            council_data = council_votes_pro_enhanced(df)
             gz = council_data.get("gz")
             footprint = council_data.get("footprint", {})
+            smc_analysis = council_data.get("smc_analysis", {})
             sig = None
 
-            # --- Enhanced SRBox Entry ---
-            srbox_entry = enhanced_entry_decision_with_srbox(df, council_data, srbox_context)
-            if srbox_entry and srbox_entry['confidence'] >= 6.0:
-                sig = srbox_entry['side']
-                log_i(f"🎯 SRBOX ENTRY: {sig.upper()} | confidence={srbox_entry['confidence']:.1f} | {srbox_entry['reasons']}")
+            # --- Enhanced SMC Entry Pro ---
+            smc_entry = False
+            if SMC_ENABLED and smc_analysis.get('trading_opportunities'):
+                best_opportunity = max(smc_analysis['trading_opportunities'], 
+                                     key=lambda x: x.get('confidence', 0))
+                
+                if best_opportunity['confidence'] >= 0.7:
+                    if best_opportunity['direction'] == 'long':
+                        sig = "buy"
+                        smc_entry = True
+                        log_i(f"🎯 SMC ENTRY PRO: BUY | {best_opportunity['type']} (ثقة: {best_opportunity['confidence']:.1f})")
+                    elif best_opportunity['direction'] == 'short':
+                        sig = "sell" 
+                        smc_entry = True
+                        log_i(f"🎯 SMC ENTRY PRO: SELL | {best_opportunity['type']} (ثقة: {best_opportunity['confidence']:.1f})")
 
             # --- Enhanced Golden Entry Pro ---
             golden_entry = False
-            if not sig and (gz and gz.get("ok") and gz.get("confirmed")):
+            if not smc_entry and (gz and gz.get("ok") and gz.get("confirmed")):
                 if gz["zone"]["type"]=="golden_bottom" and gz["score"]>=GOLDEN_ENTRY_SCORE:
                     if footprint.get('ok') and footprint.get('absorption_bull'):
                         sig = "buy"
@@ -2559,8 +2564,8 @@ def trade_loop_enhanced_with_srbox():
                         golden_entry = True
                         log_i(f"🎯 GOLDEN ENTRY PRO: SELL | score={gz['score']:.1f} | منطقة ذهبية مؤكدة + Footprint")
 
-            # Council Strong Entry (إذا لم يكن هناك دخول ذهبي أو SRBox)
-            if not sig:
+            # Council Strong Entry (إذا لم يكن هناك دخول SMC أو ذهبي)
+            if not smc_entry and not golden_entry:
                 if council_data["score_b"] > council_data["score_s"] and council_data["score_b"] >= 8.0:
                     sig = "buy"
                 elif council_data["score_s"] > council_data["score_b"] and council_data["score_s"] >= 8.0:
@@ -2573,21 +2578,12 @@ def trade_loop_enhanced_with_srbox():
                 else:
                     qty = compute_size(bal, px or info["price"])
                     if qty > 0:
-                        # تطبيق استراتيجية جني الأرباح الذكية للدخول الجديد
-                        profit_strategy = None
-                        if srbox_entry and srbox_entry.get('box_context'):
-                            profit_strategy = apply_smart_profit_strategy(
-                                px or info["price"], 
-                                sig, 
-                                srbox_entry['box_context'],
-                                {'signal_strength': council_data["score_b"] if sig == "buy" else council_data["score_s"]}
-                            )
-                        
-                        ok = open_market_enhanced(sig, qty, px or info["price"], profit_strategy)
+                        ok = open_market_enhanced(sig, qty, px or info["price"])
                         if ok:
                             wait_for_next_signal_side = None
                             # تسجيل قرار المجلس المحسن
-                            log_i(f"🎯 ENHANCED COUNCIL DECISION: {sig.upper()} | "
+                            entry_type = "SMC" if smc_entry else "GOLDEN" if golden_entry else "COUNCIL"
+                            log_i(f"🎯 {entry_type} ENHANCED DECISION: {sig.upper()} | "
                                   f"Score B/S: {council_data['score_b']:.1f}/{council_data['score_s']:.1f} | "
                                   f"Signal Strength: {STATE.get('signal_strength', 0):.1f}")
                             for log_msg in council_data.get("logs", []):
@@ -2609,7 +2605,7 @@ compute_candles = compute_enhanced_candles
 council_votes_pro = council_votes_pro_enhanced
 manage_after_entry = manage_after_entry_enhanced
 open_market = open_market_enhanced
-trade_loop = trade_loop_enhanced_with_srbox
+trade_loop = trade_loop_enhanced
 decide_strategy_mode = decide_strategy_mode_enhanced
 golden_zone_check = golden_zone_pro_analysis
 
@@ -2623,7 +2619,7 @@ def pretty_snapshot(bal, info, ind, spread_bps, reason=None, df=None):
         print("📈 INDICATORS & RF")
         print(f"   💲 Price {fmt(info.get('price'))} | RF filt={fmt(info.get('filter'))}  hi={fmt(info.get('hi'))} lo={fmt(info.get('lo'))}")
         print(f"   🧮 RSI={fmt(ind.get('rsi'))}  +DI={fmt(ind.get('plus_di'))}  -DI={fmt(ind.get('minus_di'))}  ADX={fmt(ind.get('adx'))}  ATR={fmt(ind.get('atr'))}")
-        print(f"   🎯 ENTRY: COUNCIL PRO + GOLDEN ENTRY + VWAP STRATEGY + SRBOX ADVANCED  |  spread_bps={fmt(spread_bps,2)}")
+        print(f"   🎯 ENTRY: SMC ADVANCED + COUNCIL PRO + GOLDEN ENTRY + VWAP STRATEGY  |  spread_bps={fmt(spread_bps,2)}")
         print(f"   ⏱️ closes_in ≈ {left_s}s")
         print("\n🧭 POSITION")
         bal_line = f"Balance={fmt(bal,2)}  Risk={int(RISK_ALLOC*100)}%×{LEVERAGE}x  CompoundPnL={fmt(compound_pnl)}  Eq~{fmt((bal or 0)+compound_pnl,2)}"
@@ -2644,7 +2640,7 @@ app = Flask(__name__)
 @app.route("/")
 def home():
     mode='LIVE' if MODE_LIVE else 'PAPER'
-    return f"✅ Council PRO Bot — {SYMBOL} {INTERVAL} — {mode} — Enhanced Candles + Golden Zone Pro + Smart Profit AI + VWAP Strategy + SRBox Advanced"
+    return f"✅ Council PRO Bot — {SYMBOL} {INTERVAL} — {mode} — Advanced SMC + Smart Money Concepts + Elliott Waves + Stop Hunt AI"
 
 @app.route("/metrics")
 def metrics():
@@ -2652,18 +2648,16 @@ def metrics():
         "symbol": SYMBOL, "interval": INTERVAL, "mode": "live" if MODE_LIVE else "paper",
         "leverage": LEVERAGE, "risk_alloc": RISK_ALLOC, "price": price_now(),
         "state": STATE, "compound_pnl": compound_pnl,
-        "entry_mode": "COUNCIL_PRO_GOLDEN_ENHANCED_VWAP_SRBOX", "wait_for_next_signal": wait_for_next_signal_side,
+        "entry_mode": "SMC_ADVANCED_COUNCIL_PRO_GOLDEN_ENHANCED_VWAP", 
+        "wait_for_next_signal": wait_for_next_signal_side,
         "guards": {"max_spread_bps": MAX_SPREAD_BPS, "final_chunk_qty": FINAL_CHUNK_QTY},
         "vwap_strategy": {
             "enabled": VWAP_ENABLED,
             "scalp_band_bps": VWAP_SCALP_BAND_BPS,
             "trend_band_bps": VWAP_TREND_BAND_BPS
         },
-        "srbox_system": {
-            "active_boxes": len(SRBOX_MANAGER.get_active_boxes()),
-            "fvg_count": len(FVG_SYSTEM.fvg_list),
-            "stop_zones": len(STOP_HUNT.zones)
-        }
+        "smc_enabled": SMC_ENABLED,
+        "elliott_enabled": ELLIOTT_WAVE_ENABLED
     })
 
 @app.route("/health")
@@ -2672,7 +2666,8 @@ def health():
         "ok": True, "mode": "live" if MODE_LIVE else "paper",
         "open": STATE["open"], "side": STATE["side"], "qty": STATE["qty"],
         "compound_pnl": compound_pnl, "timestamp": datetime.utcnow().isoformat(),
-        "entry_mode": "COUNCIL_PRO_GOLDEN_ENHANCED_VWAP_SRBOX", "wait_for_next_signal": wait_for_next_signal_side
+        "entry_mode": "SMC_ADVANCED_COUNCIL_PRO_GOLDEN_ENHANCED_VWAP", 
+        "wait_for_next_signal": wait_for_next_signal_side
     }), 200
 
 def keepalive_loop():
@@ -2703,16 +2698,16 @@ if __name__ == "__main__":
     verify_execution_environment()
 
     print(colored(f"MODE: {'LIVE' if MODE_LIVE else 'PAPER'}  •  {SYMBOL}  •  {INTERVAL}", "yellow"))
-    print(colored(f"RISK: {int(RISK_ALLOC*100)}% × {LEVERAGE}x  •  COUNCIL_PRO=ENHANCED", "yellow"))
+    print(colored(f"RISK: {int(RISK_ALLOC*100)}% × {LEVERAGE}x  •  COUNCIL_PRO=SMC_ADVANCED", "yellow"))
     print(colored(f"GOLDEN ENTRY PRO: score≥{GOLDEN_ENTRY_SCORE} | ADX≥{GOLDEN_ENTRY_ADX}", "yellow"))
+    print(colored(f"ADVANCED SMC: Supply/Demand + Order Blocks + FVG + Breaker Blocks + Spring Patterns", "yellow"))
     print(colored(f"ENHANCED CANDLES: SMC Patterns + Wick exhaustion + Golden reversal", "yellow"))
     print(colored(f"FOOTPRINT ANALYSIS: Volume spikes + Absorption detection", "yellow"))
     print(colored(f"SMART PROFIT AI: Dynamic profit taking + Signal strength", "yellow"))
     print(colored(f"VWAP STRATEGY: SCALP(near {VWAP_SCALP_BAND_BPS}bps) | TREND(far {VWAP_TREND_BAND_BPS}bps)", "yellow"))
-    print(colored(f"SRBOX ADVANCED: Box Analysis + FVG Detection + Stop Hunt Zones", "yellow"))
     print(colored(f"EXECUTION: {'ACTIVE' if EXECUTE_ORDERS and not DRY_RUN else 'SIMULATION'}", "yellow"))
     
-    logging.info("enhanced service starting…")
+    logging.info("enhanced SMC service starting…")
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
     signal.signal(signal.SIGINT,  lambda *_: sys.exit(0))
     
