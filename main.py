@@ -14,6 +14,7 @@ RF Futures Bot — RF-LIVE ONLY (BingX Perp via CCXT)
 • EDGE ALGO ENGINE: RR Zones + Setup Quality + Dynamic Profit Profiles
 • CVD DIVERGENCE OSCILLATOR: TradingFinder-style divergence detection
 • ENHANCED FILTERS: CVD ADX≥20 + Score≥8 | SMC Confidence≥0.8 | Signal Strength≥6.0
+• SMART SIGNAL & SMART PROFIT SYSTEM: RF Master + Edge Zones + HOLD-TP Logic
 """
 
 import os, time, math, random, signal, sys, traceback, logging, json
@@ -48,7 +49,7 @@ SHADOW_MODE_DASHBOARD = False
 DRY_RUN = False
 
 # ==== Addon: Logging + Recovery Settings ====
-BOT_VERSION = "DOGE Council PRO v7.0 — Ultra Market Structure + Real RF + VWAP + SMC Advanced + Elliott Waves + Stop Hunt AI + ADX+ATR Filters + EdgeAlgo + CVD Divergence + ENHANCED FILTERS"
+BOT_VERSION = "DOGE Council PRO v8.0 — Ultra Market Structure + Real RF + VWAP + SMC Advanced + Elliott Waves + Stop Hunt AI + ADX+ATR Filters + EdgeAlgo + CVD Divergence + ENHANCED FILTERS + SMART SIGNAL/PROFIT"
 print("🔁 Booting:", BOT_VERSION, flush=True)
 
 STATE_PATH = "./bot_state.json"
@@ -104,6 +105,20 @@ TREND_TP_FRACS  = [0.30, 0.30, 0.20]
 
 SCALP_TPS       = [0.40]
 SCALP_TP_FRACS  = [0.60]
+
+# ==== Smart Signal / Smart Profit Settings ====
+# أقل قوة إشارة مسموح بيها عشان ندخل من الأساس
+MIN_SIGNAL_FOR_ENTRY        = 6.0   # أقل من كده = سكالب تافه → نرميه
+MIN_SIGNAL_FOR_SCALP_ENTRY  = 8.0   # في بيئة سكالب/عرضية لازم الإشارة تكون قوية جدًا
+
+# منطق HOLD-TP بعد TP1
+HOLD_AFTER_TP1_MIN_STRENGTH = 7.0   # قوة الإشارة المطلوبة بعد TP1
+HOLD_AFTER_TP1_MIN_ADX      = 22.0  # ADX محترم
+HOLD_AFTER_TP1_EXTRA_BOOST  = 1.30  # نرفع الهدف 30%
+
+# لو الإشارة خرافية جدًا
+VERY_STRONG_SIGNAL          = 8.5
+VERY_STRONG_TP_BOOST        = 1.50  # نرفع الهدف 50%
 
 # Dust guard
 FINAL_CHUNK_QTY = float(os.getenv("FINAL_CHUNK_QTY", 40.0))
@@ -2058,6 +2073,7 @@ def verify_execution_environment():
     print(f"🧠 EDGE ALGO ENGINE: RR Zones + Setup Quality + Dynamic Profit Profiles", flush=True)
     print(f"📊 CVD DIVERGENCE OSCILLATOR: TradingFinder-style divergence detection", flush=True)
     print(f"🔒 ENHANCED ENTRY FILTERS: CVD ADX≥{CVD_ADX_MIN} + Score≥{CVD_SCORE_MIN} | SMC Confidence≥{SMC_CONFIDENCE_MIN} | Signal Strength≥{SIGNAL_STRENGTH_MIN}", flush=True)
+    print(f"🧠 SMART SIGNAL/PROFIT SYSTEM: RF Master + HOLD-TP Logic + Edge Zones", flush=True)
     
     if not EXECUTE_ORDERS:
         print("🟡 WARNING: EXECUTE_ORDERS=False - البوت في وضع التحليل فقط!", flush=True)
@@ -2304,51 +2320,86 @@ def decide_strategy_mode_enhanced(df, adx=None, di_plus=None, di_minus=None, rsi
 # =================== SMART PROFIT AI ===================
 def smart_profit_ai_decision(state, df, ind, mode, side, entry_price, current_price):
     """
-    ذكاء اصطناعي لجني الأرباح بشكل ذكي حسب قوة الصفقة
+    ذكاء اصطناعي لجني الأرباح:
+    - يعتمد على profit_profile من الحالة (SCALP_STRICT / MID_2TP / TREND_3TP)
+    - يفرق بين TP1 وما بعدها
+    - يطبق HOLD-TP ورفع الأهداف لما الصفقة تكون قوية
     """
-    pnl_pct = (current_price - entry_price) / entry_price * 100 * (1 if side == "long" else -1)
-    
-    if mode == "scalp":
-        # جني الأرباح على مرحلة واحدة للسكالب
-        tp_levels = SCALP_TPS
-        tp_fractions = SCALP_TP_FRACS
-        max_tp = max(tp_levels)
-    else:
-        # جني الأرباح على 3 مراحل للترند
-        tp_levels = TREND_TPS
-        tp_fractions = TREND_TP_FRACS
-        max_tp = max(tp_levels)
-    
-    achieved_targets = state.get("profit_targets_achieved", 0)
+    # PnL % كنسبة مئوية
+    pnl_pct = (current_price - entry_price) / entry_price * 100.0 * (1 if side == "long" else -1)
+
+    profit_profile      = state.get("profit_profile", "SCALP_STRICT")
+    achieved_targets    = state.get("profit_targets_achieved", 0)
+    highest_profit_pct  = state.get("highest_profit_pct", 0.0)
+
+    # اختيار سلم الـ TP حسب البروفايل
+    if profit_profile == "TREND_3TP":
+        tp_levels    = TREND_TPS[:]         # مثال: [0.50, 1.00, 1.80]
+        tp_fractions = TREND_TP_FRACS[:]    # [0.30, 0.30, 0.20]
+    elif profit_profile == "MID_2TP":
+        tp_levels    = TREND_TPS[:2]        # نستخدم أول هدفين كصفقة mid
+        tp_fractions = [0.50, 0.50]
+    else:  # SCALP_STRICT
+        tp_levels    = SCALP_TPS[:]
+        tp_fractions = SCALP_TP_FRACS[:]
+
     next_target_index = achieved_targets
-    
     if next_target_index >= len(tp_levels):
-        return {"action": "hold", "target": None, "reason": "كل الأهداف محققة"}
-    
-    next_target_pct = tp_levels[next_target_index]
+        # كل أهداف السلم اتحققت بالفعل
+        return {"action": "hold", "target": None, "reason": "all_targets_reached"}
+
+    base_target_pct      = tp_levels[next_target_index]
     next_target_fraction = tp_fractions[next_target_index]
-    
-    # تحسين القرار بناء على قوة الإشارة
+
+    # قوة الإشارة
     signal_strength = calculate_signal_strength(df, ind, side)
-    
-    # تعديل الأهداف حسب قوة الإشارة
-    if signal_strength >= 8.0:  # إشارة قوية جداً
-        next_target_pct *= 1.2  # زيادة الهدف 20%
-    elif signal_strength >= 6.0:  # إشارة قوية
-        next_target_pct *= 1.1  # زيادة الهدف 10%
-    elif signal_strength < 4.0:  # إشارة ضعيفة
-        next_target_pct *= 0.8  # تقليل الهدف 20%
-    
-    if pnl_pct >= next_target_pct:
+    adx             = float(ind.get("adx", 0.0))
+
+    boosted_target_pct = base_target_pct
+
+    # ===== بعد TP1 في صفقات MID/TREND: HOLD-TP ورفع الأهداف =====
+    if profit_profile in ("TREND_3TP", "MID_2TP") and achieved_targets >= 1:
+        if (
+            signal_strength >= HOLD_AFTER_TP1_MIN_STRENGTH
+            and adx >= HOLD_AFTER_TP1_MIN_ADX
+            and highest_profit_pct >= base_target_pct
+        ):
+            boosted_target_pct = base_target_pct * HOLD_AFTER_TP1_EXTRA_BOOST
+            if signal_strength >= VERY_STRONG_SIGNAL:
+                boosted_target_pct = base_target_pct * VERY_STRONG_TP_BOOST
+    else:
+        # قبل TP1 أو سكالب: Boost بسيط حسب القوة
+        if signal_strength >= 8.0:
+            boosted_target_pct = base_target_pct * 1.20
+        elif signal_strength >= 6.0:
+            boosted_target_pct = base_target_pct * 1.10
+        elif signal_strength < 4.0:
+            boosted_target_pct = base_target_pct * 0.80
+
+    target_pct = boosted_target_pct
+
+    if pnl_pct >= target_pct:
         return {
             "action": "take_profit",
             "target": next_target_index + 1,
-            "target_pct": next_target_pct,
+            "target_pct": target_pct,
             "fraction": next_target_fraction,
-            "reason": f"تحقيق الهدف {next_target_index + 1} ({next_target_pct:.2f}%)"
+            "reason": (
+                f"TP{next_target_index + 1} hit "
+                f"({base_target_pct:.2f}%→{target_pct:.2f}%) "
+                f"| strength={signal_strength:.1f}"
+            ),
         }
-    
-    return {"action": "hold", "target": next_target_index + 1, "reason": "لم يحقق الهدف بعد"}
+
+    return {
+        "action": "hold",
+        "target": next_target_index + 1,
+        "reason": (
+            f"waiting TP{next_target_index + 1} "
+            f"({pnl_pct:.2f}% / {target_pct:.2f}%) "
+            f"| strength={signal_strength:.1f}"
+        ),
+    }
 
 def calculate_signal_strength(df, ind, side):
     """حساب قوة الإشارة للتداول"""
@@ -2392,6 +2443,149 @@ def calculate_signal_strength(df, ind, side):
     return min(10.0, strength)
 
 # =================== ADVANCED COUNCIL VOTING WITH ALL ENGINES + EDGE ALGO + CVD DIVERGENCE ===================
+def evaluate_rf_signal_context(council_data, rf_side: str) -> dict:
+    """
+    تقييم إشارة RF باستخدام:
+      SMC + Golden Zone + Flow + UltraMS + Edge + VWAP + ADX/DI + CVD Divergence
+    يخرج:
+      grade: "weak" / "mid" / "strong"
+      score: رقم القوة
+      area_type: نوع المنطقة (golden_bottom / supply / demand / liquidity / ...)
+      tp_profile: "SCALP_STRICT" / "MID_2TP" / "TREND_3TP"
+    """
+    score = 0.0
+    reasons = []
+
+    ind      = council_data.get("ind", {})
+    smc      = council_data.get("smc_analysis", {})
+    gz       = council_data.get("gz", {})
+    flow     = council_data.get("flow", {})
+    ultra_ms = council_data.get("ultra_ms", {})
+    edge     = council_data.get("edge_setup", {})
+    vwap_ctx = council_data.get("vwap", {})
+    cvd_div  = council_data.get("ind", {}).get("cvd_div", {})
+
+    is_buy  = (rf_side == "buy")
+    is_sell = (rf_side == "sell")
+
+    adx       = float(ind.get("adx", 0.0))
+    di_spread = float(ind.get("di_spread", 0.0))
+
+    # ===== 1) SMC / مناطق عرض وطلب / مصائد سيولة =====
+    zone_type = smc.get("zone_type") or smc.get("zone_type_primary")
+    smc_bias  = smc.get("bias")
+    is_sweep  = smc.get("liquidity_sweep", False) or smc.get("stop_hunt", False)
+    is_ob     = smc.get("is_ob", False)
+    is_sd     = smc.get("is_sd", False)
+    is_retest = smc.get("retest", False)
+
+    area_type = zone_type or "unknown"
+
+    if is_buy and smc_bias == "bull":
+        score += 4.0
+        reasons.append("📦 SMC: bullish demand/OB")
+    if is_sell and smc_bias == "bear":
+        score += 4.0
+        reasons.append("📦 SMC: bearish supply/OB")
+
+    if is_ob:
+        score += 1.5; reasons.append("OB confluence")
+    if is_sd:
+        score += 1.0; reasons.append("Supply/Demand zone")
+    if is_retest:
+        score += 1.0; reasons.append("clean retest")
+
+    if is_sweep:
+        score += 2.0; reasons.append("💧 Liquidity sweep / stop-hunt")
+
+    # ===== 2) Golden Zone =====
+    gz_bias = gz.get("bias")
+    gz_conf = gz.get("confirmed", False)
+    if gz_conf:
+        if is_buy and gz_bias == "bullish":
+            score += 3.0
+            area_type = area_type or "golden_bottom"
+            reasons.append("⭐ Golden Bottom confirmed")
+        if is_sell and gz_bias == "bearish":
+            score += 3.0
+            area_type = area_type or "golden_top"
+            reasons.append("⭐ Golden Top confirmed")
+
+    # ===== 3) Ultra Market Structure =====
+    ms_bias = ultra_ms.get("bias", "neutral")
+    if is_buy and ms_bias == "bull":
+        score += 2.0; reasons.append("📈 UltraMS bullish BOS/structure")
+    if is_sell and ms_bias == "bear":
+        score += 2.0; reasons.append("📉 UltraMS bearish BOS/structure")
+
+    if ultra_ms.get("bos"):
+        score += 1.5; reasons.append("BOS in RF direction")
+    if ultra_ms.get("choch"):
+        score += 1.0; reasons.append("CHoCH context")
+
+    # ===== 4) Flow / Footprint =====
+    flow_side = flow.get("side")
+    if flow_side == rf_side:
+        score += 2.0; reasons.append("🧱 Flow pressure with RF side")
+
+    if flow.get("big_buyers") and is_buy:
+        score += 1.5; reasons.append("big buyers at zone")
+    if flow.get("big_sellers") and is_sell:
+        score += 1.5; reasons.append("big sellers at zone")
+
+    # ===== 5) ADX / DI =====
+    if adx >= 18 and di_spread >= 4:
+        score += 2.0; reasons.append(f"ADX {adx:.1f} / DI spread {di_spread:.1f}")
+    if adx >= 25 and di_spread >= 7:
+        score += 2.0; reasons.append("strong trend strength")
+
+    # ===== 6) Edge Algo grade =====
+    grade_raw = (edge or {}).get("grade", "weak")
+    if grade_raw == "mid":
+        score += 2.0; reasons.append("EdgeAlgo mid setup")
+    elif grade_raw == "strong":
+        score += 4.0; reasons.append("EdgeAlgo strong setup")
+
+    # ===== 7) VWAP distance =====
+    try:
+        z = float(vwap_ctx.get("zscore", 0.0))
+    except Exception:
+        z = 0.0
+    if abs(z) >= 0.7:
+        score += 1.0; reasons.append(f"VWAP distance |z|={z:.2f}")
+    else:
+        reasons.append("VWAP mid-zone (neutral)")
+
+    # ===== 8) CVD Divergence =====
+    div_type = cvd_div.get("type")
+    if div_type == "regular_bullish" and is_buy:
+        score += 2.5; reasons.append("CVD Regular Bullish Divergence")
+    if div_type == "regular_bearish" and is_sell:
+        score += 2.5; reasons.append("CVD Regular Bearish Divergence")
+    if div_type == "hidden_bullish" and is_buy:
+        score += 1.5; reasons.append("Hidden Bullish Divergence")
+    if div_type == "hidden_bearish" and is_sell:
+        score += 1.5; reasons.append("Hidden Bearish Divergence")
+
+    # ===== Final Grade → TP profile =====
+    if score >= 12.0:
+        grade = "strong"
+        tp_profile = "TREND_3TP"
+    elif score >= 7.0:
+        grade = "mid"
+        tp_profile = "MID_2TP"
+    else:
+        grade = "weak"
+        tp_profile = "SCALP_STRICT"
+
+    return {
+        "grade": grade,
+        "score": score,
+        "area_type": area_type,
+        "tp_profile": tp_profile,
+        "reasons": reasons,
+    }
+
 def council_votes_pro_enhanced(df):
     """مجلس تصويت محسّن مع جميع المحركات المتكاملة + Edge Algo + CVD Divergence"""
     try:
@@ -3307,9 +3501,228 @@ def setup_trade_management(mode, edge_setup=None):
                 "edge_setup": None
             }
 
+# =================== STATE ===================
+STATE = {
+    "open": False, "side": None, "entry": None, "qty": 0.0,
+    "pnl": 0.0, "bars": 0, "trail": None, "breakeven": None,
+    "tp1_done": False, "highest_profit_pct": 0.0,
+    "profit_targets_achieved": 0,
+    "edge_setup": None,
+    "profit_profile": "SCALP_STRICT"
+}
+compound_pnl = 0.0
+wait_for_next_signal_side = None
+
+# RF-driven profit profile (يتم ضبطه وقت الدخول بناءً على تقييم إشارة RF)
+pending_profit_profile = None
+
+# =================== WAIT FOR NEXT SIGNAL ===================
+def _arm_wait_after_close(prev_side):
+    """تفعيل انتظار الإشارة التالية بعد الإغلاق"""
+    global wait_for_next_signal_side
+    wait_for_next_signal_side = "sell" if prev_side=="long" else ("buy" if prev_side=="short" else None)
+    log_i(f"🛑 WAIT FOR NEXT SIGNAL: {wait_for_next_signal_side}")
+
+def wait_gate_allow(df, info):
+    """التحقق من بوابة الانتظار"""
+    if wait_for_next_signal_side is None: 
+        return True, ""
+    
+    bar_ts = int(info.get("time") or 0)
+    need = (wait_for_next_signal_side=="buy" and info.get("long")) or (wait_for_next_signal_side=="sell" and info.get("short"))
+    
+    if need:
+        return True, ""
+    return False, f"wait-for-next-RF({wait_for_next_signal_side})"
+
+# =================== ORDERS ===================
+def _params_open(side):
+    if POSITION_MODE == "hedge":
+        return {"positionSide": "LONG" if side=="buy" else "SHORT", "reduceOnly": False}
+    return {"positionSide": "BOTH", "reduceOnly": False}
+
+def _params_close():
+    if POSITION_MODE == "hedge":
+        return {"positionSide": "LONG" if STATE.get("side")=="long" else "SHORT", "reduceOnly": True}
+    return {"positionSide": "BOTH", "reduceOnly": True}
+
+def _read_position():
+    try:
+        poss = ex.fetch_positions(params={"type":"swap"})
+        for p in poss:
+            sym = (p.get("symbol") or p.get("info",{}).get("symbol") or "")
+            if SYMBOL.split(":")[0] not in sym: continue
+            qty = abs(float(p.get("contracts") or p.get("info",{}).get("positionAmt") or 0))
+            if qty <= 0: return 0.0, None, None
+            entry = float(p.get("entryPrice") or p.get("info",{}).get("avgEntryPrice") or 0)
+            side_raw = (p.get("side") or p.get("info",{}).get("positionSide") or "").lower()
+            side = "long" if ("long" in side_raw or float(p.get("cost",0))>0) else "short"
+            return qty, side, entry
+    except Exception as e:
+        logging.error(f"_read_position error: {e}")
+    return 0.0, None, None
+
+def compute_size(balance, price):
+    effective = balance or 0.0
+    capital = effective * RISK_ALLOC * LEVERAGE
+    raw = max(0.0, capital / max(float(price or 0.0), 1e-9))
+    return safe_qty(raw)
+
+def close_market_strict(reason="STRICT"):
+    global compound_pnl, wait_for_next_signal_side
+    exch_qty, exch_side, exch_entry = _read_position()
+    if exch_qty <= 0:
+        if STATE.get("open"):
+            _reset_after_close(reason)
+        return
+    side_to_close = "sell" if (exch_side=="long") else "buy"
+    qty_to_close  = safe_qty(exch_qty)
+    attempts=0; last_error=None
+    while attempts < CLOSE_RETRY_ATTEMPTS:
+        try:
+            if MODE_LIVE and EXECUTE_ORDERS and not DRY_RUN:
+                params = _params_close(); params["reduceOnly"]=True
+                ex.create_order(SYMBOL,"market",side_to_close,qty_to_close,None,params)
+            time.sleep(CLOSE_VERIFY_WAIT_S)
+            left_qty, _, _ = _read_position()
+            if left_qty <= 0:
+                px = price_now() or STATE.get("entry")
+                entry_px = STATE.get("entry") or exch_entry or px
+                side = STATE.get("side") or exch_side or ("long" if side_to_close=="sell" else "short")
+                qty  = exch_qty
+                pnl  = (px - entry_px) * qty * (1 if side=="long" else -1)
+                compound_pnl += pnl
+                log_i(f"STRICT CLOSE {side} reason={reason} pnl={fmt(pnl)} total={fmt(compound_pnl)}")
+                logging.info(f"STRICT_CLOSE {side} pnl={pnl} total={compound_pnl}")
+                _reset_after_close(reason, prev_side=side)
+                return
+            qty_to_close = safe_qty(left_qty)
+            attempts += 1
+            log_w(f"strict close retry {attempts}/{CLOSE_RETRY_ATTEMPTS} — residual={fmt(left_qty,4)}")
+            time.sleep(CLOSE_VERIFY_WAIT_S)
+        except Exception as e:
+            last_error = e; logging.error(f"close_market_strict attempt {attempts+1}: {e}"); attempts += 1; time.sleep(CLOSE_VERIFY_WAIT_S)
+    log_e(f"STRICT CLOSE FAILED after {CLOSE_RETRY_ATTEMPTS} attempts — last error: {last_error}")
+    logging.critical(f"STRICT CLOSE FAILED — last_error={last_error}")
+
+def _reset_after_close(reason, prev_side=None):
+    """إعادة تعيين الحالة بعد الإغلاق"""
+    global wait_for_next_signal_side, pending_profit_profile
+    prev_side = prev_side or STATE.get("side")
+    STATE.update({
+        "open": False, "side": None, "entry": None, "qty": 0.0,
+        "pnl": 0.0, "bars": 0, "trail": None, "breakeven": None,
+        "tp1_done": False, "highest_profit_pct": 0.0, "profit_targets_achieved": 0,
+        "trail_tightened": False, "partial_taken": False,
+        "edge_setup": None,
+        "profit_profile": "SCALP_STRICT"
+    })
+    pending_profit_profile = None
+    save_state({"in_position": False, "position_qty": 0})
+    
+    # تفعيل انتظار الإشارة التالية
+    _arm_wait_after_close(prev_side)
+    logging.info(f"AFTER_CLOSE waiting_for={wait_for_next_signal_side}")
+
+# =================== SMART EXIT GUARD ===================
+def smart_exit_guard(state, df, ind, flow, bm, now_price, pnl_pct, mode, side, entry_price, gz=None):
+    """يقرر: Partial / Tighten / Strict Close مع لوج واضح."""
+    atr = ind.get('atr', 0.0)
+    adx = ind.get('adx', 0.0)
+    rsi = ind.get('rsi', 50.0)
+    rsi_ma = ind.get('rsi_ma', 50.0)
+    
+    if len(df) >= 3:
+        adx_slope = adx - ind.get('adx_prev', adx)
+    else:
+        adx_slope = 0.0
+
+    # حساب الفتائل
+    wick_signal = False
+    if len(df) > 0:
+        c = df.iloc[-1]
+        wick_up = float(c['high']) - max(float(c['close']), float(c['open']))
+        wick_down = min(float(c['close']), float(c['open'])) - float(c['low'])
+        wick_signal = (wick_up >= WICK_ATR_MULT * atr) if side == "long" else (wick_down >= WICK_ATR_MULT * atr)
+
+    rsi_cross_down = (rsi < rsi_ma) if side == "long" else (rsi > rsi_ma)
+    adx_falling = (adx_slope < 0)
+    cvd_down = (flow and flow.get('ok') and flow.get('cvd_trend') == 'down')
+    evx_spike = False  # يمكن إضافة حساب EVX لاحقًا
+    
+    bm_wall_close = False
+    if bm and bm.get('ok'):
+        if side == "long":
+            sell_walls = bm.get('sell_walls', [])
+            if sell_walls:
+                best_ask = min([p for p, _ in sell_walls])
+                bps = abs((best_ask - now_price) / now_price) * 10000.0
+                bm_wall_close = (bps <= BM_WALL_PROX_BPS)
+        else:
+            buy_walls = bm.get('buy_walls', [])
+            if buy_walls:
+                best_bid = max([p for p, _ in buy_walls])
+                bps = abs((best_bid - now_price) / now_price) * 10000.0
+                bm_wall_close = (bps <= BM_WALL_PROX_BPS)
+
+    # --- Golden Reversal بعد TP1 ---
+    if state.get('tp1_done') and (gz and gz.get('ok')):
+        # إغلاق صارم لو تقاطع Golden عكس اتجاهي بعد TP1
+        opp = (gz['zone']['type']=='golden_top' and side=='long') or (gz['zone']['type']=='golden_bottom' and side=='short')
+        if opp and gz.get('score',0) >= GOLDEN_REVERSAL_SCORE:
+            return {
+                "action": "close", 
+                "why": "golden_reversal",
+                "log": f"🔴 CLOSE STRONG | golden reversal after TP1 | score={gz['score']:.1f}"
+            }
+
+    tp1_target = TP1_SCALP_PCT if mode == 'scalp' else TP1_TREND_PCT
+    if pnl_pct >= tp1_target and not state.get('tp1_done'):
+        qty_pct = 0.35 if mode == 'scalp' else 0.25
+        return {
+            "action": "partial", 
+            "why": f"TP1 hit {tp1_target*100:.2f}%",
+            "qty_pct": qty_pct,
+            "log": f"💰 TP1 جزئي {tp1_target*100:.2f}% | pnl={pnl_pct*100:.2f}% | mode={mode}"
+        }
+
+    # --- Wick exhaustion + Tighten عند إجهاد/تدفق/جدار ---
+    if pnl_pct > 0:
+        if wick_signal or evx_spike or bm_wall_close or cvd_down:
+            return {
+                "action": "tighten", 
+                "why": "exhaustion/flow/wall",
+                "trail_mult": TRAIL_TIGHT_MULT,
+                "log": f"🛡️ Tighten | wick={int(bool(wick_signal))} evx={int(bool(evx_spike))} wall={bm_wall_close} cvd_down={cvd_down}"
+            }
+
+    bearish_signals = [rsi_cross_down, adx_falling, cvd_down, evx_spike, bm_wall_close]
+    bearish_count = sum(bearish_signals)
+    
+    if pnl_pct >= HARD_CLOSE_PNL_PCT and bearish_count >= 2:
+        reasons = []
+        if rsi_cross_down: reasons.append("rsi↓")
+        if adx_falling: reasons.append("adx↓")
+        if cvd_down: reasons.append("cvd↓")
+        if evx_spike: reasons.append("evx")
+        if bm_wall_close: reasons.append("wall")
+        
+        return {
+            "action": "close", 
+            "why": "hard_close_signal",
+            "log": f"🔴 CLOSE STRONG | pnl={pnl_pct*100:.2f}% | {', '.join(reasons)}"
+        }
+
+    return {
+        "action": "hold", 
+        "why": "keep_riding", 
+        "log": None
+    }
+
 # =================== ENHANCED TRADE EXECUTION WITH EDGE ALGO ===================
 def open_market_enhanced(side, qty, price):
-    """فتح صفقة محسنة مع Edge Algo"""
+    """فتح صفقة محسنة مع Edge Algo + RF Master Profile"""
+    global pending_profit_profile
     if qty <= 0: 
         log_e("skip open (qty<=0)")
         return False
@@ -3337,6 +3750,12 @@ def open_market_enhanced(side, qty, price):
     mode = mode_data["mode"]
     gz = snap["gz"]
     
+    # فلتر قوة الإشارة قبل تنفيذ أي صفقة
+    signal_strength_pre = calculate_signal_strength(df, votes["ind"], "long" if side == "buy" else "short")
+    if signal_strength_pre < MIN_SIGNAL_FOR_ENTRY:
+        log_i(f"⛔ SKIP ENTRY {side.upper()} | signal_strength={signal_strength_pre:.1f} < {MIN_SIGNAL_FOR_ENTRY}")
+        return False
+    
     # Enhanced management config with Edge Algo
     management_config = setup_trade_management(mode, edge_setup)
     
@@ -3345,15 +3764,21 @@ def open_market_enhanced(side, qty, price):
     if success:
         signal_strength = calculate_signal_strength(df, votes["ind"], "long" if side=="buy" else "short")
         
-        # تحديد profit_profile بناءً على Edge Setup
-        profit_profile = "SCALP_STRICT"
-        if edge_setup and edge_setup.get("valid"):
-            profit_profile = edge_setup.get("tp_profile", "SCALP_STRICT")
+        # تحديد profit_profile:
+        # 1) لو RF حدد بروفايل → نستخدمه
+        # 2) لو Edge عنده tp_profile → نستخدمه
+        # 3) غير كده: mode → SCALP / TREND
+        if pending_profit_profile:
+            profit_profile = pending_profit_profile
         else:
-            if mode == "trend":
-                profit_profile = "TREND_3TP"
+            profit_profile = "SCALP_STRICT"
+            if edge_setup and edge_setup.get("valid"):
+                profit_profile = edge_setup.get("tp_profile", "SCALP_STRICT")
             else:
-                profit_profile = "SCALP_STRICT"
+                if mode == "trend":
+                    profit_profile = "TREND_3TP"
+                else:
+                    profit_profile = "SCALP_STRICT"
         
         STATE.update({
             "open": True, 
@@ -3398,6 +3823,8 @@ def open_market_enhanced(side, qty, price):
             "trail_active": False,
             "trail_tightened": False,
         })
+        
+        pending_profit_profile = None  # تصفير بعد الاستخدام
         
         log_g(f"✅ ULTRA ENHANCED POSITION OPENED: {side.upper()} | mode={mode} | signal_strength={signal_strength:.1f} | edge_profile={profit_profile}")
         return True
@@ -3506,220 +3933,6 @@ def rf_signal_live(df: pd.DataFrame):
         "filter": f_now, "hi": float(hi.iloc[-1]), "lo": float(lo.iloc[-1])
     }
 
-# =================== STATE ===================
-STATE = {
-    "open": False, "side": None, "entry": None, "qty": 0.0,
-    "pnl": 0.0, "bars": 0, "trail": None, "breakeven": None,
-    "tp1_done": False, "highest_profit_pct": 0.0,
-    "profit_targets_achieved": 0,
-    "edge_setup": None,
-    "profit_profile": "SCALP_STRICT"
-}
-compound_pnl = 0.0
-wait_for_next_signal_side = None
-
-# =================== WAIT FOR NEXT SIGNAL ===================
-def _arm_wait_after_close(prev_side):
-    """تفعيل انتظار الإشارة التالية بعد الإغلاق"""
-    global wait_for_next_signal_side
-    wait_for_next_signal_side = "sell" if prev_side=="long" else ("buy" if prev_side=="short" else None)
-    log_i(f"🛑 WAIT FOR NEXT SIGNAL: {wait_for_next_signal_side}")
-
-def wait_gate_allow(df, info):
-    """التحقق من بوابة الانتظار"""
-    if wait_for_next_signal_side is None: 
-        return True, ""
-    
-    bar_ts = int(info.get("time") or 0)
-    need = (wait_for_next_signal_side=="buy" and info.get("long")) or (wait_for_next_signal_side=="sell" and info.get("short"))
-    
-    if need:
-        return True, ""
-    return False, f"wait-for-next-RF({wait_for_next_signal_side})"
-
-# =================== ORDERS ===================
-def _params_open(side):
-    if POSITION_MODE == "hedge":
-        return {"positionSide": "LONG" if side=="buy" else "SHORT", "reduceOnly": False}
-    return {"positionSide": "BOTH", "reduceOnly": False}
-
-def _params_close():
-    if POSITION_MODE == "hedge":
-        return {"positionSide": "LONG" if STATE.get("side")=="long" else "SHORT", "reduceOnly": True}
-    return {"positionSide": "BOTH", "reduceOnly": True}
-
-def _read_position():
-    try:
-        poss = ex.fetch_positions(params={"type":"swap"})
-        for p in poss:
-            sym = (p.get("symbol") or p.get("info",{}).get("symbol") or "")
-            if SYMBOL.split(":")[0] not in sym: continue
-            qty = abs(float(p.get("contracts") or p.get("info",{}).get("positionAmt") or 0))
-            if qty <= 0: return 0.0, None, None
-            entry = float(p.get("entryPrice") or p.get("info",{}).get("avgEntryPrice") or 0)
-            side_raw = (p.get("side") or p.get("info",{}).get("positionSide") or "").lower()
-            side = "long" if ("long" in side_raw or float(p.get("cost",0))>0) else "short"
-            return qty, side, entry
-    except Exception as e:
-        logging.error(f"_read_position error: {e}")
-    return 0.0, None, None
-
-def compute_size(balance, price):
-    effective = balance or 0.0
-    capital = effective * RISK_ALLOC * LEVERAGE
-    raw = max(0.0, capital / max(float(price or 0.0), 1e-9))
-    return safe_qty(raw)
-
-def close_market_strict(reason="STRICT"):
-    global compound_pnl, wait_for_next_signal_side
-    exch_qty, exch_side, exch_entry = _read_position()
-    if exch_qty <= 0:
-        if STATE.get("open"):
-            _reset_after_close(reason)
-        return
-    side_to_close = "sell" if (exch_side=="long") else "buy"
-    qty_to_close  = safe_qty(exch_qty)
-    attempts=0; last_error=None
-    while attempts < CLOSE_RETRY_ATTEMPTS:
-        try:
-            if MODE_LIVE and EXECUTE_ORDERS and not DRY_RUN:
-                params = _params_close(); params["reduceOnly"]=True
-                ex.create_order(SYMBOL,"market",side_to_close,qty_to_close,None,params)
-            time.sleep(CLOSE_VERIFY_WAIT_S)
-            left_qty, _, _ = _read_position()
-            if left_qty <= 0:
-                px = price_now() or STATE.get("entry")
-                entry_px = STATE.get("entry") or exch_entry or px
-                side = STATE.get("side") or exch_side or ("long" if side_to_close=="sell" else "short")
-                qty  = exch_qty
-                pnl  = (px - entry_px) * qty * (1 if side=="long" else -1)
-                compound_pnl += pnl
-                log_i(f"STRICT CLOSE {side} reason={reason} pnl={fmt(pnl)} total={fmt(compound_pnl)}")
-                logging.info(f"STRICT_CLOSE {side} pnl={pnl} total={compound_pnl}")
-                _reset_after_close(reason, prev_side=side)
-                return
-            qty_to_close = safe_qty(left_qty)
-            attempts += 1
-            log_w(f"strict close retry {attempts}/{CLOSE_RETRY_ATTEMPTS} — residual={fmt(left_qty,4)}")
-            time.sleep(CLOSE_VERIFY_WAIT_S)
-        except Exception as e:
-            last_error = e; logging.error(f"close_market_strict attempt {attempts+1}: {e}"); attempts += 1; time.sleep(CLOSE_VERIFY_WAIT_S)
-    log_e(f"STRICT CLOSE FAILED after {CLOSE_RETRY_ATTEMPTS} attempts — last error: {last_error}")
-    logging.critical(f"STRICT CLOSE FAILED — last_error={last_error}")
-
-def _reset_after_close(reason, prev_side=None):
-    """إعادة تعيين الحالة بعد الإغلاق"""
-    global wait_for_next_signal_side
-    prev_side = prev_side or STATE.get("side")
-    STATE.update({
-        "open": False, "side": None, "entry": None, "qty": 0.0,
-        "pnl": 0.0, "bars": 0, "trail": None, "breakeven": None,
-        "tp1_done": False, "highest_profit_pct": 0.0, "profit_targets_achieved": 0,
-        "trail_tightened": False, "partial_taken": False,
-        "edge_setup": None,
-        "profit_profile": "SCALP_STRICT"
-    })
-    save_state({"in_position": False, "position_qty": 0})
-    
-    # تفعيل انتظار الإشارة التالية
-    _arm_wait_after_close(prev_side)
-    logging.info(f"AFTER_CLOSE waiting_for={wait_for_next_signal_side}")
-
-# =================== SMART EXIT GUARD ===================
-def smart_exit_guard(state, df, ind, flow, bm, now_price, pnl_pct, mode, side, entry_price, gz=None):
-    """يقرر: Partial / Tighten / Strict Close مع لوج واضح."""
-    atr = ind.get('atr', 0.0)
-    adx = ind.get('adx', 0.0)
-    rsi = ind.get('rsi', 50.0)
-    rsi_ma = ind.get('rsi_ma', 50.0)
-    
-    if len(df) >= 3:
-        adx_slope = adx - ind.get('adx_prev', adx)
-    else:
-        adx_slope = 0.0
-
-    # حساب الفتائل
-    wick_signal = False
-    if len(df) > 0:
-        c = df.iloc[-1]
-        wick_up = float(c['high']) - max(float(c['close']), float(c['open']))
-        wick_down = min(float(c['close']), float(c['open'])) - float(c['low'])
-        wick_signal = (wick_up >= WICK_ATR_MULT * atr) if side == "long" else (wick_down >= WICK_ATR_MULT * atr)
-
-    rsi_cross_down = (rsi < rsi_ma) if side == "long" else (rsi > rsi_ma)
-    adx_falling = (adx_slope < 0)
-    cvd_down = (flow and flow.get('ok') and flow.get('cvd_trend') == 'down')
-    evx_spike = False  # يمكن إضافة حساب EVX لاحقًا
-    
-    bm_wall_close = False
-    if bm and bm.get('ok'):
-        if side == "long":
-            sell_walls = bm.get('sell_walls', [])
-            if sell_walls:
-                best_ask = min([p for p, _ in sell_walls])
-                bps = abs((best_ask - now_price) / now_price) * 10000.0
-                bm_wall_close = (bps <= BM_WALL_PROX_BPS)
-        else:
-            buy_walls = bm.get('buy_walls', [])
-            if buy_walls:
-                best_bid = max([p for p, _ in buy_walls])
-                bps = abs((best_bid - now_price) / now_price) * 10000.0
-                bm_wall_close = (bps <= BM_WALL_PROX_BPS)
-
-    # --- Golden Reversal بعد TP1 ---
-    if state.get('tp1_done') and (gz and gz.get('ok')):
-        # إغلاق صارم لو تقاطع Golden عكس اتجاهي بعد TP1
-        opp = (gz['zone']['type']=='golden_top' and side=='long') or (gz['zone']['type']=='golden_bottom' and side=='short')
-        if opp and gz.get('score',0) >= GOLDEN_REVERSAL_SCORE:
-            return {
-                "action": "close", 
-                "why": "golden_reversal",
-                "log": f"🔴 CLOSE STRONG | golden reversal after TP1 | score={gz['score']:.1f}"
-            }
-
-    tp1_target = TP1_SCALP_PCT if mode == 'scalp' else TP1_TREND_PCT
-    if pnl_pct >= tp1_target and not state.get('tp1_done'):
-        qty_pct = 0.35 if mode == 'scalp' else 0.25
-        return {
-            "action": "partial", 
-            "why": f"TP1 hit {tp1_target*100:.2f}%",
-            "qty_pct": qty_pct,
-            "log": f"💰 TP1 جزئي {tp1_target*100:.2f}% | pnl={pnl_pct*100:.2f}% | mode={mode}"
-        }
-
-    # --- Wick exhaustion + Tighten عند إجهاد/تدفق/جدار ---
-    if pnl_pct > 0:
-        if wick_signal or evx_spike or bm_wall_close or cvd_down:
-            return {
-                "action": "tighten", 
-                "why": "exhaustion/flow/wall",
-                "trail_mult": TRAIL_TIGHT_MULT,
-                "log": f"🛡️ Tighten | wick={int(bool(wick_signal))} evx={int(bool(evx_spike))} wall={bm_wall_close} cvd_down={cvd_down}"
-            }
-
-    bearish_signals = [rsi_cross_down, adx_falling, cvd_down, evx_spike, bm_wall_close]
-    bearish_count = sum(bearish_signals)
-    
-    if pnl_pct >= HARD_CLOSE_PNL_PCT and bearish_count >= 2:
-        reasons = []
-        if rsi_cross_down: reasons.append("rsi↓")
-        if adx_falling: reasons.append("adx↓")
-        if cvd_down: reasons.append("cvd↓")
-        if evx_spike: reasons.append("evx")
-        if bm_wall_close: reasons.append("wall")
-        
-        return {
-            "action": "close", 
-            "why": "hard_close_signal",
-            "log": f"🔴 CLOSE STRONG | pnl={pnl_pct*100:.2f}% | {', '.join(reasons)}"
-        }
-
-    return {
-        "action": "hold", 
-        "why": "keep_riding", 
-        "log": None
-    }
-
 # =================== ENHANCED TRADE MANAGEMENT WITH EDGE ALGO ===================
 def manage_after_entry_enhanced(df, ind, info):
     """إدارة محسنة للمركز مع Smart Profit AI + Smart Exit Guard + Edge Algo"""
@@ -3758,8 +3971,15 @@ def manage_after_entry_enhanced(df, ind, info):
                     STATE["qty"] = safe_qty(qty - close_qty)
                     STATE["profit_targets_achieved"] = target_num
                     
-                    # لو دي آخر مرحلة جني أرباح في السلم: اقفل الصفقة بالكامل
-                    if target_num >= (len(SCALP_TPS) if mode == "scalp" else len(TREND_TPS)):
+                    # تحديد عدد الأهداف حسب البروفايل الفعلي
+                    if profit_profile == "SCALP_STRICT":
+                        max_targets = len(SCALP_TPS)
+                    elif profit_profile == "MID_2TP":
+                        max_targets = 2
+                    else:  # TREND_3TP
+                        max_targets = len(TREND_TPS)
+
+                    if target_num >= max_targets:
                         close_market_strict("all_targets_achieved")
                         return
                 except Exception as e:
@@ -3897,7 +4117,7 @@ def manage_after_entry_enhanced(df, ind, info):
 # =================== ULTRA ENHANCED TRADE LOOP WITH EDGE ALGO + CVD DIVERGENCE + ENHANCED FILTERS ===================
 def trade_loop_enhanced():
     """حلقة تداول محسنة مع جميع المحركات المتكاملة + Edge Algo + CVD Divergence + Enhanced Filters"""
-    global wait_for_next_signal_side
+    global wait_for_next_signal_side, pending_profit_profile
     loop_i = 0
     
     while True:
@@ -3943,45 +4163,72 @@ def trade_loop_enhanced():
             cvd_div = council_data.get("ind", {}).get("cvd_div", {})
             
             sig = None
+            entry_type = None
+            pending_profit_profile = None
 
-            # استخراج القيم الأساسية للفلترة
-            score_b = council_data.get("score_b", 0.0)
-            score_s = council_data.get("score_s", 0.0)
-            adx_val = council_data.get("ind", {}).get("adx", ind.get("adx", 0.0))
+            # ========= RF MASTER ENTRY =========
+            rf_side = None
+            if rf_ctx.get("buy_signal"):
+                rf_side = "buy"
+            elif rf_ctx.get("sell_signal"):
+                rf_side = "sell"
 
-            # --- CVD Divergence Entry (مع فلتر ADX ≥ 20 + Council score ≥ 8) ---
+            if rf_side:
+                rf_eval = evaluate_rf_signal_context(council_data, rf_side)
+                grade      = rf_eval["grade"]
+                score      = rf_eval["score"]
+                tp_profile = rf_eval["tp_profile"]
+                area_type  = rf_eval["area_type"]
+                reasons    = rf_eval["reasons"]
+
+                log_i(
+                    f"🧮 RF MASTER EVAL: side={rf_side.upper()} | "
+                    f"grade={grade} | score={score:.1f} | area={area_type} | "
+                    f"reasons: " + " | ".join(reasons)
+                )
+
+                if grade == "weak":
+                    log_i("🚫 RF entry skipped (weak setup)")
+                else:
+                    sig = rf_side
+                    entry_type = f"RF_{grade.upper()}"
+                    pending_profit_profile = tp_profile
+                    log_g(f"✅ RF entry accepted: {rf_side.upper()} | tp_profile={tp_profile}")
+
+            # من هنا فصاعدًا، باقي الاستراتيجيات تشتغل فقط لو RF ما فتحش صفقة
+            # --- CVD Divergence Entry ---
             cvd_entry = False
-            if cvd_div:
+            if sig is None and cvd_div and cvd_div.get("active") and cvd_div.get("strength",0)>=1:
                 if cvd_div.get("bull_div"):
-                    if adx_val >= CVD_ADX_MIN and score_b >= CVD_SCORE_MIN:
+                    if council_data.get("ind", {}).get("adx", 0) >= CVD_ADX_MIN and council_data["score_b"] >= CVD_SCORE_MIN:
                         sig = "buy"
                         cvd_entry = True
                         log_i(
                             f"📈 CVD DIVERGENCE ENTRY: BUY | Bullish Divergence detected "
-                            f"(ADX={adx_val:.1f} ≥ {CVD_ADX_MIN} • score_b={score_b:.1f} ≥ {CVD_SCORE_MIN})"
+                            f"(ADX={council_data.get('ind', {}).get('adx', 0):.1f} ≥ {CVD_ADX_MIN} • score_b={council_data['score_b']:.1f} ≥ {CVD_SCORE_MIN})"
                         )
                     else:
                         log_i(
                             f"⚠️ CVD BUY skipped | weak context "
-                            f"(ADX={adx_val:.1f} • score_b={score_b:.1f})"
+                            f"(ADX={council_data.get('ind', {}).get('adx', 0):.1f} • score_b={council_data['score_b']:.1f})"
                         )
                 elif cvd_div.get("bear_div"):
-                    if adx_val >= CVD_ADX_MIN and score_s >= CVD_SCORE_MIN:
+                    if council_data.get("ind", {}).get("adx", 0) >= CVD_ADX_MIN and council_data["score_s"] >= CVD_SCORE_MIN:
                         sig = "sell"
                         cvd_entry = True
                         log_i(
                             f"📉 CVD DIVERGENCE ENTRY: SELL | Bearish Divergence detected "
-                            f"(ADX={adx_val:.1f} ≥ {CVD_ADX_MIN} • score_s={score_s:.1f} ≥ {CVD_SCORE_MIN})"
+                            f"(ADX={council_data.get('ind', {}).get('adx', 0):.1f} ≥ {CVD_ADX_MIN} • score_s={council_data['score_s']:.1f} ≥ {CVD_SCORE_MIN})"
                         )
                     else:
                         log_i(
                             f"⚠️ CVD SELL skipped | weak context "
-                            f"(ADX={adx_val:.1f} • score_s={score_s:.1f})"
+                            f"(ADX={council_data.get('ind', {}).get('adx', 0):.1f} • score_s={council_data['score_s']:.1f})"
                         )
 
-            # --- Enhanced SMC Entry Pro مع ADX+ATR Filters وفلتر الثقة ≥ 0.8 ---
+            # --- Advanced SMC Entry Pro مع ADX+ATR Filters وفلتر الثقة ≥ 0.8 ---
             smc_entry = False
-            if not cvd_entry and SMC_ENABLED and smc_analysis.get('trading_opportunities'):
+            if sig is None and SMC_ENABLED and smc_analysis.get('trading_opportunities'):
                 # فلترة الفرص بناءً على ADX+ATR وفلتر الثقة
                 filtered_opportunities = []
                 for opp in smc_analysis['trading_opportunities']:
@@ -4014,7 +4261,7 @@ def trade_loop_enhanced():
 
             # --- Enhanced Golden Entry Pro ---
             golden_entry = False
-            if not cvd_entry and not smc_entry and (gz and gz.get("ok") and gz.get("confirmed")):
+            if sig is None and (gz and gz.get("ok") and gz.get("confirmed")):
                 if gz["zone"]["type"]=="golden_bottom" and gz["score"]>=GOLDEN_ENTRY_SCORE:
                     if footprint.get('ok') and footprint.get('absorption_bull'):
                         sig = "buy"
@@ -4028,7 +4275,7 @@ def trade_loop_enhanced():
 
             # --- Ultra Market Structure Entry ---
             ultra_entry = False
-            if not cvd_entry and not smc_entry and not golden_entry:
+            if sig is None and ultra_ms:
                 ms_bias = ultra_ms.get("bias", "neutral")
                 fvg = ultra_ms.get("fvg", {})
                 
@@ -4043,28 +4290,29 @@ def trade_loop_enhanced():
                         ultra_entry = True
                         log_i(f"🏛 ULTRA MS ENTRY: SELL | Bear BOS + FVG + RF confirm")
 
-            # --- Edge Algo Entry (إذا لم يكن هناك دخول آخر) ---
+            # --- EDGE ALGO ENTRY ---
             edge_entry = False
-            if not cvd_entry and not smc_entry and not golden_entry and not ultra_entry:
-                if edge_setup and edge_setup.get("valid"):
-                    grade = edge_setup.get("grade", "weak")
-                    if grade in ["strong", "mid"]:
-                        if edge_setup["side"] == "BUY":
-                            sig = "buy"
-                            edge_entry = True
-                            log_i(f"🧠 EDGE ALGO ENTRY: BUY | grade={grade} | RR≈{edge_setup['rr1']:.2f}/{edge_setup['rr2']:.2f}/{edge_setup['rr3']:.2f}")
-                        elif edge_setup["side"] == "SELL":
-                            sig = "sell"
-                            edge_entry = True
-                            log_i(f"🧠 EDGE ALGO ENTRY: SELL | grade={grade} | RR≈{edge_setup['rr1']:.2f}/{edge_setup['rr2']:.2f}/{edge_setup['rr3']:.2f}")
+            if sig is None and edge_setup and edge_setup.get("valid"):
+                grade = edge_setup.get("grade", "weak")
+                if grade in ["strong", "mid"]:
+                    if edge_setup["side"] == "BUY":
+                        sig = "buy"
+                        edge_entry = True
+                        log_i(f"🧠 EDGE ALGO ENTRY: BUY | grade={grade} | RR≈{edge_setup['rr1']:.2f}/{edge_setup['rr2']:.2f}/{edge_setup['rr3']:.2f}")
+                    elif edge_setup["side"] == "SELL":
+                        sig = "sell"
+                        edge_entry = True
+                        log_i(f"🧠 EDGE ALGO ENTRY: SELL | grade={grade} | RR≈{edge_setup['rr1']:.2f}/{edge_setup['rr2']:.2f}/{edge_setup['rr3']:.2f}")
 
-            # Council Strong Entry (إذا لم يكن هناك دخول SMC أو ذهبي أو Ultra أو Edge أو CVD)
-            if not cvd_entry and not smc_entry and not golden_entry and not ultra_entry and not edge_entry:
+            # Council Strong Entry (لو مفيش أي entry من اللي فوق)
+            if sig is None and not cvd_entry and not smc_entry and not golden_entry and not ultra_entry and not edge_entry:
                 if council_data["score_b"] > council_data["score_s"] and council_data["score_b"] >= 8.0:
                     sig = "buy"
+                    entry_type = "COUNCIL_STRONG_BUY"
                 elif council_data["score_s"] > council_data["score_b"] and council_data["score_s"] >= 8.0:
                     sig = "sell"
-            
+                    entry_type = "COUNCIL_STRONG_SELL"
+
             # ========== فلتر قوة الإشارة FINAL قبل أي دخول ==========
             if not STATE["open"] and sig and reason is None:
                 # فلتر قوة الإشارة قبل أي دخول
@@ -4085,12 +4333,7 @@ def trade_loop_enhanced():
                             if ok:
                                 wait_for_next_signal_side = None
                                 # تسجيل قرار المجلس المحسن مع جميع المعلومات
-                                entry_type = "CVD_DIVERGENCE" if cvd_entry else \
-                                           "SMC_STOP_HUNT_FILTERED" if smc_entry and 'stop_hunt' in best_opportunity['type'] else \
-                                           "SMC" if smc_entry else \
-                                           "GOLDEN" if golden_entry else \
-                                           "ULTRA_MS" if ultra_entry else \
-                                           "EDGE_ALGO" if edge_entry else "COUNCIL"
+                                entry_type = entry_type or "GENERIC"
                                 
                                 adx_info = f" | ADX={ind.get('adx',0):.1f}" if ind.get('adx') else ""
                                 atr_info = f" | ATR={ind.get('atr',0):.6f}" if ind.get('atr') else ""
@@ -4154,7 +4397,7 @@ app = Flask(__name__)
 @app.route("/")
 def home():
     mode='LIVE' if MODE_LIVE else 'PAPER'
-    return f"✅ ULTRA Council PRO Bot v7.0 — {SYMBOL} {INTERVAL} — {mode} — Ultra Market Structure + Real RF + VWAP + SMC Advanced + Elliott Waves + Stop Hunt AI + ADX+ATR Filters + Edge Algo + CVD Divergence + ENHANCED FILTERS"
+    return f"✅ ULTRA Council PRO Bot v8.0 — {SYMBOL} {INTERVAL} — {mode} — Ultra Market Structure + Real RF + VWAP + SMC Advanced + Elliott Waves + Stop Hunt AI + ADX+ATR Filters + Edge Algo + CVD Divergence + ENHANCED FILTERS + SMART SIGNAL/PROFIT SYSTEM"
 
 @app.route("/metrics")
 def metrics():
@@ -4164,7 +4407,7 @@ def metrics():
         "symbol": SYMBOL, "interval": INTERVAL, "mode": "live" if MODE_LIVE else "paper",
         "leverage": LEVERAGE, "risk_alloc": RISK_ALLOC, "price": price_now(),
         "state": STATE, "compound_pnl": compound_pnl,
-        "entry_mode": "ULTRA_MARKET_STRUCTURE+REAL_RF+VWAP+SMC_ADVANCED_COUNCIL_PRO_GOLDEN_ENHANCED_ADX_ATR_FILTERS+EDGE_ALGO+CVD_DIVERGENCE+ENHANCED_FILTERS", 
+        "entry_mode": "ULTRA_MARKET_STRUCTURE+REAL_RF+VWAP+SMC_ADVANCED_COUNCIL_PRO_GOLDEN_ENHANCED_ADX_ATR_FILTERS+EDGE_ALGO+CVD_DIVERGENCE+ENHANCED_FILTERS+SMART_SIGNAL/PROFIT", 
         "wait_for_next_signal": wait_for_next_signal_side,
         "guards": {"max_spread_bps": MAX_SPREAD_BPS, "final_chunk_qty": FINAL_CHUNK_QTY},
         "vwap_strategy": {
@@ -4208,6 +4451,14 @@ def metrics():
             "smc_confidence_min": SMC_CONFIDENCE_MIN,
             "signal_strength_min": SIGNAL_STRENGTH_MIN,
             "description": "Enhanced entry filters for higher quality trades"
+        },
+        "smart_signal_profit": {
+            "min_signal_for_entry": MIN_SIGNAL_FOR_ENTRY,
+            "hold_after_tp1_min_strength": HOLD_AFTER_TP1_MIN_STRENGTH,
+            "hold_after_tp1_min_adx": HOLD_AFTER_TP1_MIN_ADX,
+            "hold_after_tp1_extra_boost": HOLD_AFTER_TP1_EXTRA_BOOST,
+            "very_strong_tp_boost": VERY_STRONG_TP_BOOST,
+            "description": "RF Master + Smart Profit AI + HOLD-TP Logic"
         }
     })
 
@@ -4217,10 +4468,11 @@ def health():
         "ok": True, "mode": "live" if MODE_LIVE else "paper",
         "open": STATE["open"], "side": STATE["side"], "qty": STATE["qty"],
         "compound_pnl": compound_pnl, "timestamp": datetime.utcnow().isoformat(),
-        "entry_mode": "ULTRA_MARKET_STRUCTURE+REAL_RF+VWAP+SMC_ADVANCED_COUNCIL_PRO_GOLDEN_ENHANCED_ADX_ATR_FILTERS+EDGE_ALGO+CVD_DIVERGENCE+ENHANCED_FILTERS", 
+        "entry_mode": "ULTRA_MARKET_STRUCTURE+REAL_RF+VWAP+SMC_ADVANCED_COUNCIL_PRO_GOLDEN_ENHANCED_ADX_ATR_FILTERS+EDGE_ALGO+CVD_DIVERGENCE+ENHANCED_FILTERS+SMART_SIGNAL/PROFIT", 
         "wait_for_next_signal": wait_for_next_signal_side,
         "edge_profile": STATE.get("profit_profile", "SCALP_STRICT"),
-        "enhanced_filters_active": True
+        "enhanced_filters_active": True,
+        "smart_signal_active": True
     }), 200
 
 def keepalive_loop():
@@ -4238,7 +4490,7 @@ def keepalive_loop():
 
 # =================== BOOT ===================
 if __name__ == "__main__":
-    log_banner("ULTRA ENHANCED BOT INIT WITH EDGE ALGO + CVD DIVERGENCE + ENHANCED FILTERS")
+    log_banner("ULTRA ENHANCED BOT INIT WITH EDGE ALGO + CVD DIVERGENCE + ENHANCED FILTERS + SMART SIGNAL/PROFIT")
     state = load_state() or {}
     state.setdefault("in_position", False)
 
@@ -4260,7 +4512,7 @@ if __name__ == "__main__":
     print(colored(f"STOP-HUNT FILTERS: ADX={STOP_HUNT_ADX_MIN}-{STOP_HUNT_ADX_MAX} | ATR_MULT≥{STOP_HUNT_ATR_MULT_MIN} | WICK≥{STOP_HUNT_WICK_RATIO*100}%", "yellow"))
     print(colored(f"ENHANCED CANDLES: SMC Patterns + Wick exhaustion + Golden reversal", "yellow"))
     print(colored(f"FOOTPRINT ANALYSIS: Volume spikes + Absorption detection", "yellow"))
-    print(colored(f"SMART PROFIT AI: Dynamic profit taking + Signal strength", "yellow"))
+    print(colored(f"SMART PROFIT AI: Dynamic profit taking + Signal strength + HOLD-TP Logic", "yellow"))
     print(colored(f"VWAP STRATEGY: SCALP(near {VWAP_SCALP_BAND_BPS}bps) | TREND(far {VWAP_TREND_BAND_BPS}bps)", "yellow"))
     print(colored(f"🧠 EDGE ALGO ENGINE: RR Zones + Setup Quality + Dynamic Profit Profiles (TREND_3TP/MID_2TP/SCALP_STRICT)", "yellow"))
     print(colored(f"📊 CVD DIVERGENCE OSCILLATOR: TradingFinder-style divergence detection", "yellow"))
@@ -4268,9 +4520,13 @@ if __name__ == "__main__":
     print(colored(f"   • CVD Divergence: ADX≥{CVD_ADX_MIN} + Council Score≥{CVD_SCORE_MIN}", "yellow"))
     print(colored(f"   • SMC Confidence: ≥{SMC_CONFIDENCE_MIN} (was 0.7)", "yellow"))
     print(colored(f"   • Signal Strength: ≥{SIGNAL_STRENGTH_MIN} for any entry", "yellow"))
+    print(colored(f"🧠 SMART SIGNAL/PROFIT SYSTEM:", "yellow"))
+    print(colored(f"   • RF Master Entry: تقييم الإشارة من كل المحركات", "yellow"))
+    print(colored(f"   • HOLD-TP Logic: رفع الأهداف بعد TP1 للصفقات القوية", "yellow"))
+    print(colored(f"   • Signal Filter: MIN_SIGNAL_FOR_ENTRY={MIN_SIGNAL_FOR_ENTRY}", "yellow"))
     print(colored(f"EXECUTION: {'ACTIVE' if EXECUTE_ORDERS and not DRY_RUN else 'SIMULATION'}", "yellow"))
     
-    logging.info("ULTRA enhanced SMC service starting with all engines + Edge Algo + CVD Divergence + Enhanced Filters…")
+    logging.info("ULTRA enhanced SMC service starting with all engines + Edge Algo + CVD Divergence + Enhanced Filters + Smart Signal/Profit…")
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
     signal.signal(signal.SIGINT,  lambda *_: sys.exit(0))
     
