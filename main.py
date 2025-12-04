@@ -13,6 +13,7 @@ RF Futures Bot — RF-LIVE ONLY (BingX Perp via CCXT)
 • Real Range Filter (RF) Pine Exact + VWAP Session
 • EDGE ALGO ENGINE: RR Zones + Setup Quality + Dynamic Profit Profiles
 • CVD DIVERGENCE OSCILLATOR: TradingFinder-style divergence detection
+• ENHANCED FILTERS: CVD ADX≥20 + Score≥8 | SMC Confidence≥0.8 | Signal Strength≥6.0
 """
 
 import os, time, math, random, signal, sys, traceback, logging, json
@@ -47,7 +48,7 @@ SHADOW_MODE_DASHBOARD = False
 DRY_RUN = False
 
 # ==== Addon: Logging + Recovery Settings ====
-BOT_VERSION = "DOGE Council PRO v7.0 — Ultra Market Structure + Real RF + VWAP + SMC Advanced + Elliott Waves + Stop Hunt AI + ADX+ATR Filters + EdgeAlgo + CVD Divergence"
+BOT_VERSION = "DOGE Council PRO v7.0 — Ultra Market Structure + Real RF + VWAP + SMC Advanced + Elliott Waves + Stop Hunt AI + ADX+ATR Filters + EdgeAlgo + CVD Divergence + ENHANCED FILTERS"
 print("🔁 Booting:", BOT_VERSION, flush=True)
 
 STATE_PATH = "./bot_state.json"
@@ -182,6 +183,12 @@ STOP_HUNT_ATR_MULT_MIN = 1.3    # الحد الأدنى لحجم الشمعة (�
 STOP_HUNT_WICK_RATIO = 0.6      # نسبة الذيل/فتيلة في الشمعة
 STOP_HUNT_DISTANCE_ATR = 0.5    # المسافة الدنيا فوق/تحت مستوى السيولة
 STOP_HUNT_SL_ATR_MULT = 0.7     # مضاعف ATR لوضع Stop Loss
+
+# =================== ENHANCED ENTRY FILTERS ===================
+CVD_ADX_MIN = 20                # الحد الأدنى لـ ADX لدخول CVD
+CVD_SCORE_MIN = 8.0             # الحد الأدنى لـ Council Score لدخول CVD
+SMC_CONFIDENCE_MIN = 0.8        # الحد الأدنى لثقة SMC (كان 0.7)
+SIGNAL_STRENGTH_MIN = 6.0       # الحد الأدنى لقوة الإشارة لأي دخول
 
 # =================== PROFESSIONAL LOGGING ===================
 def log_i(msg): print(f"ℹ️ {msg}", flush=True)
@@ -2050,6 +2057,7 @@ def verify_execution_environment():
     print(f"📗 REAL RF FILTER: Pine Exact + Live Signals", flush=True)
     print(f"🧠 EDGE ALGO ENGINE: RR Zones + Setup Quality + Dynamic Profit Profiles", flush=True)
     print(f"📊 CVD DIVERGENCE OSCILLATOR: TradingFinder-style divergence detection", flush=True)
+    print(f"🔒 ENHANCED ENTRY FILTERS: CVD ADX≥{CVD_ADX_MIN} + Score≥{CVD_SCORE_MIN} | SMC Confidence≥{SMC_CONFIDENCE_MIN} | Signal Strength≥{SIGNAL_STRENGTH_MIN}", flush=True)
     
     if not EXECUTE_ORDERS:
         print("🟡 WARNING: EXECUTE_ORDERS=False - البوت في وضع التحليل فقط!", flush=True)
@@ -3886,9 +3894,9 @@ def manage_after_entry_enhanced(df, ind, info):
             return
         # متعمدين نتجاهل "partial" هنا عشان ما نعملش TP1 مزدوج (Smart AI + Guard)
 
-# =================== ULTRA ENHANCED TRADE LOOP WITH EDGE ALGO + CVD DIVERGENCE ===================
+# =================== ULTRA ENHANCED TRADE LOOP WITH EDGE ALGO + CVD DIVERGENCE + ENHANCED FILTERS ===================
 def trade_loop_enhanced():
-    """حلقة تداول محسنة مع جميع المحركات المتكاملة + Edge Algo + CVD Divergence"""
+    """حلقة تداول محسنة مع جميع المحركات المتكاملة + Edge Algo + CVD Divergence + Enhanced Filters"""
     global wait_for_next_signal_side
     loop_i = 0
     
@@ -3920,7 +3928,7 @@ def trade_loop_enhanced():
                     **info
                 })
             
-            # قرار الدخول المحسن مع جميع المحركات + Edge Algo + CVD Divergence
+            # قرار الدخول المحسن مع جميع المحركات + Edge Algo + CVD Divergence + Enhanced Filters
             reason = None
             if spread_bps is not None and spread_bps > MAX_SPREAD_BPS:
                 reason = f"spread too high ({fmt(spread_bps,2)}bps > {MAX_SPREAD_BPS})"
@@ -3936,22 +3944,45 @@ def trade_loop_enhanced():
             
             sig = None
 
-            # --- CVD Divergence Entry ---
+            # استخراج القيم الأساسية للفلترة
+            score_b = council_data.get("score_b", 0.0)
+            score_s = council_data.get("score_s", 0.0)
+            adx_val = council_data.get("ind", {}).get("adx", ind.get("adx", 0.0))
+
+            # --- CVD Divergence Entry (مع فلتر ADX ≥ 20 + Council score ≥ 8) ---
             cvd_entry = False
             if cvd_div:
                 if cvd_div.get("bull_div"):
-                    sig = "buy"
-                    cvd_entry = True
-                    log_i(f"📈 CVD DIVERGENCE ENTRY: BUY | Bullish Divergence detected")
+                    if adx_val >= CVD_ADX_MIN and score_b >= CVD_SCORE_MIN:
+                        sig = "buy"
+                        cvd_entry = True
+                        log_i(
+                            f"📈 CVD DIVERGENCE ENTRY: BUY | Bullish Divergence detected "
+                            f"(ADX={adx_val:.1f} ≥ {CVD_ADX_MIN} • score_b={score_b:.1f} ≥ {CVD_SCORE_MIN})"
+                        )
+                    else:
+                        log_i(
+                            f"⚠️ CVD BUY skipped | weak context "
+                            f"(ADX={adx_val:.1f} • score_b={score_b:.1f})"
+                        )
                 elif cvd_div.get("bear_div"):
-                    sig = "sell"
-                    cvd_entry = True
-                    log_i(f"📉 CVD DIVERGENCE ENTRY: SELL | Bearish Divergence detected")
+                    if adx_val >= CVD_ADX_MIN and score_s >= CVD_SCORE_MIN:
+                        sig = "sell"
+                        cvd_entry = True
+                        log_i(
+                            f"📉 CVD DIVERGENCE ENTRY: SELL | Bearish Divergence detected "
+                            f"(ADX={adx_val:.1f} ≥ {CVD_ADX_MIN} • score_s={score_s:.1f} ≥ {CVD_SCORE_MIN})"
+                        )
+                    else:
+                        log_i(
+                            f"⚠️ CVD SELL skipped | weak context "
+                            f"(ADX={adx_val:.1f} • score_s={score_s:.1f})"
+                        )
 
-            # --- Enhanced SMC Entry Pro مع ADX+ATR Filters ---
+            # --- Enhanced SMC Entry Pro مع ADX+ATR Filters وفلتر الثقة ≥ 0.8 ---
             smc_entry = False
             if not cvd_entry and SMC_ENABLED and smc_analysis.get('trading_opportunities'):
-                # فلترة الفرص بناءً على ADX+ATR
+                # فلترة الفرص بناءً على ADX+ATR وفلتر الثقة
                 filtered_opportunities = []
                 for opp in smc_analysis['trading_opportunities']:
                     if 'stop_hunt' in opp['type']:
@@ -3966,17 +3997,20 @@ def trade_loop_enhanced():
                     best_opportunity = max(filtered_opportunities, 
                                          key=lambda x: x.get('confidence', 0))
                     
-                    if best_opportunity['confidence'] >= 0.7:
+                    # تطبيق فلتر الثقة الجديد ≥ 0.8 (كان 0.7)
+                    if best_opportunity['confidence'] >= SMC_CONFIDENCE_MIN:
                         if best_opportunity['direction'] == 'long':
                             sig = "buy"
                             smc_entry = True
                             entry_type = "SMC_STOP_HUNT" if 'stop_hunt' in best_opportunity['type'] else "SMC"
-                            log_i(f"🎯 {entry_type} ENTRY: BUY | {best_opportunity['type']} (ثقة: {best_opportunity['confidence']:.1f})")
+                            log_i(f"🎯 {entry_type} ENTRY: BUY | {best_opportunity['type']} (ثقة: {best_opportunity['confidence']:.1f} ≥ {SMC_CONFIDENCE_MIN})")
                         elif best_opportunity['direction'] == 'short':
                             sig = "sell" 
                             smc_entry = True
                             entry_type = "SMC_STOP_HUNT" if 'stop_hunt' in best_opportunity['type'] else "SMC"
-                            log_i(f"🎯 {entry_type} ENTRY: SELL | {best_opportunity['type']} (ثقة: {best_opportunity['confidence']:.1f})")
+                            log_i(f"🎯 {entry_type} ENTRY: SELL | {best_opportunity['type']} (ثقة: {best_opportunity['confidence']:.1f} ≥ {SMC_CONFIDENCE_MIN})")
+                    else:
+                        log_i(f"⚠️ SMC opportunity skipped | low confidence {best_opportunity['confidence']:.1f} < {SMC_CONFIDENCE_MIN}")
 
             # --- Enhanced Golden Entry Pro ---
             golden_entry = False
@@ -4031,36 +4065,45 @@ def trade_loop_enhanced():
                 elif council_data["score_s"] > council_data["score_b"] and council_data["score_s"] >= 8.0:
                     sig = "sell"
             
+            # ========== فلتر قوة الإشارة FINAL قبل أي دخول ==========
             if not STATE["open"] and sig and reason is None:
-                allow_wait, wait_reason = wait_gate_allow(df, info)
-                if not allow_wait:
-                    reason = wait_reason
+                # فلتر قوة الإشارة قبل أي دخول
+                sig_side = "long" if sig == "buy" else "short"
+                signal_strength = calculate_signal_strength(df, ind, sig_side)
+                
+                if signal_strength < SIGNAL_STRENGTH_MIN:
+                    reason = f"weak_signal_strength({signal_strength:.1f}<{SIGNAL_STRENGTH_MIN})"
+                    log_i(f"🚫 SKIP ENTRY | {sig.upper()} | ضعيف جداً | strength={signal_strength:.1f} < {SIGNAL_STRENGTH_MIN}")
                 else:
-                    qty = compute_size(bal, px or info["price"])
-                    if qty > 0:
-                        ok = open_market_enhanced(sig, qty, px or info["price"])
-                        if ok:
-                            wait_for_next_signal_side = None
-                            # تسجيل قرار المجلس المحسن مع جميع المعلومات
-                            entry_type = "CVD_DIVERGENCE" if cvd_entry else \
-                                       "SMC_STOP_HUNT_FILTERED" if smc_entry and 'stop_hunt' in best_opportunity['type'] else \
-                                       "SMC" if smc_entry else \
-                                       "GOLDEN" if golden_entry else \
-                                       "ULTRA_MS" if ultra_entry else \
-                                       "EDGE_ALGO" if edge_entry else "COUNCIL"
-                            
-                            adx_info = f" | ADX={ind.get('adx',0):.1f}" if ind.get('adx') else ""
-                            atr_info = f" | ATR={ind.get('atr',0):.6f}" if ind.get('atr') else ""
-                            rf_info = f" | RF dir={rf_ctx.get('dir', 0)}" if rf_ctx else ""
-                            edge_info = f" | Edge grade={edge_setup.get('grade', 'N/A')}" if edge_setup else ""
-                            
-                            log_i(f"🎯 {entry_type} ULTRA ENHANCED DECISION: {sig.upper()} | "
-                                  f"Score B/S: {council_data['score_b']:.1f}/{council_data['score_s']:.1f} | "
-                                  f"Signal Strength: {STATE.get('signal_strength', 0):.1f}{adx_info}{atr_info}{rf_info}{edge_info}")
-                            for log_msg in council_data.get("logs", []):
-                                log_i(f"   - {log_msg}")
+                    allow_wait, wait_reason = wait_gate_allow(df, info)
+                    if not allow_wait:
+                        reason = wait_reason
                     else:
-                        reason = "qty<=0"
+                        qty = compute_size(bal, px or info["price"])
+                        if qty > 0:
+                            ok = open_market_enhanced(sig, qty, px or info["price"])
+                            if ok:
+                                wait_for_next_signal_side = None
+                                # تسجيل قرار المجلس المحسن مع جميع المعلومات
+                                entry_type = "CVD_DIVERGENCE" if cvd_entry else \
+                                           "SMC_STOP_HUNT_FILTERED" if smc_entry and 'stop_hunt' in best_opportunity['type'] else \
+                                           "SMC" if smc_entry else \
+                                           "GOLDEN" if golden_entry else \
+                                           "ULTRA_MS" if ultra_entry else \
+                                           "EDGE_ALGO" if edge_entry else "COUNCIL"
+                                
+                                adx_info = f" | ADX={ind.get('adx',0):.1f}" if ind.get('adx') else ""
+                                atr_info = f" | ATR={ind.get('atr',0):.6f}" if ind.get('atr') else ""
+                                rf_info = f" | RF dir={rf_ctx.get('dir', 0)}" if rf_ctx else ""
+                                edge_info = f" | Edge grade={edge_setup.get('grade', 'N/A')}" if edge_setup else ""
+                                
+                                log_i(f"🎯 {entry_type} ULTRA ENHANCED DECISION: {sig.upper()} | "
+                                      f"Score B/S: {council_data['score_b']:.1f}/{council_data['score_s']:.1f} | "
+                                      f"Signal Strength: {signal_strength:.1f}{adx_info}{atr_info}{rf_info}{edge_info}")
+                                for log_msg in council_data.get("logs", []):
+                                    log_i(f"   - {log_msg}")
+                        else:
+                            reason = "qty<=0"
             
             loop_i += 1
             sleep_s = NEAR_CLOSE_S if time_to_candle_close(df) <= 10 else BASE_SLEEP
@@ -4090,7 +4133,7 @@ def pretty_snapshot(bal, info, ind, spread_bps, reason=None, df=None):
         print("📈 INDICATORS & RF")
         print(f"   💲 Price {fmt(info.get('price'))} | RF filt={fmt(info.get('filter'))}  hi={fmt(info.get('hi'))} lo={fmt(info.get('lo'))}")
         print(f"   🧮 RSI={fmt(ind.get('rsi'))}  +DI={fmt(ind.get('plus_di'))}  -DI={fmt(ind.get('minus_di'))}  ADX={fmt(ind.get('adx'))}  ATR={fmt(ind.get('atr'))}")
-        print(f"   🎯 ENTRY: ULTRA MARKET STRUCTURE + REAL RF + VWAP + SMC ADVANCED + COUNCIL PRO + GOLDEN ENTRY + ADX+ATR STOP-HUNT FILTERS + EDGE ALGO + CVD DIVERGENCE |  spread_bps={fmt(spread_bps,2)}")
+        print(f"   🎯 ENTRY: ULTRA MARKET STRUCTURE + REAL RF + VWAP + SMC ADVANCED + COUNCIL PRO + GOLDEN ENTRY + ADX+ATR STOP-HUNT FILTERS + EDGE ALGO + CVD DIVERGENCE + ENHANCED FILTERS |  spread_bps={fmt(spread_bps,2)}")
         print(f"   ⏱️ closes_in ≈ {left_s}s")
         print("\n🧭 POSITION")
         bal_line = f"Balance={fmt(bal,2)}  Risk={int(RISK_ALLOC*100)}%×{LEVERAGE}x  CompoundPnL={fmt(compound_pnl)}  Eq~{fmt((bal or 0)+compound_pnl,2)}"
@@ -4111,7 +4154,7 @@ app = Flask(__name__)
 @app.route("/")
 def home():
     mode='LIVE' if MODE_LIVE else 'PAPER'
-    return f"✅ ULTRA Council PRO Bot v7.0 — {SYMBOL} {INTERVAL} — {mode} — Ultra Market Structure + Real RF + VWAP + SMC Advanced + Elliott Waves + Stop Hunt AI + ADX+ATR Filters + Edge Algo + CVD Divergence"
+    return f"✅ ULTRA Council PRO Bot v7.0 — {SYMBOL} {INTERVAL} — {mode} — Ultra Market Structure + Real RF + VWAP + SMC Advanced + Elliott Waves + Stop Hunt AI + ADX+ATR Filters + Edge Algo + CVD Divergence + ENHANCED FILTERS"
 
 @app.route("/metrics")
 def metrics():
@@ -4121,7 +4164,7 @@ def metrics():
         "symbol": SYMBOL, "interval": INTERVAL, "mode": "live" if MODE_LIVE else "paper",
         "leverage": LEVERAGE, "risk_alloc": RISK_ALLOC, "price": price_now(),
         "state": STATE, "compound_pnl": compound_pnl,
-        "entry_mode": "ULTRA_MARKET_STRUCTURE+REAL_RF+VWAP+SMC_ADVANCED_COUNCIL_PRO_GOLDEN_ENHANCED_ADX_ATR_FILTERS+EDGE_ALGO+CVD_DIVERGENCE", 
+        "entry_mode": "ULTRA_MARKET_STRUCTURE+REAL_RF+VWAP+SMC_ADVANCED_COUNCIL_PRO_GOLDEN_ENHANCED_ADX_ATR_FILTERS+EDGE_ALGO+CVD_DIVERGENCE+ENHANCED_FILTERS", 
         "wait_for_next_signal": wait_for_next_signal_side,
         "guards": {"max_spread_bps": MAX_SPREAD_BPS, "final_chunk_qty": FINAL_CHUNK_QTY},
         "vwap_strategy": {
@@ -4158,6 +4201,13 @@ def metrics():
             "enabled": True,
             "current": cvd_div if cvd_div else None,
             "description": "TradingFinder-style CVD Divergence Oscillator"
+        },
+        "enhanced_filters": {
+            "cvd_adx_min": CVD_ADX_MIN,
+            "cvd_score_min": CVD_SCORE_MIN,
+            "smc_confidence_min": SMC_CONFIDENCE_MIN,
+            "signal_strength_min": SIGNAL_STRENGTH_MIN,
+            "description": "Enhanced entry filters for higher quality trades"
         }
     })
 
@@ -4167,9 +4217,10 @@ def health():
         "ok": True, "mode": "live" if MODE_LIVE else "paper",
         "open": STATE["open"], "side": STATE["side"], "qty": STATE["qty"],
         "compound_pnl": compound_pnl, "timestamp": datetime.utcnow().isoformat(),
-        "entry_mode": "ULTRA_MARKET_STRUCTURE+REAL_RF+VWAP+SMC_ADVANCED_COUNCIL_PRO_GOLDEN_ENHANCED_ADX_ATR_FILTERS+EDGE_ALGO+CVD_DIVERGENCE", 
+        "entry_mode": "ULTRA_MARKET_STRUCTURE+REAL_RF+VWAP+SMC_ADVANCED_COUNCIL_PRO_GOLDEN_ENHANCED_ADX_ATR_FILTERS+EDGE_ALGO+CVD_DIVERGENCE+ENHANCED_FILTERS", 
         "wait_for_next_signal": wait_for_next_signal_side,
-        "edge_profile": STATE.get("profit_profile", "SCALP_STRICT")
+        "edge_profile": STATE.get("profit_profile", "SCALP_STRICT"),
+        "enhanced_filters_active": True
     }), 200
 
 def keepalive_loop():
@@ -4187,7 +4238,7 @@ def keepalive_loop():
 
 # =================== BOOT ===================
 if __name__ == "__main__":
-    log_banner("ULTRA ENHANCED BOT INIT WITH EDGE ALGO + CVD DIVERGENCE")
+    log_banner("ULTRA ENHANCED BOT INIT WITH EDGE ALGO + CVD DIVERGENCE + ENHANCED FILTERS")
     state = load_state() or {}
     state.setdefault("in_position", False)
 
@@ -4213,9 +4264,13 @@ if __name__ == "__main__":
     print(colored(f"VWAP STRATEGY: SCALP(near {VWAP_SCALP_BAND_BPS}bps) | TREND(far {VWAP_TREND_BAND_BPS}bps)", "yellow"))
     print(colored(f"🧠 EDGE ALGO ENGINE: RR Zones + Setup Quality + Dynamic Profit Profiles (TREND_3TP/MID_2TP/SCALP_STRICT)", "yellow"))
     print(colored(f"📊 CVD DIVERGENCE OSCILLATOR: TradingFinder-style divergence detection", "yellow"))
+    print(colored(f"🔒 ENHANCED ENTRY FILTERS:", "yellow"))
+    print(colored(f"   • CVD Divergence: ADX≥{CVD_ADX_MIN} + Council Score≥{CVD_SCORE_MIN}", "yellow"))
+    print(colored(f"   • SMC Confidence: ≥{SMC_CONFIDENCE_MIN} (was 0.7)", "yellow"))
+    print(colored(f"   • Signal Strength: ≥{SIGNAL_STRENGTH_MIN} for any entry", "yellow"))
     print(colored(f"EXECUTION: {'ACTIVE' if EXECUTE_ORDERS and not DRY_RUN else 'SIMULATION'}", "yellow"))
     
-    logging.info("ULTRA enhanced SMC service starting with all engines + Edge Algo + CVD Divergence…")
+    logging.info("ULTRA enhanced SMC service starting with all engines + Edge Algo + CVD Divergence + Enhanced Filters…")
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
     signal.signal(signal.SIGINT,  lambda *_: sys.exit(0))
     
