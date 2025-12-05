@@ -13,7 +13,7 @@ RF Futures Bot — RF-LIVE ONLY (BingX Perp via CCXT)
 • Real Range Filter (RF) Pine Exact + VWAP Session
 • EDGE ALGO ENGINE: RR Zones + Setup Quality + Dynamic Profit Profiles
 • CVD DIVERGENCE OSCILLATOR: TradingFinder-style divergence detection
-• ENHANCED FILTERS: CVD ADX≥20 + Score≥8 | SMC Confidence≥0.8 | Signal Strength≥6.0
+• ENHANCED FILTERS: CVD ADX≥20 + Score≥8 | SMC Confidence≥0.85 | Signal Strength≥7.0 | Council Votes≥11
 • SMART SIGNAL & SMART PROFIT SYSTEM: RF Master + Edge Zones + HOLD-TP Logic
 """
 
@@ -202,8 +202,9 @@ STOP_HUNT_SL_ATR_MULT = 0.7     # مضاعف ATR لوضع Stop Loss
 # =================== ENHANCED ENTRY FILTERS ===================
 CVD_ADX_MIN = 20                # الحد الأدنى لـ ADX لدخول CVD
 CVD_SCORE_MIN = 8.0             # الحد الأدنى لـ Council Score لدخول CVD
-SMC_CONFIDENCE_MIN = 0.8        # الحد الأدنى لثقة SMC (كان 0.7)
-SIGNAL_STRENGTH_MIN = 6.0       # الحد الأدنى لقوة الإشارة لأي دخول
+SMC_CONFIDENCE_MIN = 0.85       # ✅ تم التعديل من 0.8 إلى 0.85
+SIGNAL_STRENGTH_MIN = 7.0       # ✅ تم التعديل من 6.0 إلى 7.0
+COUNCIL_SMC_VOTES_MIN = 11      # ✅ الحد الأدنى لأصوات المجلس لدخول SMC
 
 # =================== PROFESSIONAL LOGGING ===================
 def log_i(msg): print(f"ℹ️ {msg}", flush=True)
@@ -217,7 +218,7 @@ def save_state(state: dict):
     try:
         state["ts"] = int(time.time())
         with open(STATE_PATH, "w", encoding="utf-8") as f:
-            json.dump(state, f, ensure_asci=False, indent=2)
+            json.dump(state, f, ensure_cii=False, indent=2)
         log_i(f"state saved → {STATE_PATH}")
     except Exception as e:
         log_w(f"state save failed: {e}")
@@ -2072,7 +2073,7 @@ def verify_execution_environment():
     print(f"📗 REAL RF FILTER: Pine Exact + Live Signals", flush=True)
     print(f"🧠 EDGE ALGO ENGINE: RR Zones + Setup Quality + Dynamic Profit Profiles", flush=True)
     print(f"📊 CVD DIVERGENCE OSCILLATOR: TradingFinder-style divergence detection", flush=True)
-    print(f"🔒 ENHANCED ENTRY FILTERS: CVD ADX≥{CVD_ADX_MIN} + Score≥{CVD_SCORE_MIN} | SMC Confidence≥{SMC_CONFIDENCE_MIN} | Signal Strength≥{SIGNAL_STRENGTH_MIN}", flush=True)
+    print(f"🔒 ENHANCED ENTRY FILTERS: CVD ADX≥{CVD_ADX_MIN} + Score≥{CVD_SCORE_MIN} | SMC Confidence≥{SMC_CONFIDENCE_MIN} | Signal Strength≥{SIGNAL_STRENGTH_MIN} | Council Votes≥{COUNCIL_SMC_VOTES_MIN}", flush=True)
     print(f"🧠 SMART SIGNAL/PROFIT SYSTEM: RF Master + HOLD-TP Logic + Edge Zones", flush=True)
     
     if not EXECUTE_ORDERS:
@@ -2963,6 +2964,7 @@ def council_votes_pro_enhanced(df):
 
         return {
             "b": votes_b, "s": votes_s,
+            "votes_b": votes_b, "votes_s": votes_s,  # ✅ نسخة إضافية للتأكد
             "score_b": score_b, "score_s": score_s,
             "logs": logs, "ind": ind, "gz": gz, 
             "footprint": footprint, "candles": cd,
@@ -2975,7 +2977,7 @@ def council_votes_pro_enhanced(df):
         }
     except Exception as e:
         log_w(f"council_votes_pro_enhanced error: {e}")
-        return {"b":0,"s":0,"score_b":0.0,"score_s":0.0,"logs":[],"ind":{},"gz":None,"candles":{}}
+        return {"b":0,"s":0,"votes_b":0,"votes_s":0,"score_b":0.0,"score_s":0.0,"logs":[],"ind":{},"gz":None,"candles":{}}
 
 # =================== POSITION RECOVERY ===================
 def _normalize_side(pos):
@@ -4226,7 +4228,7 @@ def trade_loop_enhanced():
                             f"(ADX={council_data.get('ind', {}).get('adx', 0):.1f} • score_s={council_data['score_s']:.1f})"
                         )
 
-            # --- Advanced SMC Entry Pro مع ADX+ATR Filters وفلتر الثقة ≥ 0.8 ---
+            # ========== Advanced SMC Entry Pro مع ADX+ATR Filters وفلتر الثقة + RF MASTER ==========
             smc_entry = False
             if sig is None and SMC_ENABLED and smc_analysis.get('trading_opportunities'):
                 # فلترة الفرص بناءً على ADX+ATR وفلتر الثقة
@@ -4237,27 +4239,58 @@ def trade_loop_enhanced():
                         if opp.get('filters_applied'):
                             filtered_opportunities.append(opp)
                     else:
-                        # الفرص الأخرى (Supply/Demand, Order Blocks, etc.)
+                        # الفرص الأخرى (Supply/Demand, Order Blocks, الخ)
                         filtered_opportunities.append(opp)
-                
+
                 if filtered_opportunities:
-                    best_opportunity = max(filtered_opportunities, 
-                                         key=lambda x: x.get('confidence', 0))
-                    
-                    # تطبيق فلتر الثقة الجديد ≥ 0.8 (كان 0.7)
-                    if best_opportunity['confidence'] >= SMC_CONFIDENCE_MIN:
-                        if best_opportunity['direction'] == 'long':
-                            sig = "buy"
-                            smc_entry = True
-                            entry_type = "SMC_STOP_HUNT" if 'stop_hunt' in best_opportunity['type'] else "SMC"
-                            log_i(f"🎯 {entry_type} ENTRY: BUY | {best_opportunity['type']} (ثقة: {best_opportunity['confidence']:.1f} ≥ {SMC_CONFIDENCE_MIN})")
-                        elif best_opportunity['direction'] == 'short':
-                            sig = "sell" 
-                            smc_entry = True
-                            entry_type = "SMC_STOP_HUNT" if 'stop_hunt' in best_opportunity['type'] else "SMC"
-                            log_i(f"🎯 {entry_type} ENTRY: SELL | {best_opportunity['type']} (ثقة: {best_opportunity['confidence']:.1f} ≥ {SMC_CONFIDENCE_MIN})")
-                    else:
-                        log_i(f"⚠️ SMC opportunity skipped | low confidence {best_opportunity['confidence']:.1f} < {SMC_CONFIDENCE_MIN}")
+                    best_opportunity = max(
+                        filtered_opportunities,
+                        key=lambda x: x.get('confidence', 0)
+                    )
+
+                    conf = best_opportunity.get('confidence', 0)
+                    direction = best_opportunity.get('direction')
+                    opp_type = best_opportunity.get('type', 'unknown')
+
+                    # ✅ فلتر الثقة العالية أولاً (0.85 بدل 0.8)
+                    if conf >= SMC_CONFIDENCE_MIN:
+                        # ✅ نقرأ إشارات RF + أصوات المجلس
+                        rf_buy  = rf_ctx.get("buy_signal", False) if 'rf_ctx' in locals() else False
+                        rf_sell = rf_ctx.get("sell_signal", False) if 'rf_ctx' in locals() else False
+                        votes_b = council_data.get("votes_b", 0)
+                        votes_s = council_data.get("votes_s", 0)
+
+                        if direction == 'long':
+                            # ✅ فلتر RF + أصوات المجلس
+                            if rf_buy and votes_b >= COUNCIL_SMC_VOTES_MIN:
+                                sig = "buy"
+                                smc_entry = True
+                                entry_type = "SMC_STOP_HUNT" if 'stop_hunt' in opp_type else "SMC"
+                                log_i(
+                                    f"🎯 {entry_type} ENTRY: BUY | {opp_type} "
+                                    f"(ثقة={conf:.2f} • RF BUY=True • votes_b={votes_b}≥{COUNCIL_SMC_VOTES_MIN})"
+                                )
+                            else:
+                                log_i(
+                                    f"⚠️ SMC BUY skipped | weak RF/council "
+                                    f"(conf={conf:.2f} • rf_buy={rf_buy} • votes_b={votes_b}<{COUNCIL_SMC_VOTES_MIN})"
+                                )
+
+                        elif direction == 'short':
+                            # ✅ فلتر RF + أصوات المجلس
+                            if rf_sell and votes_s >= COUNCIL_SMC_VOTES_MIN:
+                                sig = "sell"
+                                smc_entry = True
+                                entry_type = "SMC_STOP_HUNT" if 'stop_hunt' in opp_type else "SMC"
+                                log_i(
+                                    f"🎯 {entry_type} ENTRY: SELL | {opp_type} "
+                                    f"(ثقة={conf:.2f} • RF SELL=True • votes_s={votes_s}≥{COUNCIL_SMC_VOTES_MIN})"
+                                )
+                            else:
+                                log_i(
+                                    f"⚠️ SMC SELL skipped | weak RF/council "
+                                    f"(conf={conf:.2f} • rf_sell={rf_sell} • votes_s={votes_s}<{COUNCIL_SMC_VOTES_MIN})"
+                                )
 
             # --- Enhanced Golden Entry Pro ---
             golden_entry = False
@@ -4319,6 +4352,7 @@ def trade_loop_enhanced():
                 sig_side = "long" if sig == "buy" else "short"
                 signal_strength = calculate_signal_strength(df, ind, sig_side)
                 
+                # ✅ فلتر قوة الإشارة المعزز (7.0 بدل 6.0)
                 if signal_strength < SIGNAL_STRENGTH_MIN:
                     reason = f"weak_signal_strength({signal_strength:.1f}<{SIGNAL_STRENGTH_MIN})"
                     log_i(f"🚫 SKIP ENTRY | {sig.upper()} | ضعيف جداً | strength={signal_strength:.1f} < {SIGNAL_STRENGTH_MIN}")
@@ -4397,7 +4431,7 @@ app = Flask(__name__)
 @app.route("/")
 def home():
     mode='LIVE' if MODE_LIVE else 'PAPER'
-    return f"✅ ULTRA Council PRO Bot v8.0 — {SYMBOL} {INTERVAL} — {mode} — Ultra Market Structure + Real RF + VWAP + SMC Advanced + Elliott Waves + Stop Hunt AI + ADX+ATR Filters + Edge Algo + CVD Divergence + ENHANCED FILTERS + SMART SIGNAL/PROFIT SYSTEM"
+    return f"✅ ULTRA Council PRO Bot v8.0 — {SYMBOL} {INTERVAL} — {mode} — Ultra Market Structure + Real RF + VWAP + SMC Advanced + Elliott Waves + Stop Hunt AI + ADX+ATR Filters + EdgeAlgo + CVD Divergence + ENHANCED FILTERS + SMART SIGNAL/PROFIT SYSTEM"
 
 @app.route("/metrics")
 def metrics():
@@ -4450,6 +4484,7 @@ def metrics():
             "cvd_score_min": CVD_SCORE_MIN,
             "smc_confidence_min": SMC_CONFIDENCE_MIN,
             "signal_strength_min": SIGNAL_STRENGTH_MIN,
+            "council_votes_min": COUNCIL_SMC_VOTES_MIN,
             "description": "Enhanced entry filters for higher quality trades"
         },
         "smart_signal_profit": {
@@ -4518,8 +4553,9 @@ if __name__ == "__main__":
     print(colored(f"📊 CVD DIVERGENCE OSCILLATOR: TradingFinder-style divergence detection", "yellow"))
     print(colored(f"🔒 ENHANCED ENTRY FILTERS:", "yellow"))
     print(colored(f"   • CVD Divergence: ADX≥{CVD_ADX_MIN} + Council Score≥{CVD_SCORE_MIN}", "yellow"))
-    print(colored(f"   • SMC Confidence: ≥{SMC_CONFIDENCE_MIN} (was 0.7)", "yellow"))
-    print(colored(f"   • Signal Strength: ≥{SIGNAL_STRENGTH_MIN} for any entry", "yellow"))
+    print(colored(f"   • SMC Confidence: ≥{SMC_CONFIDENCE_MIN} (تم التعديل من 0.8)", "yellow"))
+    print(colored(f"   • Signal Strength: ≥{SIGNAL_STRENGTH_MIN} for any entry (تم التعديل من 6.0)", "yellow"))
+    print(colored(f"   • Council Votes: ≥{COUNCIL_SMC_VOTES_MIN} for SMC entries", "yellow"))
     print(colored(f"🧠 SMART SIGNAL/PROFIT SYSTEM:", "yellow"))
     print(colored(f"   • RF Master Entry: تقييم الإشارة من كل المحركات", "yellow"))
     print(colored(f"   • HOLD-TP Logic: رفع الأهداف بعد TP1 للصفقات القوية", "yellow"))
