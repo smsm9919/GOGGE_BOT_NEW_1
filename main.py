@@ -218,7 +218,7 @@ def save_state(state: dict):
     try:
         state["ts"] = int(time.time())
         with open(STATE_PATH, "w", encoding="utf-8") as f:
-            json.dump(state, f, ensure_cii=False, indent=2)
+            json.dump(state, f, ensure_ascii=False, indent=2)
         log_i(f"state saved → {STATE_PATH}")
     except Exception as e:
         log_w(f"state save failed: {e}")
@@ -3969,18 +3969,26 @@ def manage_after_entry_enhanced(df, ind, info):
             if MODE_LIVE and EXECUTE_ORDERS and not DRY_RUN:
                 try:
                     ex.create_order(SYMBOL, "market", close_side, close_qty, None, _params_close())
-                    log_g(f"✅ SMART TP{target_num}: closed {fraction*100:.0f}% | {profit_decision['reason']}")
+                    log_g(
+                        f"✅ SMART TP{target_num}: "
+                        f"closed {fraction*100:.0f}% | {profit_decision['reason']}"
+                    )
                     STATE["qty"] = safe_qty(qty - close_qty)
                     STATE["profit_targets_achieved"] = target_num
+
+                    # ✅ علَّم إن TP1 تحقق (مهم لـ Golden Reversal / Smart Exit)
+                    if target_num == 1:
+                        STATE["tp1_done"] = True
                     
                     # تحديد عدد الأهداف حسب البروفايل الفعلي
                     if profit_profile == "SCALP_STRICT":
                         max_targets = len(SCALP_TPS)
                     elif profit_profile == "MID_2TP":
-                        max_targets = 2
+                        max_targets = 2      # نص ترند = 2 أهداف
                     else:  # TREND_3TP
-                        max_targets = len(TREND_TPS)
+                        max_targets = len(TREND_TPS)  # ترند كبير = 3 أهداف
 
+                    # لو وصلنا آخر هدف ⇒ إغلاق صارم
                     if target_num >= max_targets:
                         close_market_strict("all_targets_achieved")
                         return
@@ -4016,8 +4024,8 @@ def manage_after_entry_enhanced(df, ind, info):
     # نحول PnL من % إلى كسور عشان نستخدمه مع الحراس اللي شغّالين بالـ fraction
     pnl_frac = pnl_pct / 100.0
 
-    # TP1 جزئي (مرة واحدة فقط)
-    if not STATE.get("tp1_done") and pnl_frac >= tp1_pct:
+    # TP1 جزئي (معطَّل الآن — Smart Profit AI هو المسؤول عن الـ partial TP)
+    if False and not STATE.get("tp1_done") and pnl_frac >= tp1_pct:
         # تحديد كمية الإغلاق بناءً على البروفايل
         if profit_profile == "TREND_3TP":
             close_fraction = 0.25  # 25% للترند القوي
@@ -4410,7 +4418,7 @@ def pretty_snapshot(bal, info, ind, spread_bps, reason=None, df=None):
         print("📈 INDICATORS & RF")
         print(f"   💲 Price {fmt(info.get('price'))} | RF filt={fmt(info.get('filter'))}  hi={fmt(info.get('hi'))} lo={fmt(info.get('lo'))}")
         print(f"   🧮 RSI={fmt(ind.get('rsi'))}  +DI={fmt(ind.get('plus_di'))}  -DI={fmt(ind.get('minus_di'))}  ADX={fmt(ind.get('adx'))}  ATR={fmt(ind.get('atr'))}")
-        print(f"   🎯 ENTRY: ULTRA MARKET STRUCTURE + REAL RF + VWAP + SMC ADVANCED + COUNCIL PRO + GOLDEN ENTRY + ADX+ATR STOP-HUNT FILTERS + EDGE ALGO + CVD DIVERGENCE + ENHANCED FILTERS |  spread_bps={fmt(spread_bps,2)}")
+        print(f"   🎯 ENTRY: ULTRA MARKET STRUCTURE + REAL RF + VWAP + SMC ADVANCED + COUNCIL PRO + GOLDEN ENTRY + ADX+ATR STOP-HUNT FILTERS + EDGE ALGO + CVD DIVERGENCE + ENHANCED FILTERS + SMART SIGNAL/PROFIT SYSTEM |  spread_bps={fmt(spread_bps,2)}")
         print(f"   ⏱️ closes_in ≈ {left_s}s")
         print("\n🧭 POSITION")
         bal_line = f"Balance={fmt(bal,2)}  Risk={int(RISK_ALLOC*100)}%×{LEVERAGE}x  CompoundPnL={fmt(compound_pnl)}  Eq~{fmt((bal or 0)+compound_pnl,2)}"
