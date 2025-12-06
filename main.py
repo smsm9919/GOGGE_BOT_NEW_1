@@ -8,6 +8,7 @@ RF Futures Bot — RF-LIVE ONLY (BingX Perp via CCXT)
 • Professional Logging & Dashboard
 • Enhanced with Footprint, SMC Candles, Liquidity Traps + VWAP Strategy
 • OTC Hidden Flow Detection & Protection System
+• EMA Crossover Strength Engine (Strong/Weak Trend Detection)
 """
 
 import os, time, math, random, signal, sys, traceback, logging, json
@@ -42,7 +43,7 @@ SHADOW_MODE_DASHBOARD = False
 DRY_RUN = False
 
 # ==== Addon: Logging + Recovery Settings ====
-BOT_VERSION = "DOGE Council PRO v5.0 — Smart Profit AI + Golden Zone Pro + VWAP Strategy + OTC Detection"
+BOT_VERSION = "DOGE Council PRO v5.0 — Smart Profit AI + Golden Zone Pro + VWAP Strategy + OTC Detection + EMA Crossover Engine"
 print("🔁 Booting:", BOT_VERSION, flush=True)
 
 STATE_PATH = "./bot_state.json"
@@ -514,6 +515,7 @@ def verify_execution_environment():
     print(f"👣 FOOTPRINT ANALYSIS: Volume spikes + Absorption", flush=True)
     print(f"💰 OTC DETECTION: Hidden flow detection + Protection", flush=True)
     print(f"📊 VWAP STRATEGY: SCALP(near {VWAP_SCALP_BAND_BPS}bps) | TREND(far {VWAP_TREND_BAND_BPS}bps)", flush=True)
+    print(f"📈 EMA CROSSOVER ENGINE: Strong/Weak Trend Detection", flush=True)
     
     if not EXECUTE_ORDERS:
         print("🟡 WARNING: EXECUTE_ORDERS=False - البوت في وضع التحليل فقط!", flush=True)
@@ -563,6 +565,71 @@ def rsi_ma_context(df):
         "trendZ": "bull" if persist_bull else ("bear" if persist_bear else "none"),
         "in_chop": in_chop
     }
+
+# =================== EMA CROSSOVER STRENGTH ENGINE ===================
+def ema_crossover_strength(df, ind=None, fast=9, mid=21, slow=50):
+    """
+    تصنيف تقاطع EMA:
+    - strong_bull / weak_bull
+    - strong_bear / weak_bear
+    - none
+
+    يرجّع:
+    {
+        "side": "bull"/"bear"/"flat",
+        "label": "strong_bull"/"weak_bull"/"strong_bear"/"weak_bear"/"none",
+        "score": float
+    }
+    """
+    try:
+        if len(df) < slow + 5:
+            return {"side": "flat", "label": "none", "score": 0.0}
+
+        close = df["close"].astype(float)
+        ema_fast = close.ewm(span=fast, adjust=False).mean()
+        ema_mid  = close.ewm(span=mid, adjust=False).mean()
+        ema_slow = close.ewm(span=slow, adjust=False).mean()
+
+        f_now = float(ema_fast.iloc[-1]); f_prev = float(ema_fast.iloc[-2])
+        m_now = float(ema_mid.iloc[-1]);  m_prev = float(ema_mid.iloc[-2])
+        s_now = float(ema_slow.iloc[-1])
+        px    = float(close.iloc[-1])
+
+        cross_up   = (f_prev <= m_prev) and (f_now > m_now)
+        cross_down = (f_prev >= m_prev) and (f_now < m_now)
+
+        adx = 0.0
+        if ind:
+            adx = float(ind.get("adx", 0.0))
+
+        side  = "flat"
+        label = "none"
+        score = 0.0
+
+        # ===== Bullish context =====
+        if f_now > m_now >= s_now:
+            side = "bull"
+            # strong bull: ema fast > mid > slow + price فوق fast + ADX محترم + cross قريب
+            if cross_up and adx >= 22 and px > f_now:
+                label = "strong_bull"
+                score = 3.0
+            else:
+                label = "weak_bull"
+                score = 1.5
+
+        # ===== Bearish context =====
+        elif f_now < m_now <= s_now:
+            side = "bear"
+            if cross_down and adx >= 22 and px < f_now:
+                label = "strong_bear"
+                score = 3.0
+            else:
+                label = "weak_bear"
+                score = 1.5
+
+        return {"side": side, "label": label, "score": score}
+    except Exception:
+        return {"side": "flat", "label": "none", "score": 0.0}
 
 # =================== GOLDEN ZONE PRO ANALYSIS ===================
 def golden_zone_pro_analysis(df, current_price):
@@ -701,8 +768,8 @@ def golden_zone_pro_analysis(df, current_price):
     except Exception as e:
         return {"ok": False, "score": 0.0, "zone": None, "reasons": [f"error: {e}"], "confirmed": False}
 
-def decide_strategy_mode_enhanced(df, adx=None, di_plus=None, di_minus=None, rsi_ctx=None, footprint=None):
-    """تحديد نمط التداول المحسن: SCALP أم TREND مع VWAP + Footprint"""
+def decide_strategy_mode_enhanced(df, adx=None, di_plus=None, di_minus=None, rsi_ctx=None, footprint=None, ema_ctx=None):
+    """تحديد نمط التداول المحسن: SCALP أم TREND مع VWAP + Footprint + EMA"""
     ind = compute_indicators(df)
 
     if adx is None or di_plus is None or di_minus is None:
@@ -716,6 +783,9 @@ def decide_strategy_mode_enhanced(df, adx=None, di_plus=None, di_minus=None, rsi
     if footprint is None:
         footprint = compute_footprint_metrics(df)
 
+    if ema_ctx is None:
+        ema_ctx = ema_crossover_strength(df, ind)
+
     di_spread = abs(di_plus - di_minus)
 
     # VWAP context
@@ -728,6 +798,11 @@ def decide_strategy_mode_enhanced(df, adx=None, di_plus=None, di_minus=None, rsi
     else:
         near_vwap = False
         far_from_vwap = False
+
+    # تقاطع EMA قوي يفرض نمط الترند
+    ema_label = ema_ctx.get("label", "none")
+    if ema_label in ("strong_bull", "strong_bear"):
+        return {"mode": "trend", "why": "ema_strong_cross"}
 
     # ترند قوي
     strong_trend = (
@@ -845,11 +920,32 @@ def calculate_signal_strength(df, ind, side):
     elif gz.get('ok'):
         strength += 1.5
     
+    # EMA Crossover impact
+    ema_ctx = ema_crossover_strength(df, ind)
+    ema_label = ema_ctx.get("label", "none")
+
+    if side == "long":
+        if ema_label == "strong_bull":
+            strength += 2.0
+        elif ema_label == "weak_bull":
+            strength += 1.0
+        elif ema_label in ("strong_bear", "weak_bear"):
+            # إشارة معاكسة تقلل الثقة
+            strength -= 1.0
+    elif side == "short":
+        if ema_label == "strong_bear":
+            strength += 2.0
+        elif ema_label == "weak_bear":
+            strength += 1.0
+        elif ema_label in ("strong_bull", "weak_bull"):
+            strength -= 1.0
+
+    strength = max(0.0, strength)
     return min(10.0, strength)
 
 # =================== ENHANCED COUNCIL VOTING ===================
 def council_votes_pro_enhanced(df):
-    """مجلس تصويت محسّن مع Footprint + SMC + Golden Zone Pro + VWAP + OTC"""
+    """مجلس تصويت محسّن مع Footprint + SMC + Golden Zone Pro + VWAP + OTC + EMA"""
     try:
         ind = compute_indicators(df)
         rsi_ctx = rsi_ma_context(df)
@@ -873,6 +969,23 @@ def council_votes_pro_enhanced(df):
         plus_di = ind.get('plus_di', 0)
         minus_di = ind.get('minus_di', 0)
         di_spread = ind.get('di_spread', abs(plus_di - minus_di))
+
+        # ==== EMA CROSSOVER CONTEXT =====
+        ema_ctx = ema_crossover_strength(df, ind)
+        ema_label = ema_ctx.get("label", "none")
+
+        if ema_label == "strong_bull":
+            votes_b += 3; score_b += 2.0
+            logs.append("📈 EMA STRONG BULL TREND")
+        elif ema_label == "weak_bull":
+            votes_b += 1; score_b += 0.8
+            logs.append("🟢 EMA WEAK BULL BIAS")
+        elif ema_label == "strong_bear":
+            votes_s += 3; score_s += 2.0
+            logs.append("📉 EMA STRONG BEAR TREND")
+        elif ema_label == "weak_bear":
+            votes_s += 1; score_s += 0.8
+            logs.append("🔴 EMA WEAK BEAR BIAS")
 
         # ==== VWAP CONTEXT ====
         vwap = ind.get("vwap")
@@ -1020,7 +1133,8 @@ def council_votes_pro_enhanced(df):
             "wick_dn_big": cd["wick_dn_big"],
             "candle_tags": cd["pattern"],
             "smc_pattern": cd["smc_pattern"],
-            "liquidity_trap": cd["liquidity_trap"]
+            "liquidity_trap": cd["liquidity_trap"],
+            "ema_ctx": ema_ctx,
         })
 
         return {
@@ -1030,6 +1144,7 @@ def council_votes_pro_enhanced(df):
             "footprint": footprint, "candles": cd,
             "liquidity_traps": liquidity_traps,
             "otc": otc,
+            "ema": ema_ctx,
         }
     except Exception as e:
         log_w(f"council_votes_pro_enhanced error: {e}")
@@ -1037,7 +1152,7 @@ def council_votes_pro_enhanced(df):
             "b": 0, "s": 0,
             "score_b": 0.0, "score_s": 0.0,
             "logs": [], "ind": {}, "gz": None,
-            "candles": {}, "footprint": {}, "liquidity_traps": {}, "otc": {}
+            "candles": {}, "footprint": {}, "liquidity_traps": {}, "otc": {}, "ema": {}
         }
 
 # =================== POSITION RECOVERY ===================
@@ -1100,6 +1215,7 @@ def resume_open_position(exchange, symbol: str, state: dict) -> dict:
         "gz_snapshot": prev.get("gz_snapshot", {}),
         "cv_snapshot": prev.get("cv_snapshot", {}),
         "footprint_snapshot": prev.get("footprint_snapshot", {}),
+        "ema_snapshot": prev.get("ema_snapshot", {}),
         "opened_at": prev.get("opened_at", ts),
     })
     save_state(state)
@@ -1300,13 +1416,19 @@ def compute_flow_metrics(df):
 # ========= Unified snapshot emitter =========
 def emit_snapshots(exchange, symbol, df, balance_fn=None, pnl_fn=None):
     """
-    يطبع Snapshot موحّد: Bookmap + Flow + Council + Strategy + Balance/PnL + VWAP + OTC
+    يطبع Snapshot موحّد: Bookmap + Flow + Council + Strategy + Balance/PnL + VWAP + OTC + EMA
     """
     try:
         bm = bookmap_snapshot(exchange, symbol)
         flow = compute_flow_metrics(df)
         cv = council_votes_pro_enhanced(df)
-        mode = decide_strategy_mode_enhanced(df)
+        mode = decide_strategy_mode_enhanced(df, 
+                                            adx=cv["ind"].get("adx"),
+                                            di_plus=cv["ind"].get("plus_di"),
+                                            di_minus=cv["ind"].get("minus_di"),
+                                            rsi_ctx=rsi_ma_context(df),
+                                            footprint=cv.get("footprint", {}),
+                                            ema_ctx=cv.get("ema", {}))
         current_price = float(df['close'].iloc[-1])
         gz = golden_zone_pro_analysis(df, current_price)
 
@@ -1338,7 +1460,7 @@ def emit_snapshots(exchange, symbol, df, balance_fn=None, pnl_fn=None):
                 f"DI={cv['ind'].get('di_spread',0):.1f}")
 
         strat_icon = "⚡" if mode["mode"]=="scalp" else "📈" if mode["mode"]=="trend" else "ℹ️"
-        strat = f"Strategy: {strat_icon} {mode['mode'].upper()}"
+        strat = f"Strategy: {strat_icon} {mode['mode'].upper()} ({mode['why']})"
 
         bal_note = f"Balance={bal:.2f}" if bal is not None else ""
         pnl_note = f"CompoundPnL={cpnl:.6f}" if cpnl is not None else ""
@@ -1354,11 +1476,19 @@ def emit_snapshots(exchange, symbol, df, balance_fn=None, pnl_fn=None):
             otc_note = f" | 💰 OTC BUY s={cv['otc'].get('strength',0):.1f}"
         elif cv.get("otc", {}).get("otc_sell"):
             otc_note = f" | 💰 OTC SELL s={cv['otc'].get('strength',0):.1f}"
+            
+        # EMA info
+        ema_note = ""
+        ema_ctx = cv.get("ema", {})
+        if ema_ctx.get("label") != "none":
+            ema_label = ema_ctx.get("label", "")
+            ema_score = ema_ctx.get("score", 0.0)
+            ema_note = f" | 📈 EMA:{ema_label}({ema_score:.1f})"
 
         if LOG_ADDONS:
             print(f"🧱 {bm_note}", flush=True)
             print(f"📦 {fl_note}", flush=True)
-            print(f"📊 {dash}{gz_note}{otc_note}", flush=True)
+            print(f"📊 {dash}{gz_note}{otc_note}{ema_note}", flush=True)
             print(f"{strat}{(' | ' + wallet) if wallet else ''}", flush=True)
             
             gz_snap_note = ""
@@ -1386,9 +1516,14 @@ def emit_snapshots(exchange, symbol, df, balance_fn=None, pnl_fn=None):
             elif cv.get("otc", {}).get("otc_sell"):
                 otc_snap = f" | 💰OTC-SELL({cv['otc'].get('strength',0):.1f})"
             
+            # EMA info for snapshot
+            ema_snap = ""
+            if ema_ctx.get("label") != "none":
+                ema_snap = f" | 📈EMA:{ema_ctx.get('label','')}({ema_ctx.get('score',0):.1f})"
+            
             print(f"🧠 SNAP | {side_hint} | votes={cv['b']}/{cv['s']} score={cv['score_b']:.1f}/{cv['score_s']:.1f} "
                   f"| ADX={cv['ind'].get('adx',0):.1f} DI={cv['ind'].get('di_spread',0):.1f} | "
-                  f"z={flow_z:.2f} | imb={bm_imb:.2f}{gz_snap_note}{vwap_info}{otc_snap}", 
+                  f"z={flow_z:.2f} | imb={bm_imb:.2f}{gz_snap_note}{vwap_info}{otc_snap}{ema_snap}", 
                   flush=True)
             
             # إضافة معلومات Footprint وSMC
@@ -1406,6 +1541,10 @@ def emit_snapshots(exchange, symbol, df, balance_fn=None, pnl_fn=None):
                 print(f"💰 OTC | {'BUY' if otc.get('otc_buy') else 'SELL'} | strength={otc.get('strength',0):.1f} | "
                       f"move={otc.get('move_bps',0):.1f}bps | flow={otc.get('visible_flow_ratio',0)*100:.1f}% | "
                       f"reason={otc.get('reason','')}", flush=True)
+            
+            # EMA detailed info
+            if ema_ctx.get("label") != "none":
+                print(f"📈 EMA CROSSOVER | {ema_ctx.get('label')} | score={ema_ctx.get('score',0):.1f} | side={ema_ctx.get('side','flat')}", flush=True)
             
             print("✅ ENHANCED ADDONS LIVE", flush=True)
 
@@ -1437,10 +1576,16 @@ def execute_trade_decision(side, price, qty, mode, council_data, gz_data):
     elif council_data.get("otc", {}).get("otc_sell"):
         otc_note = f" | 💰 OTC SELL s={council_data['otc'].get('strength',0):.1f}"
     
+    # EMA note
+    ema_note = ""
+    ema_ctx = council_data.get("ema", {})
+    if ema_ctx.get("label") != "none":
+        ema_note = f" | 📈 EMA:{ema_ctx.get('label','')}"
+    
     votes = council_data
     print(f"🎯 EXECUTE: {side.upper()} {qty:.4f} @ {price:.6f} | "
           f"mode={mode} | votes={votes['b']}/{votes['s']} score={votes['score_b']:.1f}/{votes['score_s']:.1f}"
-          f"{gz_note}{otc_note}", flush=True)
+          f"{gz_note}{otc_note}{ema_note}", flush=True)
 
     try:
         if MODE_LIVE:
@@ -1485,13 +1630,15 @@ def open_market_enhanced(side, qty, price):
     snap = emit_snapshots(ex, SYMBOL, df)
     votes = snap["cv"]
     footprint = votes.get("footprint", {})
+    ema_ctx = votes.get("ema", {})
     
     mode_data = decide_strategy_mode_enhanced(df, 
                                    adx=votes["ind"].get("adx"),
                                    di_plus=votes["ind"].get("plus_di"),
                                    di_minus=votes["ind"].get("minus_di"),
                                    rsi_ctx=rsi_ma_context(df),
-                                   footprint=footprint)
+                                   footprint=footprint,
+                                   ema_ctx=ema_ctx)
     
     mode = mode_data["mode"]
     gz = snap["gz"]
@@ -1533,6 +1680,7 @@ def open_market_enhanced(side, qty, price):
             "gz_snapshot": gz if isinstance(gz, dict) else {},
             "cv_snapshot": votes if isinstance(votes, dict) else {},
             "footprint_snapshot": footprint if isinstance(footprint, dict) else {},
+            "ema_snapshot": ema_ctx if isinstance(ema_ctx, dict) else {},
             "opened_at": int(time.time()),
             "partial_taken": False,
             "breakeven_armed": False,
@@ -2037,7 +2185,7 @@ def manage_after_entry_enhanced(df, ind, info):
 
 # =================== ENHANCED TRADE LOOP ===================
 def trade_loop_enhanced():
-    """حلقة تداول محسنة مع Golden Zone Pro وSmart Profit AI وVWAP وOTC Detection"""
+    """حلقة تداول محسنة مع Golden Zone Pro وSmart Profit AI وVWAP وOTC Detection وEMA Cross"""
     global wait_for_next_signal_side
     loop_i = 0
     
@@ -2078,6 +2226,7 @@ def trade_loop_enhanced():
             gz = council_data.get("gz")
             footprint = council_data.get("footprint", {})
             otc = council_data.get("otc", {})
+            ema_ctx = council_data.get("ema", {})
             sig = None
 
             # --- Enhanced Golden Entry Pro ---
@@ -2103,11 +2252,35 @@ def trade_loop_enhanced():
                     sig = "sell"
                     log_i(f"💰 OTC ENTRY: SELL | strength={otc.get('strength',0):.1f} | سيولة بيع مخفية قوية")
 
-            # Council Strong Entry (إذا لم يكن هناك دخول ذهبي أو OTC)
+            # --- Council Strong Entry مع تخفيف احترافي للتقاطع القوي ---
             if not golden_entry and not sig:
-                if council_data["score_b"] > council_data["score_s"] and council_data["score_b"] >= 8.0:
+                ema_label = ema_ctx.get("label", "none")
+                strong_bull = (ema_label == "strong_bull")
+                strong_bear = (ema_label == "strong_bear")
+
+                buy_score  = council_data["score_b"]
+                sell_score = council_data["score_s"]
+
+                buy_ok = False
+                sell_ok = False
+
+                # الأساس: 8.0 زي ما هو
+                if buy_score >= 8.0 and buy_score > sell_score:
+                    buy_ok = True
+                elif sell_score >= 8.0 and sell_score > buy_score:
+                    sell_ok = True
+
+                # تخفيف احترافي: 7.0 مسموح فقط لو EMA strong في نفس الاتجاه
+                if not buy_ok and buy_score >= 7.0 and buy_score > sell_score and strong_bull:
+                    buy_ok = True
+                    log_i(f"✅ BUY by Council(7.x) + EMA STRONG BULL ({buy_score:.1f})")
+                if not sell_ok and sell_score >= 7.0 and sell_score > buy_score and strong_bear:
+                    sell_ok = True
+                    log_i(f"✅ SELL by Council(7.x) + EMA STRONG BEAR ({sell_score:.1f})")
+
+                if buy_ok:
                     sig = "buy"
-                elif council_data["score_s"] > council_data["score_b"] and council_data["score_s"] >= 8.0:
+                elif sell_ok:
                     sig = "sell"
             
             if not STATE["open"] and sig and reason is None:
@@ -2122,6 +2295,8 @@ def trade_loop_enhanced():
                             wait_for_next_signal_side = None
                             # تسجيل قرار المجلس المحسن
                             entry_type = "GOLDEN" if golden_entry else "OTC" if otc.get("otc_buy") or otc.get("otc_sell") else "COUNCIL"
+                            if ema_label in ("strong_bull", "strong_bear"):
+                                entry_type = f"EMA_STRONG_{entry_type}"
                             log_i(f"🎯 ENHANCED {entry_type} DECISION: {sig.upper()} | "
                                   f"Score B/S: {council_data['score_b']:.1f}/{council_data['score_s']:.1f} | "
                                   f"Signal Strength: {STATE.get('signal_strength', 0):.1f}")
@@ -2158,7 +2333,7 @@ def pretty_snapshot(bal, info, ind, spread_bps, reason=None, df=None):
         print("📈 INDICATORS & RF")
         print(f"   💲 Price {fmt(info.get('price'))} | RF filt={fmt(info.get('filter'))}  hi={fmt(info.get('hi'))} lo={fmt(info.get('lo'))}")
         print(f"   🧮 RSI={fmt(ind.get('rsi'))}  +DI={fmt(ind.get('plus_di'))}  -DI={fmt(ind.get('minus_di'))}  ADX={fmt(ind.get('adx'))}  ATR={fmt(ind.get('atr'))}")
-        print(f"   🎯 ENTRY: COUNCIL PRO + GOLDEN ENTRY + VWAP STRATEGY + OTC DETECTION  |  spread_bps={fmt(spread_bps,2)}")
+        print(f"   🎯 ENTRY: COUNCIL PRO + GOLDEN ENTRY + VWAP STRATEGY + OTC DETECTION + EMA CROSSOVER ENGINE  |  spread_bps={fmt(spread_bps,2)}")
         print(f"   ⏱️ closes_in ≈ {left_s}s")
         print("\n🧭 POSITION")
         bal_line = f"Balance={fmt(bal,2)}  Risk={int(RISK_ALLOC*100)}%×{LEVERAGE}x  CompoundPnL={fmt(compound_pnl)}  Eq~{fmt((bal or 0)+compound_pnl,2)}"
@@ -2179,7 +2354,7 @@ app = Flask(__name__)
 @app.route("/")
 def home():
     mode='LIVE' if MODE_LIVE else 'PAPER'
-    return f"✅ Council PRO Bot — {SYMBOL} {INTERVAL} — {mode} — Enhanced Candles + Golden Zone Pro + Smart Profit AI + VWAP Strategy + OTC Detection"
+    return f"✅ Council PRO Bot — {SYMBOL} {INTERVAL} — {mode} — Enhanced Candles + Golden Zone Pro + Smart Profit AI + VWAP Strategy + OTC Detection + EMA Crossover Engine"
 
 @app.route("/metrics")
 def metrics():
@@ -2187,7 +2362,7 @@ def metrics():
         "symbol": SYMBOL, "interval": INTERVAL, "mode": "live" if MODE_LIVE else "paper",
         "leverage": LEVERAGE, "risk_alloc": RISK_ALLOC, "price": price_now(),
         "state": STATE, "compound_pnl": compound_pnl,
-        "entry_mode": "COUNCIL_PRO_GOLDEN_ENHANCED_VWAP_OTC", "wait_for_next_signal": wait_for_next_signal_side,
+        "entry_mode": "COUNCIL_PRO_GOLDEN_ENHANCED_VWAP_OTC_EMA", "wait_for_next_signal": wait_for_next_signal_side,
         "guards": {"max_spread_bps": MAX_SPREAD_BPS, "final_chunk_qty": FINAL_CHUNK_QTY},
         "vwap_strategy": {
             "enabled": VWAP_ENABLED,
@@ -2199,6 +2374,12 @@ def metrics():
             "window_bars": OTC_WINDOW_BARS,
             "min_move_bps": OTC_MIN_MOVE_BPS,
             "exit_min_strength": OTC_EXIT_MIN_STRENGTH
+        },
+        "ema_crossover": {
+            "enabled": True,
+            "fast_period": 9,
+            "mid_period": 21,
+            "slow_period": 50
         }
     })
 
@@ -2208,7 +2389,7 @@ def health():
         "ok": True, "mode": "live" if MODE_LIVE else "paper",
         "open": STATE["open"], "side": STATE["side"], "qty": STATE["qty"],
         "compound_pnl": compound_pnl, "timestamp": datetime.utcnow().isoformat(),
-        "entry_mode": "COUNCIL_PRO_GOLDEN_ENHANCED_VWAP_OTC", "wait_for_next_signal": wait_for_next_signal_side
+        "entry_mode": "COUNCIL_PRO_GOLDEN_ENHANCED_VWAP_OTC_EMA", "wait_for_next_signal": wait_for_next_signal_side
     }), 200
 
 def keepalive_loop():
@@ -2246,6 +2427,7 @@ if __name__ == "__main__":
     print(colored(f"OTC DETECTION: Hidden flow detection + Protection system", "yellow"))
     print(colored(f"SMART PROFIT AI: Dynamic profit taking + Signal strength", "yellow"))
     print(colored(f"VWAP STRATEGY: SCALP(near {VWAP_SCALP_BAND_BPS}bps) | TREND(far {VWAP_TREND_BAND_BPS}bps)", "yellow"))
+    print(colored(f"EMA CROSSOVER ENGINE: Strong/Weak Trend Detection (9/21/50)", "yellow"))
     print(colored(f"EXECUTION: {'ACTIVE' if EXECUTE_ORDERS and not DRY_RUN else 'SIMULATION'}", "yellow"))
     
     logging.info("enhanced service starting…")
