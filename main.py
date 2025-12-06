@@ -9,6 +9,7 @@ RF Futures Bot — RF-LIVE ONLY (BingX Perp via CCXT)
 • Enhanced with Footprint, SMC Candles, Liquidity Traps + VWAP Strategy
 • OTC Hidden Flow Detection & Protection System
 • EMA Crossover Strength Engine (Strong/Weak Trend Detection)
+• ENHANCED WITH: Hard Stop Loss, Post-Big-Win Guard, Auto-Recovery
 """
 
 import os, time, math, random, signal, sys, traceback, logging, json
@@ -43,7 +44,7 @@ SHADOW_MODE_DASHBOARD = False
 DRY_RUN = False
 
 # ==== Addon: Logging + Recovery Settings ====
-BOT_VERSION = "DOGE Council PRO v5.0 — Smart Profit AI + Golden Zone Pro + VWAP Strategy + OTC Detection + EMA Crossover Engine"
+BOT_VERSION = "DOGE Council PRO v5.0 — Smart Profit AI + Golden Zone Pro + VWAP Strategy + OTC Detection + EMA Crossover Engine + Hard Stop + Post-Big-Win Guard + Auto-Recovery"
 print("🔁 Booting:", BOT_VERSION, flush=True)
 
 STATE_PATH = "./bot_state.json"
@@ -58,6 +59,11 @@ IMBALANCE_ALERT = 1.30
 FLOW_WINDOW = 20
 FLOW_SPIKE_Z = 1.60
 CVD_SMOOTH = 8
+
+# ================== RISK & GUARDS CONFIG ==================
+MAX_LOSS_PCT      = -0.005   # -0.50% حدّ خسارة صارم للصفقة الواحدة
+BIG_WIN_PCT       =  0.020   # +2.0% أو أكثر تعتبر صفقة Big Win
+POST_BIG_WIN_BARS =  20      # عدد الشموع بعد Big Win يتم فيها تفعيل الحذر
 
 # =================== ENHANCED SETTINGS ===================
 SYMBOL     = os.getenv("SYMBOL", "DOGE/USDT:USDT")
@@ -516,6 +522,7 @@ def verify_execution_environment():
     print(f"💰 OTC DETECTION: Hidden flow detection + Protection", flush=True)
     print(f"📊 VWAP STRATEGY: SCALP(near {VWAP_SCALP_BAND_BPS}bps) | TREND(far {VWAP_TREND_BAND_BPS}bps)", flush=True)
     print(f"📈 EMA CROSSOVER ENGINE: Strong/Weak Trend Detection", flush=True)
+    print(f"🛡️ RISK GUARDS: Hard Stop Loss (-{abs(MAX_LOSS_PCT)*100}%) | Post-Big-Win Guard (+{BIG_WIN_PCT*100}%)", flush=True)
     
     if not EXECUTE_ORDERS:
         print("🟡 WARNING: EXECUTE_ORDERS=False - البوت في وضع التحليل فقط!", flush=True)
@@ -1188,6 +1195,208 @@ def fetch_live_position(exchange, symbol: str):
         log_w(f"fetch_live_position error: {e}")
     return {"ok": False, "why": "no_open_position"}
 
+# ================== RISK HELPERS ==================
+
+def compute_unrealized_pnl_pct(state, current_price: float) -> float:
+    """
+    حساب % PnL غير المحقَّق للصفقة الحالية بناءً على الـ STATE.
+    """
+    if not state.get("open"):
+        return 0.0
+
+    side = state.get("side")
+    entry = float(state.get("entry") or 0.0)
+    if not entry:
+        return 0.0
+
+    if side == "long":
+        return (current_price / entry) - 1.0
+    elif side == "short":
+        return (entry / current_price) - 1.0
+    return 0.0
+
+
+def risk_on_new_trade(state, side: str, entry_price: float):
+    """
+    يُستدعى مباشرة بعد فتح صفقة جديدة:
+    - يحسب max_loss_price كـ % ثابت من الـ entry
+    - يخفّض وضع Post Big Win لو انتهى
+    """
+    state["open"] = True
+    state["side"] = side
+    state["entry"] = float(entry_price)
+
+    # ستوب على أساس % من سعر الدخول
+    if side == "long":
+        state["max_loss_price"] = entry_price * (1.0 + MAX_LOSS_PCT)
+        log_i(f"🛡️ Hard Stop Loss SET for LONG: {state['max_loss_price']:.6f} (-{abs(MAX_LOSS_PCT)*100}%)")
+    else:  # short
+        state["max_loss_price"] = entry_price * (1.0 - MAX_LOSS_PCT)
+        log_i(f"🛡️ Hard Stop Loss SET for SHORT: {state['max_loss_price']:.6f} (-{abs(MAX_LOSS_PCT)*100}%)")
+
+    # لما نفتح صفقة جديدة، نكمّل عدّاد post_big_win_mode لو لسه شغّال
+    if state.get("post_big_win_mode") and state.get("post_big_win_bars_left", 0) <= 0:
+        state["post_big_win_mode"] = False
+        state["post_big_win_bars_left"] = 0
+
+
+def risk_on_trade_closed(state, realized_pnl_pct: float):
+    """
+    يُستدعى بعد إغلاق الصفقة بالكامل:
+    - يخزن آخر % PnL
+    - يفعّل وضع Post Big Win لو الربح كبير
+    """
+    state["last_closed_pnl_pct"] = float(realized_pnl_pct or 0.0)
+    state["open"] = False
+    state["side"] = None
+    state["entry"] = None
+    state["max_loss_price"] = None
+
+    if realized_pnl_pct >= BIG_WIN_PCT:
+        state["post_big_win_mode"] = True
+        state["post_big_win_bars_left"] = POST_BIG_WIN_BARS
+        log_g(f"🎉 BIG WIN DETECTED! {realized_pnl_pct*100:.2f}% ≥ {BIG_WIN_PCT*100}% - Post-Big-Win Mode ACTIVATED for {POST_BIG_WIN_BARS} bars")
+    else:
+        # مفيش Big Win → نطفي المود ده
+        state["post_big_win_mode"] = False
+        state["post_big_win_bars_left"] = 0
+
+
+def tick_post_big_win_decay(state):
+    """
+    تُستدعى مع كل شمعة/لوب:
+    تقلل عدّاد Post Big Win لو شغّال.
+    """
+    if state.get("post_big_win_mode"):
+        left = int(state.get("post_big_win_bars_left", 0))
+        if left > 0:
+            state["post_big_win_bars_left"] = left - 1
+            if state["post_big_win_bars_left"] <= 0:
+                state["post_big_win_mode"] = False
+                state["post_big_win_bars_left"] = 0
+                log_i("🛡️ Post-Big-Win Mode EXPIRED - Returning to normal trading")
+
+# =================== AUTO RECOVERY & SYNC ===================
+def sync_open_position_from_exchange(exchange, symbol: str, state):
+    """
+    محاولة مزامنة أي صفقة مفتوحة على المنصة مع STATE بعد الريستارت.
+    """
+    try:
+        positions = exchange.fetch_positions([symbol])
+    except Exception as e:
+        log_w(f"sync_open_position error: {e}")
+        return state
+
+    live_pos = None
+    for p in positions:
+        sym = p.get("symbol") or p.get("info", {}).get("symbol") or ""
+        if symbol.replace(":", "") in sym.replace(":", ""):
+            qty = abs(float(p.get("contracts") or p.get("positionAmt") or p.get("info", {}).get("size", 0) or 0))
+            if qty > 0:
+                live_pos = p
+                break
+
+    if not live_pos:
+        # مفيش صفقة حية على البورصة → صفّر الحالة لو عندك in_position
+        if state.get("open"):
+            log_w("🔄 No live position on exchange, resetting local STATE.")
+            state["open"] = False
+            state["side"] = None
+            state["entry"] = None
+            state["max_loss_price"] = None
+            state["post_big_win_mode"] = False
+            state["post_big_win_bars_left"] = 0
+        return state
+
+    # استخراج بيانات الصفقة الحية
+    side_raw = (live_pos.get("side") or live_pos.get("positionSide") or "").lower()
+    side = "long" if "long" in side_raw or float(live_pos.get("cost", 0)) > 0 else "short"
+    entry_price = float(live_pos.get("entryPrice") or live_pos.get("info", {}).get("avgEntryPrice") or 0.0)
+    qty = abs(float(live_pos.get("contracts") or live_pos.get("positionAmt") or 0))
+    
+    if qty <= 0:
+        return state
+
+    log_i(f"🔄 Syncing live position from exchange: {side.upper()} {qty:.4f} @ {entry_price:.6f}")
+    
+    # تحديث STATE بالصفقة الحية
+    state.update({
+        "open": True,
+        "side": side,
+        "entry": entry_price,
+        "qty": qty,
+        "in_position": True,
+        "max_loss_price": entry_price * (1.0 + MAX_LOSS_PCT) if side == "long" else entry_price * (1.0 - MAX_LOSS_PCT),
+    })
+    
+    # تحديث Post-Big-Win Mode من آخر صفقة مغلقة
+    last_closed_pnl = state.get("last_closed_pnl_pct", 0.0)
+    if last_closed_pnl >= BIG_WIN_PCT:
+        state["post_big_win_mode"] = True
+        state["post_big_win_bars_left"] = POST_BIG_WIN_BARS
+        log_i(f"🔄 Post-Big-Win Mode RESTORED from last trade: {last_closed_pnl*100:.2f}%")
+    
+    return state
+
+
+def enhanced_resume_open_position(exchange, symbol: str, state: dict) -> dict:
+    """
+    دالة استئناف محسنة مع Auto-Recovery الكامل
+    """
+    if not RESUME_ON_RESTART:
+        log_i("🔄 Resume disabled")
+        return state
+
+    log_i("🔄 Starting enhanced position recovery...")
+    
+    # 1. أولاً: Sync مع المنصة
+    state = sync_open_position_from_exchange(exchange, symbol, state)
+    
+    # 2. ثانياً: جلب البيانات الحية (فال باك أب)
+    live = fetch_live_position(exchange, symbol)
+    
+    # 3. الدمج الذكي بين STATE والبيانات الحية
+    if live.get("ok") and state.get("open"):
+        # تأكيد البيانات من المصدرين
+        ts = int(time.time())
+        prev = load_state()
+        
+        if prev.get("ts") and (ts - int(prev["ts"])) > RESUME_LOOKBACK_SECS:
+            log_w("🔄 Found old local state — overriding with exchange live snapshot")
+        
+        # تحديث STATE بالبيانات الأحدث
+        state.update({
+            "in_position": True,
+            "side": live["side"],
+            "entry_price": live["entry"],
+            "position_qty": live["qty"],
+            "leverage": live.get("leverage") or state.get("leverage") or LEVERAGE,
+            "partial_taken": prev.get("partial_taken", False),
+            "breakeven_armed": prev.get("breakeven_armed", False),
+            "trail_active": prev.get("trail_active", False),
+            "trail_tightened": prev.get("trail_tightened", False),
+            "mode": prev.get("mode", "trend"),
+            "gz_snapshot": prev.get("gz_snapshot", {}),
+            "cv_snapshot": prev.get("cv_snapshot", {}),
+            "footprint_snapshot": prev.get("footprint_snapshot", {}),
+            "ema_snapshot": prev.get("ema_snapshot", {}),
+            "opened_at": prev.get("opened_at", ts),
+            
+            # تحديث Stop Loss
+            "max_loss_price": live["entry"] * (1.0 + MAX_LOSS_PCT) if live["side"] == "LONG" else live["entry"] * (1.0 - MAX_LOSS_PCT),
+        })
+        
+        # حفظ الحالة المحدثة
+        save_state(state)
+        log_g(f"🔄 ENHANCED RESUME: {state['side']} qty={state['position_qty']} @ {state['entry_price']:.6f} "
+              f"lev={state['leverage']}x | Stop Loss: {state.get('max_loss_price', 'N/A'):.6f}")
+        
+        # تسجيل حالة Post-Big-Win
+        if state.get("post_big_win_mode"):
+            log_i(f"🛡️ Post-Big-Win Mode ACTIVE: {state['post_big_win_bars_left']} bars remaining")
+    
+    return state
+
 def resume_open_position(exchange, symbol: str, state: dict) -> dict:
     if not RESUME_ON_RESTART:
         log_i("resume disabled"); return state
@@ -1651,6 +1860,9 @@ def open_market_enhanced(side, qty, price):
     if success:
         signal_strength = calculate_signal_strength(df, votes["ind"], "long" if side=="buy" else "short")
         
+        # تحديث Risk Management
+        risk_on_new_trade(STATE, "long" if side=="buy" else "short", price)
+        
         STATE.update({
             "open": True, 
             "side": "long" if side=="buy" else "short", 
@@ -1801,6 +2013,12 @@ STATE = {
     "pnl": 0.0, "bars": 0, "trail": None, "breakeven": None,
     "tp1_done": False, "highest_profit_pct": 0.0,
     "profit_targets_achieved": 0,
+    
+    # --- Risk / Guards ---
+    "max_loss_price": None,           # سعر ستوب الصفقة الحالية
+    "last_closed_pnl_pct": 0.0,       # نسبة ربح/خسارة آخر صفقة مغلقة
+    "post_big_win_mode": False,       # هل إحنا في وضع حماية بعد مكسب كبير؟
+    "post_big_win_bars_left": 0,      # عدد الشموع المتبقية في وضع Post Big Win
 }
 compound_pnl = 0.0
 wait_for_next_signal_side = None
@@ -1881,6 +2099,11 @@ def close_market_strict(reason="STRICT"):
                 qty  = exch_qty
                 pnl  = (px - entry_px) * qty * (1 if side=="long" else -1)
                 compound_pnl += pnl
+                
+                # تحديث Risk Management
+                realized_pnl_pct = compute_unrealized_pnl_pct(STATE, px)
+                risk_on_trade_closed(STATE, realized_pnl_pct)
+                
                 log_i(f"STRICT CLOSE {side} reason={reason} pnl={fmt(pnl)} total={fmt(compound_pnl)}")
                 logging.info(f"STRICT_CLOSE {side} pnl={pnl} total={compound_pnl}")
                 _reset_after_close(reason, prev_side=side)
@@ -1897,12 +2120,21 @@ def close_market_strict(reason="STRICT"):
 def _reset_after_close(reason, prev_side=None):
     """إعادة تعيين الحالة بعد الإغلاق"""
     global wait_for_next_signal_side
+    
     prev_side = prev_side or STATE.get("side")
+    
+    # تحديث Risk Management لو كان هناك صفقة مفتوحة
+    if STATE["open"] and STATE["entry"]:
+        current_price = price_now() or STATE["entry"]
+        realized_pnl_pct = compute_unrealized_pnl_pct(STATE, current_price)
+        risk_on_trade_closed(STATE, realized_pnl_pct)
+    
     STATE.update({
         "open": False, "side": None, "entry": None, "qty": 0.0,
         "pnl": 0.0, "bars": 0, "trail": None, "breakeven": None,
         "tp1_done": False, "highest_profit_pct": 0.0, "profit_targets_achieved": 0,
-        "trail_tightened": False, "partial_taken": False
+        "trail_tightened": False, "partial_taken": False,
+        "max_loss_price": None,  # إعادة تعيين Stop Loss
     })
     save_state({"in_position": False, "position_qty": 0})
     
@@ -2035,7 +2267,7 @@ def smart_exit_guard(state, df, ind, flow, bm, now_price, pnl_pct, mode, side, e
 
 # =================== ENHANCED TRADE MANAGEMENT ===================
 def manage_after_entry_enhanced(df, ind, info):
-    """إدارة محسنة للمركز مع Smart Profit AI + Smart Exit Guard"""
+    """إدارة محسنة للمركز مع Smart Profit AI + Smart Exit Guard + Hard Stop"""
     if not STATE["open"] or STATE["qty"] <= 0:
         return
 
@@ -2044,6 +2276,22 @@ def manage_after_entry_enhanced(df, ind, info):
     side  = STATE["side"]
     qty   = STATE["qty"]
     mode  = STATE.get("mode", "trend")
+    
+    # ========= HARD MAX LOSS GUARD (ستوب صارم) =========
+    max_loss_price = STATE.get("max_loss_price")
+    if max_loss_price:
+        if side == "long" and px <= max_loss_price:
+            pnl_pct = compute_unrealized_pnl_pct(STATE, px)
+            log_w(f"🛑 MAX-LOSS GUARD HIT (LONG) @ {px:.6f} | Loss: {pnl_pct*100:.2f}%")
+            close_market_strict("max_loss_guard_long")
+            risk_on_trade_closed(STATE, pnl_pct)
+            return
+        elif side == "short" and px >= max_loss_price:
+            pnl_pct = compute_unrealized_pnl_pct(STATE, px)
+            log_w(f"🛑 MAX-LOSS GUARD HIT (SHORT) @ {px:.6f} | Loss: {pnl_pct*100:.2f}%")
+            close_market_strict("max_loss_guard_short")
+            risk_on_trade_closed(STATE, pnl_pct)
+            return
     
     # PnL % (كـ نسبة مئوية)
     pnl_pct = (px - entry) / entry * 100.0 * (1 if side == "long" else -1)
@@ -2185,12 +2433,15 @@ def manage_after_entry_enhanced(df, ind, info):
 
 # =================== ENHANCED TRADE LOOP ===================
 def trade_loop_enhanced():
-    """حلقة تداول محسنة مع Golden Zone Pro وSmart Profit AI وVWAP وOTC Detection وEMA Cross"""
+    """حلقة تداول محسنة مع Golden Zone Pro وSmart Profit AI وVWAP وOTC Detection وEMA Cross + Risk Guards"""
     global wait_for_next_signal_side
     loop_i = 0
     
     while True:
         try:
+            # تحديث عدّاد Post Big Win كل لوب
+            tick_post_big_win_decay(STATE)
+            
             # جمع البيانات الأساسية
             bal = balance_usdt()
             px = price_now()
@@ -2208,7 +2459,7 @@ def trade_loop_enhanced():
             if STATE["open"] and px:
                 STATE["pnl"] = (px-STATE["entry"])*STATE["qty"] if STATE["side"]=="long" else (STATE["entry"]-px)*STATE["qty"]
             
-            # إدارة الصفقة المفتوحة مع Smart Profit AI
+            # إدارة الصفقة المفتوحة مع Smart Profit AI + Hard Stop
             if STATE["open"]:
                 manage_after_entry_enhanced(df, ind, {
                     "price": px or info["price"], 
@@ -2228,6 +2479,12 @@ def trade_loop_enhanced():
             otc = council_data.get("otc", {})
             ema_ctx = council_data.get("ema", {})
             sig = None
+
+            # ===== POST-BIG-WIN FILTER =====
+            if STATE.get("post_big_win_mode") and not STATE["open"]:
+                # فلترة الإشارات في وضع Post-Big-Win
+                if STATE["post_big_win_bars_left"] > 0:
+                    log_i(f"🛡️ POST-BIG-WIN MODE ACTIVE: {STATE['post_big_win_bars_left']} bars remaining - Applying strict filters")
 
             # --- Enhanced Golden Entry Pro ---
             golden_entry = False
@@ -2270,13 +2527,25 @@ def trade_loop_enhanced():
                 elif sell_score >= 8.0 and sell_score > buy_score:
                     sell_ok = True
 
-                # تخفيف احترافي: 7.0 مسموح فقط لو EMA strong في نفس الاتجاه
-                if not buy_ok and buy_score >= 7.0 and buy_score > sell_score and strong_bull:
-                    buy_ok = True
-                    log_i(f"✅ BUY by Council(7.x) + EMA STRONG BULL ({buy_score:.1f})")
-                if not sell_ok and sell_score >= 7.0 and sell_score > buy_score and strong_bear:
-                    sell_ok = True
-                    log_i(f"✅ SELL by Council(7.x) + EMA STRONG BEAR ({sell_score:.1f})")
+                # ===== POST-BIG-WIN FILTER =====
+                if STATE.get("post_big_win_mode"):
+                    # في وضع Post-Big-Win نرفع السقف
+                    if buy_score >= 8.5 and buy_score > sell_score and strong_bull:
+                        buy_ok = True
+                        log_i(f"✅ BUY by Council(8.5+) + EMA STRONG BULL ({buy_score:.1f}) - POST-BIG-WIN MODE")
+                    elif sell_score >= 8.5 and sell_score > buy_score and strong_bear:
+                        sell_ok = True
+                        log_i(f"✅ SELL by Council(8.5+) + EMA STRONG BEAR ({sell_score:.1f}) - POST-BIG-WIN MODE")
+                    else:
+                        log_i(f"🛑 POST-BIG-WIN MODE: Skipping weak signal (Buy: {buy_score:.1f}, Sell: {sell_score:.1f})")
+                else:
+                    # تخفيف احترافي: 7.0 مسموح فقط لو EMA strong في نفس الاتجاه
+                    if not buy_ok and buy_score >= 7.0 and buy_score > sell_score and strong_bull:
+                        buy_ok = True
+                        log_i(f"✅ BUY by Council(7.x) + EMA STRONG BULL ({buy_score:.1f})")
+                    if not sell_ok and sell_score >= 7.0 and sell_score > buy_score and strong_bear:
+                        sell_ok = True
+                        log_i(f"✅ SELL by Council(7.x) + EMA STRONG BEAR ({sell_score:.1f})")
 
                 if buy_ok:
                     sig = "buy"
@@ -2335,9 +2604,24 @@ def pretty_snapshot(bal, info, ind, spread_bps, reason=None, df=None):
         print(f"   🧮 RSI={fmt(ind.get('rsi'))}  +DI={fmt(ind.get('plus_di'))}  -DI={fmt(ind.get('minus_di'))}  ADX={fmt(ind.get('adx'))}  ATR={fmt(ind.get('atr'))}")
         print(f"   🎯 ENTRY: COUNCIL PRO + GOLDEN ENTRY + VWAP STRATEGY + OTC DETECTION + EMA CROSSOVER ENGINE  |  spread_bps={fmt(spread_bps,2)}")
         print(f"   ⏱️ closes_in ≈ {left_s}s")
+        
+        # عرض معلومات الـ Guards
+        print("\n🛡️ RISK GUARDS")
+        if STATE["open"]:
+            stop_price = STATE.get("max_loss_price")
+            current_price = info.get("price") or 0
+            if stop_price:
+                stop_distance_pct = abs(stop_price - current_price) / current_price * 100
+                stop_side = "BELOW" if STATE['side'] == 'long' else "ABOVE"
+                print(f"   🔴 HARD STOP: {stop_side} {fmt(stop_price)} ({stop_distance_pct:.2f}%)")
+        
+        if STATE.get("post_big_win_mode"):
+            print(f"   🛡️ POST-BIG-WIN: ACTIVE ({STATE.get('post_big_win_bars_left', 0)} bars left)")
+        
         print("\n🧭 POSITION")
         bal_line = f"Balance={fmt(bal,2)}  Risk={int(RISK_ALLOC*100)}%×{LEVERAGE}x  CompoundPnL={fmt(compound_pnl)}  Eq~{fmt((bal or 0)+compound_pnl,2)}"
         print(colored(f"   {bal_line}", "yellow"))
+        
         if STATE["open"]:
             lamp='🟩 LONG' if STATE['side']=='long' else '🟥 SHORT'
             print(f"   {lamp}  Entry={fmt(STATE['entry'])}  Qty={fmt(STATE['qty'],4)}  Bars={STATE['bars']}  Trail={fmt(STATE['trail'])}  BE={fmt(STATE['breakeven'])}")
@@ -2354,7 +2638,7 @@ app = Flask(__name__)
 @app.route("/")
 def home():
     mode='LIVE' if MODE_LIVE else 'PAPER'
-    return f"✅ Council PRO Bot — {SYMBOL} {INTERVAL} — {mode} — Enhanced Candles + Golden Zone Pro + Smart Profit AI + VWAP Strategy + OTC Detection + EMA Crossover Engine"
+    return f"✅ Council PRO Bot — {SYMBOL} {INTERVAL} — {mode} — Enhanced Candles + Golden Zone Pro + Smart Profit AI + VWAP Strategy + OTC Detection + EMA Crossover Engine + Hard Stop Loss + Post-Big-Win Guard + Auto-Recovery"
 
 @app.route("/metrics")
 def metrics():
@@ -2363,7 +2647,13 @@ def metrics():
         "leverage": LEVERAGE, "risk_alloc": RISK_ALLOC, "price": price_now(),
         "state": STATE, "compound_pnl": compound_pnl,
         "entry_mode": "COUNCIL_PRO_GOLDEN_ENHANCED_VWAP_OTC_EMA", "wait_for_next_signal": wait_for_next_signal_side,
-        "guards": {"max_spread_bps": MAX_SPREAD_BPS, "final_chunk_qty": FINAL_CHUNK_QTY},
+        "risk_guards": {
+            "hard_stop_pct": abs(MAX_LOSS_PCT)*100,
+            "big_win_pct": BIG_WIN_PCT*100,
+            "post_big_win_bars": POST_BIG_WIN_BARS,
+            "max_spread_bps": MAX_SPREAD_BPS,
+            "final_chunk_qty": FINAL_CHUNK_QTY
+        },
         "vwap_strategy": {
             "enabled": VWAP_ENABLED,
             "scalp_band_bps": VWAP_SCALP_BAND_BPS,
@@ -2380,6 +2670,12 @@ def metrics():
             "fast_period": 9,
             "mid_period": 21,
             "slow_period": 50
+        },
+        "current_guards": {
+            "post_big_win_active": STATE.get("post_big_win_mode", False),
+            "post_big_win_bars_left": STATE.get("post_big_win_bars_left", 0),
+            "hard_stop_price": STATE.get("max_loss_price"),
+            "last_closed_pnl_pct": STATE.get("last_closed_pnl_pct", 0.0)
         }
     })
 
@@ -2389,7 +2685,11 @@ def health():
         "ok": True, "mode": "live" if MODE_LIVE else "paper",
         "open": STATE["open"], "side": STATE["side"], "qty": STATE["qty"],
         "compound_pnl": compound_pnl, "timestamp": datetime.utcnow().isoformat(),
-        "entry_mode": "COUNCIL_PRO_GOLDEN_ENHANCED_VWAP_OTC_EMA", "wait_for_next_signal": wait_for_next_signal_side
+        "entry_mode": "COUNCIL_PRO_GOLDEN_ENHANCED_VWAP_OTC_EMA", "wait_for_next_signal": wait_for_next_signal_side,
+        "risk_guards": {
+            "hard_stop_active": STATE.get("max_loss_price") is not None,
+            "post_big_win_active": STATE.get("post_big_win_mode", False)
+        }
     }), 200
 
 def keepalive_loop():
@@ -2413,9 +2713,10 @@ if __name__ == "__main__":
 
     if RESUME_ON_RESTART:
         try:
-            state = resume_open_position(ex, SYMBOL, state)
+            # استخدام الدالة المحسنة للاستئناف
+            state = enhanced_resume_open_position(ex, SYMBOL, state)
         except Exception as e:
-            log_w(f"resume error: {e}\n{traceback.format_exc()}")
+            log_w(f"🔄 Enhanced resume error: {e}\n{traceback.format_exc()}")
 
     verify_execution_environment()
 
@@ -2428,6 +2729,8 @@ if __name__ == "__main__":
     print(colored(f"SMART PROFIT AI: Dynamic profit taking + Signal strength", "yellow"))
     print(colored(f"VWAP STRATEGY: SCALP(near {VWAP_SCALP_BAND_BPS}bps) | TREND(far {VWAP_TREND_BAND_BPS}bps)", "yellow"))
     print(colored(f"EMA CROSSOVER ENGINE: Strong/Weak Trend Detection (9/21/50)", "yellow"))
+    print(colored(f"🛡️ RISK GUARDS: Hard Stop Loss (-{abs(MAX_LOSS_PCT)*100}%) | Post-Big-Win Guard (+{BIG_WIN_PCT*100}%)", "red"))
+    print(colored(f"🔄 AUTO RECOVERY: Enhanced position sync on restart", "green"))
     print(colored(f"EXECUTION: {'ACTIVE' if EXECUTE_ORDERS and not DRY_RUN else 'SIMULATION'}", "yellow"))
     
     logging.info("enhanced service starting…")
