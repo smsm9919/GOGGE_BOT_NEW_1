@@ -63,7 +63,7 @@ CVD_SMOOTH = 8
 # ================== RISK & GUARDS CONFIG ==================
 MAX_LOSS_PCT      = -0.005   # -0.50% حدّ خسارة صارم للصفقة الواحدة
 BIG_WIN_PCT       =  0.020   # +2.0% أو أكثر تعتبر صفقة Big Win
-POST_BIG_WIN_BARS =  20      # عدد الشموع بعد Big Win يتم فيها تفعيل الحذر
+POST_BIG_WIN_BARS =  2       # عدد الشموع بعد Big Win يتم فيها تفعيل الحذر (بعدها يرجع يشتغل عادي)
 
 # =================== ENHANCED SETTINGS ===================
 SYMBOL     = os.getenv("SYMBOL", "DOGE/USDT:USDT")
@@ -117,6 +117,8 @@ CLOSE_VERIFY_WAIT_S  = 2.0
 # Pacing
 BASE_SLEEP   = 5
 NEAR_CLOSE_S = 1
+# كل قد إيه نطبع حالة الصفقة وهي مفتوحة (بالثواني)
+POSITION_STATUS_LOG_INTERVAL = 30
 
 # ==== Smart Exit Tuning ===
 TP1_SCALP_PCT      = 0.35/100
@@ -842,20 +844,31 @@ def decide_strategy_mode_enhanced(df, adx=None, di_plus=None, di_minus=None, rsi
 # =================== SMART PROFIT AI ===================
 def smart_profit_ai_decision(state, df, ind, mode, side, entry_price, current_price):
     """
-    ذكاء اصطناعي لجني الأرباح بشكل ذكي حسب قوة الصفقة
+    ذكاء اصطناعي لجني الأرباح:
+      - يعتمد على trade_profile المخزّن في STATE:
+        * STRONG_TREND  → سلم 3 مراحل (TREND_TPS / TREND_TP_FRACS)
+        * MID_TREND     → جني أرباح مرة واحدة محترمة (باستخدام SCALP_TPS لكن بحجم محترم)
+        * SCALP_LIGHT   → سكالب خفيف هدف واحد وسريع
     """
     pnl_pct = (current_price - entry_price) / entry_price * 100 * (1 if side == "long" else -1)
     
-    if mode == "scalp":
-        # جني الأرباح على مرحلة واحدة للسكالب
-        tp_levels = SCALP_TPS
-        tp_fractions = SCALP_TP_FRACS
-        max_tp = max(tp_levels)
+    trade_profile = state.get("trade_profile") or "MID_TREND"
+    signal_strength = state.get("signal_strength", 0.0)
+    
+    # --- اختيار سلم الأهداف حسب الـ Profile ---
+    if trade_profile == "STRONG_TREND":
+        # ترند قوي → 3 مراحل TP (سلم كامل)
+        tp_levels = TREND_TPS[:]          # [0.50, 1.00, 1.80] مبدئياً
+        tp_fractions = TREND_TP_FRACS[:]  # [0.30, 0.30, 0.20]
+    elif trade_profile == "SCALP_LIGHT":
+        # سكالب خفيف → هدف واحد سريع
+        tp_levels = SCALP_TPS[:]          # [0.40]
+        tp_fractions = SCALP_TP_FRACS[:]  # [0.60]
     else:
-        # جني الأرباح على 3 مراحل للترند
-        tp_levels = TREND_TPS
-        tp_fractions = TREND_TP_FRACS
-        max_tp = max(tp_levels)
+        # MID_TREND (نص ترند / باي عادية) → جني أرباح مرة واحدة محترمة
+        # نستخدم نفس SCALP_TPS لكن نسمح بسلوك "صفقة محترمة" (Signal boost)
+        tp_levels = SCALP_TPS[:]
+        tp_fractions = SCALP_TP_FRACS[:]
     
     achieved_targets = state.get("profit_targets_achieved", 0)
     next_target_index = achieved_targets
@@ -866,27 +879,44 @@ def smart_profit_ai_decision(state, df, ind, mode, side, entry_price, current_pr
     next_target_pct = tp_levels[next_target_index]
     next_target_fraction = tp_fractions[next_target_index]
     
-    # تحسين القرار بناء على قوة الإشارة
-    signal_strength = calculate_signal_strength(df, ind, side)
+    # لو ما فيش signal_strength في الـ STATE لأي سبب، نحسبه احتياطيًا
+    if signal_strength <= 0.0:
+        signal_strength = calculate_signal_strength(df, ind, side)
     
-    # تعديل الأهداف حسب قوة الإشارة
-    if signal_strength >= 8.0:  # إشارة قوية جداً
-        next_target_pct *= 1.2  # زيادة الهدف 20%
-    elif signal_strength >= 6.0:  # إشارة قوية
-        next_target_pct *= 1.1  # زيادة الهدف 10%
-    elif signal_strength < 4.0:  # إشارة ضعيفة
-        next_target_pct *= 0.8  # تقليل الهدف 20%
+    # تعديل الأهداف حسب قوة الإشارة (Fine Tuning جوه الـ Profile)
+    if signal_strength >= 8.0:
+        # إشارة قوية جداً → نمدّي الهدف شوية
+        next_target_pct *= 1.25
+    elif signal_strength >= 6.0:
+        # إشارة قوية → نمدّي الهدف بسيط
+        next_target_pct *= 1.10
+    elif signal_strength < 3.0:
+        # إشارة ضعيفة → نقلّل الهدف عشان ما نطمعش في سكالب ضعيف
+        next_target_pct *= 0.80
     
+    # قرار التنفيذ
     if pnl_pct >= next_target_pct:
         return {
             "action": "take_profit",
             "target": next_target_index + 1,
             "target_pct": next_target_pct,
             "fraction": next_target_fraction,
-            "reason": f"تحقيق الهدف {next_target_index + 1} ({next_target_pct:.2f}%)"
+            "reason": (
+                f"TP{next_target_index + 1} hit "
+                f"({next_target_pct:.2f}%) | profile={trade_profile} "
+                f"| strength={signal_strength:.1f}"
+            ),
         }
     
-    return {"action": "hold", "target": next_target_index + 1, "reason": "لم يحقق الهدف بعد"}
+    return {
+        "action": "hold",
+        "target": next_target_index + 1,
+        "reason": (
+            f"لم يحقق الهدف بعد | "
+            f"profile={trade_profile} | "
+            f"target={next_target_pct:.2f}% | strength={signal_strength:.1f}"
+        ),
+    }
 
 def calculate_signal_strength(df, ind, side):
     """حساب قوة الإشارة للتداول"""
@@ -949,6 +979,37 @@ def calculate_signal_strength(df, ind, side):
 
     strength = max(0.0, strength)
     return min(10.0, strength)
+
+# =================== TRADE PROFILE CLASSIFICATION ===================
+def classify_trade_profile(signal_strength: float, mode: str) -> str:
+    """
+    تحويل قوة الإشارة + نمط الصفقة (scalp/trend)
+    إلى Profile واضح لإدارة جني الأرباح:
+      - STRONG_TREND  → ترند قوي (3 مراحل TP)
+      - MID_TREND     → نص ترند / صفقة محترمة (TP مرة واحدة محترمة)
+      - SCALP_LIGHT   → سكالب خفيف (TP سريع واحد)
+    """
+    # أولاً نحدد bucket للقوة
+    # 0–3  : ضعيف/خفيف
+    # 3–7  : متوسّط (نص ترند)
+    # 7–10 : قوي/سوبر ترند
+    if signal_strength >= 7.0:
+        strength_bucket = "strong"
+    elif signal_strength >= 3.0:
+        strength_bucket = "mid"
+    else:
+        strength_bucket = "weak"
+
+    # لو النمط Trend و الإشارة قوية → ترند قوي حقيقي
+    if mode == "trend" and strength_bucket == "strong":
+        return "STRONG_TREND"
+    
+    # لو سكالب أو قوة متوسطة → نص ترند / باي عادية
+    if strength_bucket == "mid":
+        return "MID_TREND"
+    
+    # أي شيء أضعف → سكالب خفيف
+    return "SCALP_LIGHT"
 
 # =================== ENHANCED COUNCIL VOTING ===================
 def council_votes_pro_enhanced(df):
@@ -1858,14 +1919,19 @@ def open_market_enhanced(side, qty, price):
     success = execute_trade_decision(side, price, qty, mode, votes, gz)
     
     if success:
-        signal_strength = calculate_signal_strength(df, votes["ind"], "long" if side=="buy" else "short")
+        # نحسب قوة الإشارة
+        side_label = "long" if side == "buy" else "short"
+        signal_strength = calculate_signal_strength(df, votes["ind"], side_label)
+        
+        # نحدّد Profile جني الأرباح (سكالب خفيف / نص ترند / ترند قوي)
+        trade_profile = classify_trade_profile(signal_strength, mode)
         
         # تحديث Risk Management
-        risk_on_new_trade(STATE, "long" if side=="buy" else "short", price)
+        risk_on_new_trade(STATE, side_label, price)
         
         STATE.update({
             "open": True, 
-            "side": "long" if side=="buy" else "short", 
+            "side": side_label, 
             "entry": price,
             "qty": qty, 
             "pnl": 0.0, 
@@ -1877,7 +1943,8 @@ def open_market_enhanced(side, qty, price):
             "profit_targets_achieved": 0,
             "mode": mode,
             "management": management_config,
-            "signal_strength": signal_strength
+            "signal_strength": signal_strength,
+            "trade_profile": trade_profile,
         })
         
         save_state({
@@ -1889,6 +1956,7 @@ def open_market_enhanced(side, qty, price):
             "mode": mode,
             "management": management_config,
             "signal_strength": signal_strength,
+            "trade_profile": trade_profile,
             "gz_snapshot": gz if isinstance(gz, dict) else {},
             "cv_snapshot": votes if isinstance(votes, dict) else {},
             "footprint_snapshot": footprint if isinstance(footprint, dict) else {},
@@ -1898,7 +1966,27 @@ def open_market_enhanced(side, qty, price):
             "breakeven_armed": False,
             "trail_active": False,
             "trail_tightened": False,
+            "last_status_log_ts": 0.0,
         })
+
+        # === لوج افتتاح الصفقة + خطة جني الأرباح ===
+        mgmt = management_config or {}
+        tp1_pct           = mgmt.get("tp1_pct", TP1_PCT_BASE / 100.0) * 100.0
+        be_activate_pct   = mgmt.get("be_activate_pct", BREAKEVEN_AFTER / 100.0) * 100.0
+        trail_activate_pct= mgmt.get("trail_activate_pct", TRAIL_ACTIVATE_PCT / 100.0) * 100.0
+        atr_trail_mult    = mgmt.get("atr_trail_mult", ATR_TRAIL_MULT)
+
+        side_txt = "BUY" if side == "buy" else "SELL"
+
+        log_banner("NEW POSITION OPENED")
+        log_g(
+            f"📌 OPEN {side_txt} | mode={mode} | qty={qty:.4f} | entry={price:.6f} | "
+            f"signal_strength={signal_strength:.1f}"
+        )
+        log_i(
+            f"🎯 PROFIT PLAN | TP1≈{tp1_pct:.2f}% | BE@{be_activate_pct:.2f}% | "
+            f"TRAIL@{trail_activate_pct:.2f}% ATR×{atr_trail_mult:.2f}"
+        )
         
         log_g(f"✅ ENHANCED POSITION OPENED: {side.upper()} | mode={mode} | signal_strength={signal_strength:.1f}")
         return True
@@ -2013,6 +2101,10 @@ STATE = {
     "pnl": 0.0, "bars": 0, "trail": None, "breakeven": None,
     "tp1_done": False, "highest_profit_pct": 0.0,
     "profit_targets_achieved": 0,
+    
+    # نمط الصفقة (لجني الأرباح): SCALP_LIGHT / MID_TREND / STRONG_TREND
+    "trade_profile": None,
+    "signal_strength": 0.0,
     
     # --- Risk / Guards ---
     "max_loss_price": None,           # سعر ستوب الصفقة الحالية
@@ -2135,6 +2227,9 @@ def _reset_after_close(reason, prev_side=None):
         "tp1_done": False, "highest_profit_pct": 0.0, "profit_targets_achieved": 0,
         "trail_tightened": False, "partial_taken": False,
         "max_loss_price": None,  # إعادة تعيين Stop Loss
+        "trade_profile": None,
+        "signal_strength": 0.0,
+        "last_status_log_ts": 0.0,
     })
     save_state({"in_position": False, "position_qty": 0})
     
@@ -2325,6 +2420,34 @@ def manage_after_entry_enhanced(df, ind, info):
                     log_e(f"❌ Smart TP failed: {e}")
             else:
                 log_i(f"DRY_RUN: Smart TP{target_num} close {close_qty:.4f}")
+
+    # === لوج حالة الصفقة كل 30 ثانية ===
+    now_ts = time.time()
+    last_ts = STATE.get("last_status_log_ts", 0.0)
+
+    if now_ts - last_ts >= POSITION_STATUS_LOG_INTERVAL:
+        STATE["last_status_log_ts"] = now_ts
+
+        management = STATE.get("management", {}) or {}
+        tp1_pct            = management.get("tp1_pct", TP1_PCT_BASE / 100.0) * 100.0
+        be_activate_pct    = management.get("be_activate_pct", BREAKEVEN_AFTER / 100.0) * 100.0
+        trail_activate_pct = management.get("trail_activate_pct", TRAIL_ACTIVATE_PCT / 100.0) * 100.0
+        atr_trail_mult     = management.get("atr_trail_mult", ATR_TRAIL_MULT)
+
+        mode = STATE.get("mode", "scalp")
+        max_pnl = STATE.get("highest_profit_pct", 0.0)
+        targets_done = STATE.get("profit_targets_achieved", 0)
+        side_txt = "BUY" if side == "long" else "SELL"
+
+        log_i(
+            f"📊 POSITION STATUS | {side_txt} | mode={mode} | "
+            f"price={px:.6f} | entry={entry:.6f} | qty={qty:.4f}"
+        )
+        log_i(
+            f"   PnL={pnl_pct:.2f}% (max={max_pnl:.2f}%) | TP_done={targets_done} | "
+            f"plan: TP1≈{tp1_pct:.2f}% / BE@{be_activate_pct:.2f}% / "
+            f"TRAIL@{trail_activate_pct:.2f}% ATR×{atr_trail_mult:.2f}"
+        )
 
     # ========= الإدارة الكلاسيك (TP1 + BE + Trail + Dust) =========
     current_atr      = ind.get("atr", 0.0)
