@@ -2623,6 +2623,39 @@ def manage_after_entry_enhanced(df, ind, info):
             return
         # متعمدين نتجاهل "partial" هنا عشان ما نعملش TP1 مزدوج (Smart AI + Guard)
 
+# =================== MANUAL CLOSE SYNC FUNCTION ===================
+def sync_manual_close():
+    """
+    تزامن الإغلاق اليدوي من المنصة:
+    - يتحقق من المركز الحقيقي على البورصة
+    - يضبط STATE إذا كان هناك تعارض
+    """
+    global STATE, wait_for_next_signal_side
+    
+    # قراءة المركز من البورصة
+    exch_qty, exch_side, exch_entry = _read_position()
+    
+    # 1) البورصة Flat والبوت فاكر في صفقة ⇒ أغلق داخليًا
+    if exch_qty <= 0 and STATE.get("open"):
+        log_w("⚠️ Detected manual close on exchange → syncing state (flat)")
+        _reset_after_close("manual_close_sync")
+        return
+    
+    # 2) البورصة فيها صفقة والبوت فاكر إنه Flat ⇒ نعتبرها صفقة معلّقة ونكمّل إدارتها
+    if exch_qty > 0 and not STATE.get("open"):
+        side = exch_side or "long"
+        STATE.update({
+            "open": True,
+            "side": side,
+            "entry": exch_entry,
+            "qty": exch_qty,
+            "bars": 0,
+            "highest_profit_pct": 0.0,
+            "profit_targets_achieved": 0,
+            "max_loss_price": exch_entry * (1.0 + MAX_LOSS_PCT) if side == "long" else exch_entry * (1.0 - MAX_LOSS_PCT),
+        })
+        log_g(f"♻️ Re-attached to existing exchange position | side={side} qty={exch_qty} entry={exch_entry}")
+
 # =================== ENHANCED TRADE LOOP ===================
 def trade_loop_enhanced():
     """حلقة تداول محسنة مع Golden Zone Pro وSmart Profit AI وVWAP وOTC Detection وEMA Cross + Risk Guards"""
@@ -2631,6 +2664,9 @@ def trade_loop_enhanced():
     
     while True:
         try:
+            # 🔄 أولاً: مزامنة الإغلاق اليدوي
+            sync_manual_close()
+            
             # تحديث عدّاد Post Big Win كل لوب
             tick_post_big_win_decay(STATE)
             
@@ -2748,7 +2784,9 @@ def trade_loop_enhanced():
                 # تحديد نمط الصفقة (scalp / trend)
                 mode_ctx = decide_strategy_mode_enhanced(
                     df,
-                    ind=council_data["ind"],
+                    adx=council_data["ind"].get("adx"),
+                    di_plus=council_data["ind"].get("plus_di"),
+                    di_minus=council_data["ind"].get("minus_di"),
                     rsi_ctx=rsi_ma_context(df),
                     footprint=footprint,
                     ema_ctx=ema_ctx,
@@ -2949,6 +2987,7 @@ if __name__ == "__main__":
     print(colored(f"EMA CROSSOVER ENGINE: Strong/Weak Trend Detection (9/21/50)", "yellow"))
     print(colored(f"🛡️ RISK GUARDS: Hard Stop Loss (-{abs(MAX_LOSS_PCT)*100}%) | Post-Big-Win Guard (+{BIG_WIN_PCT*100}%)", "red"))
     print(colored(f"🔄 AUTO RECOVERY: Enhanced position sync on restart", "green"))
+    print(colored(f"🔄 MANUAL CLOSE SYNC: Enabled (detects manual close from exchange)", "green"))
     print(colored(f"EXECUTION: {'ACTIVE' if EXECUTE_ORDERS and not DRY_RUN else 'SIMULATION'}", "yellow"))
     
     logging.info("enhanced service starting…")
