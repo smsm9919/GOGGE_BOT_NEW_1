@@ -841,6 +841,75 @@ def decide_strategy_mode_enhanced(df, adx=None, di_plus=None, di_minus=None, rsi
 
     return {"mode": mode, "why": why, "footprint_ok": footprint_confirmation}
 
+# =================== SCALP DIRECTION GUARD ===================
+def enforce_scalp_trend_alignment(df, ind, planned_side: str, mode_ctx: dict):
+    """
+    حارس سكالب:
+    - لو mode = scalp لازم نمشي مع اتجاه الترند العام.
+    - Bull ⇒ سكالب BUY (long) فقط
+    - Bear ⇒ سكالب SELL (short) فقط
+    - Flat / Chop ⇒ نلغي الصفقة السكالب.
+    يرجّع:
+      side, skip
+    """
+    try:
+        if mode_ctx.get("mode") != "scalp":
+            return planned_side, False  # مش سكالب → ما نغيّرش حاجة
+
+        # اتجاه EMA العام
+        ema_ctx = ema_crossover_strength(df, ind)
+        trend_side = ema_ctx.get("side", "flat")   # bull / bear / flat
+        ema_label = ema_ctx.get("label", "none")
+
+        # سياق RSI
+        rsi_ctx = rsi_ma_context(df)
+        rsi_trend = rsi_ctx.get("trendZ")          # bull / bear / chop
+
+        # Footprint / OrderFlow
+        footprint = compute_footprint_metrics(df)
+        flow_trend = footprint.get("delta_trend") if footprint.get("ok") else None  # bull/bear
+
+        # بناء bias نهائي
+        bias = "flat"
+
+        # Flow قوي ياخد أولوية لو موجود
+        if flow_trend in ("bull", "bear"):
+            bias = flow_trend
+        else:
+            # بعده EMA
+            if trend_side in ("bull", "bear"):
+                bias = trend_side
+
+        # لو RSI واضح ومش متعارض مع الـ bias، نعزّزه
+        if rsi_trend in ("bull", "bear"):
+            if bias == "flat":
+                bias = rsi_trend
+            elif bias != rsi_trend:
+                # تعارض قوي ⇒ نعتبر السوق فوضوي للسكالب
+                log_i(f"⏸️ SCALP: RSI vs EMA/Flow conflict (bias={bias}, rsi={rsi_trend}) → skip")
+                return planned_side, True
+
+        if bias == "flat":
+            # مفيش اتجاه واضح → نلغي السكالب
+            log_i("⏸️ SCALP: no clear trend bias (flat) → skip scalp entry")
+            return planned_side, True
+
+        forced_side = "long" if bias == "bull" else "short"
+
+        if planned_side != forced_side:
+            log_w(
+                f"🔄 SCALP DIRECTION OVERRIDE | planned={planned_side} → forced={forced_side} "
+                f"| bias={bias} | ema={ema_label}"
+            )
+            return forced_side, False
+
+        # الاتجاه planned متماشي مع الترند
+        return planned_side, False
+
+    except Exception as e:
+        log_w(f"SCALP direction guard error: {e}")
+        return planned_side, False
+
 # =================== SMART PROFIT AI ===================
 def smart_profit_ai_decision(state, df, ind, mode, side, entry_price, current_price):
     """
@@ -2676,6 +2745,32 @@ def trade_loop_enhanced():
                     sig = "sell"
             
             if not STATE["open"] and sig and reason is None:
+                # تحديد نمط الصفقة (scalp / trend)
+                mode_ctx = decide_strategy_mode_enhanced(
+                    df,
+                    ind=council_data["ind"],
+                    rsi_ctx=rsi_ma_context(df),
+                    footprint=footprint,
+                    ema_ctx=ema_ctx,
+                )
+                trade_mode = mode_ctx.get("mode", "scalp")
+                
+                # ✅ حارس اتجاه السكالب
+                side_label = "long" if sig == "buy" else "short"
+                side_label, skip_scalp = enforce_scalp_trend_alignment(
+                    df,
+                    council_data["ind"],
+                    side_label,
+                    mode_ctx,
+                )
+                if skip_scalp:
+                    # سكالب في سوق مش واضح → نسيبه
+                    log_i("⏸️ Skipping scalp due to unclear trend alignment")
+                    continue
+                
+                # تحديث السيجنال بعد التعديل
+                sig = "buy" if side_label == "long" else "sell"
+                
                 allow_wait, wait_reason = wait_gate_allow(df, info)
                 if not allow_wait:
                     reason = wait_reason
