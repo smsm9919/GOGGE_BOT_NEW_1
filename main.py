@@ -3099,53 +3099,171 @@ def trade_loop_enhanced():
 
             # --- Council Strong Entry مع تخفيف احترافي للتقاطع القوي ---
             if not golden_entry and not sig:
-                ema_label = ema_ctx.get("label", "none")
+                ema_label   = ema_ctx.get("label", "none")
                 strong_bull = (ema_label == "strong_bull")
                 strong_bear = (ema_label == "strong_bear")
 
-                buy_score  = council_data["score_b"]
-                sell_score = council_data["score_s"]
+                # ========== RAW COUNCIL SCORES ==========
+                buy_score  = float(council_data.get("score_b", 0.0))
+                sell_score = float(council_data.get("score_s", 0.0))
+
+                # ========== INDICATOR CONTEXT (ADX / RSI / ATR / VWAP) ==========
+                ind      = council_data.get("ind", {}) or {}
+                adx      = float(ind.get("adx", 0.0) or 0.0)
+                plus_di  = float(ind.get("plus_di", 0.0) or 0.0)
+                minus_di = float(ind.get("minus_di", 0.0) or 0.0)
+                atr_val  = float(ind.get("atr", 0.0) or 0.0)
+                rsi_val  = float(ind.get("rsi", 50.0) or 50.0)
+                vwap_val = ind.get("vwap")
+                px_now   = float(df["close"].iloc[-1])
+
+                # ADX Phase
+                if adx < 15:
+                    adx_phase = "dead"          # سوق ميت / تجميع
+                elif adx < 22:
+                    adx_phase = "waking_up"     # ADX بيصحى
+                elif adx < 35:
+                    adx_phase = "trending"      # ترند صحي
+                else:
+                    adx_phase = "overheated"    # حركة متفلتة / فقاع
+
+                if plus_di > minus_di:
+                    adx_trend_side = "UP"
+                elif minus_di > plus_di:
+                    adx_trend_side = "DOWN"
+                else:
+                    adx_trend_side = "FLAT"
+
+                # ATR Regime (حجم الحركة)
+                atr_regime = "normal"
+                if px_now > 0:
+                    atr_pct = (atr_val / px_now) * 100.0 if atr_val > 0 else 0.0
+                    if atr_pct < 0.5:
+                        atr_regime = "low_vol"
+                    elif atr_pct > 1.5:
+                        atr_regime = "high_vol"
+
+                # RSI MA Context (تقاطعات + ترند Z)
+                rsi_ctx_local = rsi_ma_context(df)
+                rsi_cross     = rsi_ctx_local.get("cross")      # bull / bear / none
+                rsi_trendz    = rsi_ctx_local.get("trendZ")     # bull / bear / none
+                rsi_in_chop   = rsi_ctx_local.get("in_chop")    # نطاق حيادي
+
+                # Strong Zones (من التحليل اللي فوق)
+                strong_buy_zone  = is_strong_buy_zone(analysis)
+                strong_sell_zone = is_strong_sell_zone(analysis)
+
+                # ========== META CONFLUENCE SCORES ==========
+                eff_buy  = buy_score
+                eff_sell = sell_score
+
+                # 1) المكان أولاً: الصناديق + المناطق الذهبية
+                if strong_buy_zone:
+                    eff_buy += 2.5
+                if strong_sell_zone:
+                    eff_sell += 2.5
+
+                if gz and gz.get("ok") and gz.get("confirmed"):
+                    if gz["zone"]["type"] == "golden_bottom":
+                        eff_buy += 1.5
+                    elif gz["zone"]["type"] == "golden_top":
+                        eff_sell += 1.5
+
+                # 2) ADX Phase + اتجاهه
+                if adx_phase in ("waking_up", "trending") and adx_trend_side == "UP":
+                    eff_buy += 1.5
+                if adx_phase in ("waking_up", "trending") and adx_trend_side == "DOWN":
+                    eff_sell += 1.5
+
+                # سوق ميت / تبريد ⇒ نخفف الثقة
+                if adx_phase in ("dead", "cooling"):
+                    eff_buy  *= 0.7
+                    eff_sell *= 0.7
+
+                # حركة متفلتة ⇒ ما ندخلش بسهولة
+                if adx_phase == "overheated":
+                    eff_buy  *= 0.9
+                    eff_sell *= 0.9
+
+                # 3) RSI + تقاطعاته
+                if rsi_cross == "bull" and rsi_val < 65:
+                    eff_buy += 1.0
+                if rsi_cross == "bear" and rsi_val > 35:
+                    eff_sell += 1.0
+
+                if rsi_trendz == "bull":
+                    eff_buy += 0.8
+                elif rsi_trendz == "bear":
+                    eff_sell += 0.8
+
+                if rsi_in_chop:
+                    eff_buy  *= 0.9
+                    eff_sell *= 0.9
+
+                # 4) EMA Trend (الموجود أصلًا)
+                if strong_bull:
+                    eff_buy += 0.7
+                if strong_bear:
+                    eff_sell += 0.7
+
+                # 5) VWAP
+                if vwap_val:
+                    if px_now > vwap_val and ema_label in ("strong_bull", "weak_bull"):
+                        eff_buy += 0.5
+                    if px_now < vwap_val and ema_label in ("strong_bear", "weak_bear"):
+                        eff_sell += 0.5
+
+                # 6) ATR Regime – في high_vol من غير صندوق قوي نقلّل
+                if atr_regime == "high_vol" and not (strong_buy_zone or strong_sell_zone):
+                    eff_buy  *= 0.7
+                    eff_sell *= 0.7
 
                 buy_ok = False
                 sell_ok = False
 
-                # الأساس: 8.0 زي ما هو
-                if buy_score >= 8.0 and buy_score > sell_score:
+                # ========== GATING: نستخدم eff_* بدل raw score ==========
+                # الأساس: 8.0 لكن على confluence مش على council بس
+                if eff_buy >= 8.0 and eff_buy > eff_sell:
                     buy_ok = True
-                elif sell_score >= 8.0 and sell_score > buy_score:
+                elif eff_sell >= 8.0 and eff_sell > eff_buy:
                     sell_ok = True
 
                 # ===== POST-BIG-WIN FILTER =====
                 if STATE.get("post_big_win_mode"):
-                    # في وضع Post-Big-Win نرفع السقف
-                    if buy_score >= 8.5 and buy_score > sell_score and strong_bull:
+                    # في وضع Post-Big-Win نرفع السقف ونطلب confluence أعلى
+                    if eff_buy >= 8.5 and eff_buy > eff_sell and strong_bull:
                         buy_ok = True
-                        log_i(f"✅ BUY by Council(8.5+) + EMA STRONG BULL ({buy_score:.1f}) - POST-BIG-WIN MODE")
-                    elif sell_score >= 8.5 and sell_score > buy_score and strong_bear:
+                        log_i(f"✅ BUY by Confluence(8.5+) + EMA STRONG BULL | raw={buy_score:.1f} eff={eff_buy:.1f}")
+                    elif eff_sell >= 8.5 and eff_sell > eff_buy and strong_bear:
                         sell_ok = True
-                        log_i(f"✅ SELL by Council(8.5+) + EMA STRONG BEAR ({sell_score:.1f}) - POST-BIG-WIN MODE")
+                        log_i(f"✅ SELL by Confluence(8.5+) + EMA STRONG BEAR | raw={sell_score:.1f} eff={eff_sell:.1f}")
                     else:
-                        log_i(f"🛑 POST-BIG-WIN MODE: Skipping weak signal (Buy: {buy_score:.1f}, Sell: {sell_score:.1f})")
+                        log_i(
+                            f"🛑 POST-BIG-WIN MODE: Skipping weak confluence "
+                            f"(raw B/S: {buy_score:.1f}/{sell_score:.1f}, "
+                            f"eff B/S: {eff_buy:.1f}/{eff_sell:.1f}, "
+                            f"ADX={adx:.1f} phase={adx_phase})"
+                        )
                 else:
-                    # تخفيف احترافي: 7.0 مسموح فقط لو EMA strong في نفس الاتجاه
-                    if not buy_ok and buy_score >= 7.0 and buy_score > sell_score and strong_bull:
+                    # تخفيف احترافي: نسمح من 7.0–8.0 فقط لو في Confluence حقيقي + EMA قوية
+                    if (not buy_ok and eff_buy >= 7.0 and eff_buy > eff_sell and strong_bull):
                         buy_ok = True
-                        log_i(f"✅ BUY by Council(7.x) + EMA STRONG BULL ({buy_score:.1f})")
-                    if not sell_ok and sell_score >= 7.0 and sell_score > buy_score and strong_bear:
+                        log_i(f"✅ BUY by Confluence(7.x) + EMA STRONG BULL | raw={buy_score:.1f} eff={eff_buy:.1f}")
+                    if (not sell_ok and eff_sell >= 7.0 and eff_sell > eff_buy and strong_bear):
                         sell_ok = True
-                        log_i(f"✅ SELL by Council(7.x) + EMA STRONG BEAR ({sell_score:.1f})")
+                        log_i(f"✅ SELL by Confluence(7.x) + EMA STRONG BEAR | raw={sell_score:.1f} eff={eff_sell:.1f}")
 
+                # في الآخر لسه بنحترم الـ Strong Zone Guard اللي تحت
                 if buy_ok and strong_buy_zone:
                     sig = "buy"
                 elif sell_ok and strong_sell_zone:
                     sig = "sell"
-                    
-                # إضافة لوج في حالة عدم وجود strong zone
+
                 if buy_ok and not strong_buy_zone:
-                    log_i(f"🛑 [ENTRY BLOCKED] BUY weak zone | strong_buy_zone=False | score={buy_score:.1f}")
+                    log_i(f"🛑 [ENTRY BLOCKED] BUY weak zone | strong_buy_zone=False | eff={eff_buy:.1f} raw={buy_score:.1f}")
                 if sell_ok and not strong_sell_zone:
-                    log_i(f"🛑 [ENTRY BLOCKED] SELL weak zone | strong_sell_zone=False | score={sell_score:.1f}")
-            
+                    log_i(f"🛑 [ENTRY BLOCKED] SELL weak zone | strong_sell_zone=False | eff={eff_sell:.1f} raw={sell_score:.1f}")
+
             # ===== STRONG ZONE GUARD FINAL CHECK =====
             if sig == "buy" and not strong_buy_zone:
                 reason = f"skip_buy_weak_zone | strong_buy_zone=False"
@@ -3333,7 +3451,7 @@ def health():
         "ok": True, "mode": "live" if MODE_LIVE else "paper",
         "open": STATE["open"], "side": STATE["side"], "qty": STATE["qty"],
         "compound_pnl": compound_pnl, "timestamp": datetime.utcnow().isoformat(),
-        "entry_mode": "COUNCIL_PRO_GOLDEN_ENHANCED_VWAP_OTC_EMA_KH_STRONG_ZONE", "wait_for_next_signal": wait_for_next_signal_side,
+        "entry_mode": "COUNCIL_PRO_GOLDEN_ENHANCED_VWAP_OTC_EMA_KH_STRONG_ZONE", "wait_for-next_signal": wait_for_next_signal_side,
         "risk_guards": {
             "hard_stop_active": STATE.get("max_loss_price") is not None,
             "post_big_win_active": STATE.get("post_big_win_mode", False),
