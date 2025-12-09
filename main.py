@@ -1708,6 +1708,20 @@ def time_to_candle_close(df: pd.DataFrame) -> int:
     left = max(0, next_close_ms - now_ms)
     return int(left/1000)
 
+# =================== CLOSED-CANDLE VIEW ===================
+def get_closed_df(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    نرجّع DataFrame مبني على آخر شمعة مُغلقة:
+    - لو فيه شمعة حية في الآخر ⇒ نستبعدها (iloc[:-1])
+    - لو الداتا قصيرة جدًا ⇒ نرجّعها زي ما هي
+    """
+    if df is None or len(df) == 0:
+        return df
+    if len(df) <= 2:
+        return df.copy()
+    return df.iloc[:-1].copy()
+
+
 # ========= Professional logging helpers =========
 def fmt_walls(walls):
     return ", ".join([f"{p:.6f}@{q:.0f}" for p, q in walls]) if walls else "-"
@@ -1963,21 +1977,26 @@ def open_market_enhanced(side, qty, price):
         return False
     
     df = fetch_ohlcv()
-    current_price = price or float(df['close'].iloc[-1])
+    df_closed = get_closed_df(df)
+
+    # نستخدم سعر المنصة أو آخر إغلاق لو مش متوفر
+    current_price = price or float(df_closed['close'].iloc[-1])
     
-    # Enhanced analysis
-    snap = emit_snapshots(ex, SYMBOL, df)
+    # Enhanced analysis على الشمعة المغلقة
+    snap = emit_snapshots(ex, SYMBOL, df_closed)
     votes = snap["cv"]
     footprint = votes.get("footprint", {})
     ema_ctx = votes.get("ema", {})
     
-    mode_data = decide_strategy_mode_enhanced(df, 
-                                   adx=votes["ind"].get("adx"),
-                                   di_plus=votes["ind"].get("plus_di"),
-                                   di_minus=votes["ind"].get("minus_di"),
-                                   rsi_ctx=rsi_ma_context(df),
-                                   footprint=footprint,
-                                   ema_ctx=ema_ctx)
+    mode_data = decide_strategy_mode_enhanced(
+        df_closed, 
+        adx=votes["ind"].get("adx"),
+        di_plus=votes["ind"].get("plus_di"),
+        di_minus=votes["ind"].get("minus_di"),
+        rsi_ctx=rsi_ma_context(df_closed),
+        footprint=footprint,
+        ema_ctx=ema_ctx,
+    )
     
     mode = mode_data["mode"]
     gz = snap["gz"]
@@ -1988,9 +2007,10 @@ def open_market_enhanced(side, qty, price):
     success = execute_trade_decision(side, price, qty, mode, votes, gz)
     
     if success:
-        # نحسب قوة الإشارة
         side_label = "long" if side == "buy" else "short"
-        signal_strength = calculate_signal_strength(df, votes["ind"], side_label)
+
+        # قوة الإشارة على الشمعة المغلقة
+        signal_strength = calculate_signal_strength(df_closed, votes["ind"], side_label)
         
         # نحدّد Profile جني الأرباح (سكالب خفيف / نص ترند / ترند قوي)
         trade_profile = classify_trade_profile(signal_strength, mode)
@@ -2674,22 +2694,32 @@ def trade_loop_enhanced():
             bal = balance_usdt()
             px = price_now()
             df = fetch_ohlcv()
-            info = rf_signal_live(df)
-            ind = compute_indicators(df)
+            
+            # نشتغل بالـ df_closed لكل التحليل/القراءة
+            df_closed = get_closed_df(df)
+
+            # RF على الشمعة المغلقة
+            info = rf_signal_live(df_closed)
+
+            # المؤشرات على الشمعة المغلقة
+            ind = compute_indicators(df_closed)
+
             spread_bps = orderbook_spread_bps()
             
-            # Enhanced Snapshots
-            snap = emit_snapshots(ex, SYMBOL, df,
-                                balance_fn=lambda: float(bal) if bal else None,
-                                pnl_fn=lambda: float(compound_pnl))
-            
+            # Enhanced Snapshots (كل حاجة جوه snapshot على الشمعة المغلقة)
+            snap = emit_snapshots(
+                ex, SYMBOL, df_closed,
+                balance_fn=lambda: float(bal) if bal else None,
+                pnl_fn=lambda: float(compound_pnl),
+            )
+
             # تحديث حالة الربح/الخسارة
             if STATE["open"] and px:
                 STATE["pnl"] = (px-STATE["entry"])*STATE["qty"] if STATE["side"]=="long" else (STATE["entry"]-px)*STATE["qty"]
             
             # إدارة الصفقة المفتوحة مع Smart Profit AI + Hard Stop
             if STATE["open"]:
-                manage_after_entry_enhanced(df, ind, {
+                manage_after_entry_enhanced(df_closed, ind, {
                     "price": px or info["price"], 
                     "bm": snap["bm"],
                     "flow": snap["flow"],
@@ -2701,7 +2731,7 @@ def trade_loop_enhanced():
             if spread_bps is not None and spread_bps > MAX_SPREAD_BPS:
                 reason = f"spread too high ({fmt(spread_bps,2)}bps > {MAX_SPREAD_BPS})"
             
-            council_data = council_votes_pro_enhanced(df)
+            council_data = council_votes_pro_enhanced(df_closed)
             gz = council_data.get("gz")
             footprint = council_data.get("footprint", {})
             otc = council_data.get("otc", {})
@@ -2783,11 +2813,11 @@ def trade_loop_enhanced():
             if not STATE["open"] and sig and reason is None:
                 # تحديد نمط الصفقة (scalp / trend)
                 mode_ctx = decide_strategy_mode_enhanced(
-                    df,
+                    df_closed,
                     adx=council_data["ind"].get("adx"),
                     di_plus=council_data["ind"].get("plus_di"),
                     di_minus=council_data["ind"].get("minus_di"),
-                    rsi_ctx=rsi_ma_context(df),
+                    rsi_ctx=rsi_ma_context(df_closed),
                     footprint=footprint,
                     ema_ctx=ema_ctx,
                 )
@@ -2796,7 +2826,7 @@ def trade_loop_enhanced():
                 # ✅ حارس اتجاه السكالب
                 side_label = "long" if sig == "buy" else "short"
                 side_label, skip_scalp = enforce_scalp_trend_alignment(
-                    df,
+                    df_closed,
                     council_data["ind"],
                     side_label,
                     mode_ctx,
@@ -2809,7 +2839,7 @@ def trade_loop_enhanced():
                 # تحديث السيجنال بعد التعديل
                 sig = "buy" if side_label == "long" else "sell"
                 
-                allow_wait, wait_reason = wait_gate_allow(df, info)
+                allow_wait, wait_reason = wait_gate_allow(df_closed, info)
                 if not allow_wait:
                     reason = wait_reason
                 else:
