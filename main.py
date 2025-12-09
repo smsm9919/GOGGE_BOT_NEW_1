@@ -10,6 +10,7 @@ RF Futures Bot — RF-LIVE ONLY (BingX Perp via CCXT)
 • OTC Hidden Flow Detection & Protection System
 • EMA Crossover Strength Engine (Strong/Weak Trend Detection)
 • ENHANCED WITH: Hard Stop Loss, Post-Big-Win Guard, Auto-Recovery
+• ADDED: KH SMC Module (ChoCH / BOS / Buy-KH / Sell-KH Zones)
 """
 
 import os, time, math, random, signal, sys, traceback, logging, json
@@ -44,7 +45,7 @@ SHADOW_MODE_DASHBOARD = False
 DRY_RUN = False
 
 # ==== Addon: Logging + Recovery Settings ====
-BOT_VERSION = "DOGE Council PRO v5.0 — Smart Profit AI + Golden Zone Pro + VWAP Strategy + OTC Detection + EMA Crossover Engine + Hard Stop + Post-Big-Win Guard + Auto-Recovery"
+BOT_VERSION = "DOGE Council PRO v5.0 — Smart Profit AI + Golden Zone Pro + VWAP Strategy + OTC Detection + EMA Crossover Engine + Hard Stop + Post-Big-Win Guard + Auto-Recovery + KH SMC Module"
 print("🔁 Booting:", BOT_VERSION, flush=True)
 
 STATE_PATH = "./bot_state.json"
@@ -386,6 +387,135 @@ def compute_footprint_metrics(df):
     except Exception as e:
         return {"ok": False, "why": str(e)}
 
+# =================== KH SMC (ChoCH / BOS / KH Zones) ===================
+
+def _find_swings_kh(df: pd.DataFrame, left: int = 3, right: int = 3):
+    """
+    اكتشاف Swing High / Swing Low بسيط لاستخدامه في KH / ChoCH / BOS
+    """
+    highs = df["high"].astype(float).values
+    lows  = df["low"].astype(float).values
+    n = len(df)
+    swing_high = np.zeros(n, dtype=bool)
+    swing_low  = np.zeros(n, dtype=bool)
+
+    if n < left + right + 3:
+        return swing_high, swing_low
+
+    for i in range(left, n - right):
+        h = highs[i]
+        l = lows[i]
+        if h == max(highs[i-left:i+right+1]):
+            swing_high[i] = True
+        if l == min(lows[i-left:i+right+1]):
+            swing_low[i] = True
+
+    return swing_high, swing_low
+
+
+def compute_kh_context(df: pd.DataFrame) -> dict:
+    """
+    سياق KH على شكل:
+      trend: up / down / range
+      choch: up / down / none
+      bos:   up / down / none
+      buy_zone: {low, high, idx} أو None
+      sell_zone: {low, high, idx} أو None
+    """
+    try:
+        if df is None or len(df) < 40:
+            return {
+                "trend": "range",
+                "choch": "none",
+                "bos": "none",
+                "buy_zone": None,
+                "sell_zone": None,
+            }
+
+        closes = df["close"].astype(float).values
+        highs  = df["high"].astype(float).values
+        lows   = df["low"].astype(float).values
+        n      = len(df)
+
+        swing_high, swing_low = _find_swings_kh(df, left=3, right=3)
+        idx = np.arange(n)
+
+        last_close = closes[-1]
+
+        # آخر سوينج هاي/لو مهمة
+        last_high_idx = idx[swing_high][-1] if swing_high.any() else None
+        last_low_idx  = idx[swing_low][-1]  if swing_low.any()  else None
+
+        # اتجاه تقريبي من آخر سوينجين
+        trend = "range"
+        if last_high_idx is not None and last_low_idx is not None:
+            if last_high_idx > last_low_idx:
+                trend = "up"
+            elif last_low_idx > last_high_idx:
+                trend = "down"
+
+        # ChoCH: كسر آخر سوينج معاكس
+        choch = "none"
+        if trend == "up" and last_low_idx is not None:
+            # لو كسر آخر لو مهم تحت → تحوّل هابط
+            if last_close < lows[last_low_idx]:
+                choch = "down"
+        elif trend == "down" and last_high_idx is not None:
+            # لو كسر آخر هاي مهم فوق → تحوّل صاعد
+            if last_close > highs[last_high_idx]:
+                choch = "up"
+
+        # BOS: كسر هيكل بعد ChoCH
+        bos = "none"
+        if choch == "up" and last_high_idx is not None:
+            if last_close > highs[last_high_idx]:
+                bos = "up"
+        elif choch == "down" and last_low_idx is not None:
+            if last_close < lows[last_low_idx]:
+                bos = "down"
+
+        buy_zone = None
+        sell_zone = None
+
+        # بناء مناطق KH بسيطة مبدئياً:
+        # بعد BOS صاعد → آخر سوينج لو يتحول لـ Buy-KH
+        if bos == "up" and last_low_idx is not None:
+            z_low  = lows[last_low_idx]
+            z_high = closes[last_low_idx]  # ممكن تغيّرها لـ high لو حابب أوسع البوكس
+            buy_zone = {
+                "low": float(z_low),
+                "high": float(z_high),
+                "idx": int(last_low_idx),
+            }
+
+        # بعد BOS هابط → آخر سوينج هاي يتحول لـ Sell-KH
+        if bos == "down" and last_high_idx is not None:
+            z_high = highs[last_high_idx]
+            z_low  = closes[last_high_idx]
+            sell_zone = {
+                "low": float(z_low),
+                "high": float(z_high),
+                "idx": int(last_high_idx),
+            }
+
+        return {
+            "trend": trend,
+            "choch": choch,
+            "bos": bos,
+            "buy_zone": buy_zone,
+            "sell_zone": sell_zone,
+        }
+    except Exception as e:
+        log_w(f"KH context error: {e}")
+        return {
+            "trend": "range",
+            "choch": "none",
+            "bos": "none",
+            "buy_zone": None,
+            "sell_zone": None,
+            "error": str(e),
+        }
+
 # =================== OTC HIDDEN FLOW DETECTION ===================
 def detect_otc_flows(df, window: int = OTC_WINDOW_BARS):
     """
@@ -525,6 +655,7 @@ def verify_execution_environment():
     print(f"📊 VWAP STRATEGY: SCALP(near {VWAP_SCALP_BAND_BPS}bps) | TREND(far {VWAP_TREND_BAND_BPS}bps)", flush=True)
     print(f"📈 EMA CROSSOVER ENGINE: Strong/Weak Trend Detection", flush=True)
     print(f"🛡️ RISK GUARDS: Hard Stop Loss (-{abs(MAX_LOSS_PCT)*100}%) | Post-Big-Win Guard (+{BIG_WIN_PCT*100}%)", flush=True)
+    print(f"📦 KH SMC MODULE: ChoCH / BOS / Buy-KH / Sell-KH Zones", flush=True)
     
     if not EXECUTE_ORDERS:
         print("🟡 WARNING: EXECUTE_ORDERS=False - البوت في وضع التحليل فقط!", flush=True)
@@ -1082,7 +1213,7 @@ def classify_trade_profile(signal_strength: float, mode: str) -> str:
 
 # =================== ENHANCED COUNCIL VOTING ===================
 def council_votes_pro_enhanced(df):
-    """مجلس تصويت محسّن مع Footprint + SMC + Golden Zone Pro + VWAP + OTC + EMA"""
+    """مجلس تصويت محسّن مع Footprint + SMC + Golden Zone Pro + VWAP + OTC + EMA + KH"""
     try:
         ind = compute_indicators(df)
         rsi_ctx = rsi_ma_context(df)
@@ -1097,6 +1228,9 @@ def council_votes_pro_enhanced(df):
         
         # Liquidity traps
         liquidity_traps = detect_liquidity_traps(df, current_price)
+
+        # KH SMC Context (ChoCH / BOS / Buy-KH / Sell-KH)
+        kh_ctx = compute_kh_context(df)
 
         votes_b = 0; votes_s = 0
         score_b = 0.0; score_s = 0.0
@@ -1191,7 +1325,45 @@ def council_votes_pro_enhanced(df):
                 conf_text = "مؤكد" if gz['confirmed'] else "محتمل"
                 logs.append(f"🏆 قمة ذهبية {conf_text} (قوة: {gz['score']:.1f})")
 
-        # --- Footprint Boost
+        # ==== KH ZONES (Buy-KH / Sell-KH) بناءً على ChoCH + BOS ====
+        kh_buy_zone  = kh_ctx.get("buy_zone")
+        kh_sell_zone = kh_ctx.get("sell_zone")
+        kh_bos       = kh_ctx.get("bos")
+        kh_trend     = kh_ctx.get("trend")
+
+        # BUY-KH: BOS صاعد + السعر داخل منطقة الطلب
+        if kh_bos == "up" and kh_buy_zone:
+            low  = kh_buy_zone["low"]
+            high = kh_buy_zone["high"]
+            if low <= current_price <= high:
+                # لمس مباشر للبوكس → تصويت قوي للشراء
+                votes_b += 3
+                score_b += 2.0
+                logs.append(
+                    f"📦 BUY-KH zone touch [{low:.6f}–{high:.6f}] | trend={kh_trend}"
+                )
+            elif current_price > high:
+                # خروج فوق البوكس بعد رفض → تأكيد إضافي لكن أخف
+                votes_b += 1
+                score_b += 0.5
+                logs.append("📦 BUY-KH breakout confirm")
+
+        # SELL-KH: BOS هابط + السعر داخل منطقة العرض
+        if kh_bos == "down" and kh_sell_zone:
+            low  = kh_sell_zone["low"]
+            high = kh_sell_zone["high"]
+            if low <= current_price <= high:
+                votes_s += 3
+                score_s += 2.0
+                logs.append(
+                    f"📦 SELL-KH zone touch [{low:.6f}–{high:.6f}] | trend={kh_trend}"
+                )
+            elif current_price < low:
+                votes_s += 1
+                score_s += 0.5
+                logs.append("📦 SELL-KH breakdown confirm")
+
+        # --- Footprint Boost ---
         if footprint.get('ok'):
             if footprint.get('absorption_bull'):
                 votes_b += 2; score_b += 1.5; logs.append("👣 Footprint امتصاص شرائي")
@@ -1272,6 +1444,7 @@ def council_votes_pro_enhanced(df):
             "smc_pattern": cd["smc_pattern"],
             "liquidity_trap": cd["liquidity_trap"],
             "ema_ctx": ema_ctx,
+            "kh_ctx": kh_ctx,    # ⬅️ جديد
         })
 
         return {
@@ -1282,6 +1455,7 @@ def council_votes_pro_enhanced(df):
             "liquidity_traps": liquidity_traps,
             "otc": otc,
             "ema": ema_ctx,
+            "kh": kh_ctx,      # ⬅️ جديد
         }
     except Exception as e:
         log_w(f"council_votes_pro_enhanced error: {e}")
@@ -1289,7 +1463,8 @@ def council_votes_pro_enhanced(df):
             "b": 0, "s": 0,
             "score_b": 0.0, "score_s": 0.0,
             "logs": [], "ind": {}, "gz": None,
-            "candles": {}, "footprint": {}, "liquidity_traps": {}, "otc": {}, "ema": {}
+            "candles": {}, "footprint": {}, "liquidity_traps": {}, "otc": {}, "ema": {},
+            "kh": {}  # ⬅️ جديد
         }
 
 # =================== POSITION RECOVERY ===================
@@ -1708,20 +1883,6 @@ def time_to_candle_close(df: pd.DataFrame) -> int:
     left = max(0, next_close_ms - now_ms)
     return int(left/1000)
 
-# =================== CLOSED-CANDLE VIEW ===================
-def get_closed_df(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    نرجّع DataFrame مبني على آخر شمعة مُغلقة:
-    - لو فيه شمعة حية في الآخر ⇒ نستبعدها (iloc[:-1])
-    - لو الداتا قصيرة جدًا ⇒ نرجّعها زي ما هي
-    """
-    if df is None or len(df) == 0:
-        return df
-    if len(df) <= 2:
-        return df.copy()
-    return df.iloc[:-1].copy()
-
-
 # ========= Professional logging helpers =========
 def fmt_walls(walls):
     return ", ".join([f"{p:.6f}@{q:.0f}" for p, q in walls]) if walls else "-"
@@ -1769,7 +1930,7 @@ def compute_flow_metrics(df):
 # ========= Unified snapshot emitter =========
 def emit_snapshots(exchange, symbol, df, balance_fn=None, pnl_fn=None):
     """
-    يطبع Snapshot موحّد: Bookmap + Flow + Council + Strategy + Balance/PnL + VWAP + OTC + EMA
+    يطبع Snapshot موحّد: Bookmap + Flow + Council + Strategy + Balance/PnL + VWAP + OTC + EMA + KH
     """
     try:
         bm = bookmap_snapshot(exchange, symbol)
@@ -1837,11 +1998,22 @@ def emit_snapshots(exchange, symbol, df, balance_fn=None, pnl_fn=None):
             ema_label = ema_ctx.get("label", "")
             ema_score = ema_ctx.get("score", 0.0)
             ema_note = f" | 📈 EMA:{ema_label}({ema_score:.1f})"
+            
+        # KH info
+        kh_note = ""
+        kh_ctx = cv.get("kh", {})
+        kh_bos = kh_ctx.get("bos", "none")
+        if kh_bos != "none":
+            kh_note = f" | 📦 KH:{kh_bos}"
+            if kh_ctx.get("buy_zone"):
+                kh_note += f" BuyZone[{kh_ctx['buy_zone']['low']:.6f}-{kh_ctx['buy_zone']['high']:.6f}]"
+            elif kh_ctx.get("sell_zone"):
+                kh_note += f" SellZone[{kh_ctx['sell_zone']['low']:.6f}-{kh_ctx['sell_zone']['high']:.6f}]"
 
         if LOG_ADDONS:
             print(f"🧱 {bm_note}", flush=True)
             print(f"📦 {fl_note}", flush=True)
-            print(f"📊 {dash}{gz_note}{otc_note}{ema_note}", flush=True)
+            print(f"📊 {dash}{gz_note}{otc_note}{ema_note}{kh_note}", flush=True)
             print(f"{strat}{(' | ' + wallet) if wallet else ''}", flush=True)
             
             gz_snap_note = ""
@@ -1874,9 +2046,18 @@ def emit_snapshots(exchange, symbol, df, balance_fn=None, pnl_fn=None):
             if ema_ctx.get("label") != "none":
                 ema_snap = f" | 📈EMA:{ema_ctx.get('label','')}({ema_ctx.get('score',0):.1f})"
             
+            # KH info for snapshot
+            kh_snap = ""
+            if kh_bos != "none":
+                kh_snap = f" | 📦KH:{kh_bos}"
+                if kh_ctx.get("buy_zone"):
+                    kh_snap += f" Buy[{kh_ctx['buy_zone']['low']:.6f}]"
+                elif kh_ctx.get("sell_zone"):
+                    kh_snap += f" Sell[{kh_ctx['sell_zone']['high']:.6f}]"
+            
             print(f"🧠 SNAP | {side_hint} | votes={cv['b']}/{cv['s']} score={cv['score_b']:.1f}/{cv['score_s']:.1f} "
                   f"| ADX={cv['ind'].get('adx',0):.1f} DI={cv['ind'].get('di_spread',0):.1f} | "
-                  f"z={flow_z:.2f} | imb={bm_imb:.2f}{gz_snap_note}{vwap_info}{otc_snap}{ema_snap}", 
+                  f"z={flow_z:.2f} | imb={bm_imb:.2f}{gz_snap_note}{vwap_info}{otc_snap}{ema_snap}{kh_snap}", 
                   flush=True)
             
             # إضافة معلومات Footprint وSMC
@@ -1898,6 +2079,11 @@ def emit_snapshots(exchange, symbol, df, balance_fn=None, pnl_fn=None):
             # EMA detailed info
             if ema_ctx.get("label") != "none":
                 print(f"📈 EMA CROSSOVER | {ema_ctx.get('label')} | score={ema_ctx.get('score',0):.1f} | side={ema_ctx.get('side','flat')}", flush=True)
+            
+            # KH detailed info
+            if kh_bos != "none":
+                print(f"📦 KH SMC | trend={kh_ctx.get('trend')} | bos={kh_bos} | choch={kh_ctx.get('choch')} | "
+                      f"buy_zone={kh_ctx.get('buy_zone')} | sell_zone={kh_ctx.get('sell_zone')}", flush=True)
             
             print("✅ ENHANCED ADDONS LIVE", flush=True)
 
@@ -1934,11 +2120,18 @@ def execute_trade_decision(side, price, qty, mode, council_data, gz_data):
     ema_ctx = council_data.get("ema", {})
     if ema_ctx.get("label") != "none":
         ema_note = f" | 📈 EMA:{ema_ctx.get('label','')}"
+        
+    # KH note
+    kh_note = ""
+    kh_ctx = council_data.get("kh", {})
+    kh_bos = kh_ctx.get("bos", "none")
+    if kh_bos != "none":
+        kh_note = f" | 📦 KH:{kh_bos}"
     
     votes = council_data
     print(f"🎯 EXECUTE: {side.upper()} {qty:.4f} @ {price:.6f} | "
           f"mode={mode} | votes={votes['b']}/{votes['s']} score={votes['score_b']:.1f}/{votes['score_s']:.1f}"
-          f"{gz_note}{otc_note}{ema_note}", flush=True)
+          f"{gz_note}{otc_note}{ema_note}{kh_note}", flush=True)
 
     try:
         if MODE_LIVE:
@@ -1977,26 +2170,21 @@ def open_market_enhanced(side, qty, price):
         return False
     
     df = fetch_ohlcv()
-    df_closed = get_closed_df(df)
-
-    # نستخدم سعر المنصة أو آخر إغلاق لو مش متوفر
-    current_price = price or float(df_closed['close'].iloc[-1])
+    current_price = price or float(df['close'].iloc[-1])
     
-    # Enhanced analysis على الشمعة المغلقة
-    snap = emit_snapshots(ex, SYMBOL, df_closed)
+    # Enhanced analysis
+    snap = emit_snapshots(ex, SYMBOL, df)
     votes = snap["cv"]
     footprint = votes.get("footprint", {})
     ema_ctx = votes.get("ema", {})
     
-    mode_data = decide_strategy_mode_enhanced(
-        df_closed, 
-        adx=votes["ind"].get("adx"),
-        di_plus=votes["ind"].get("plus_di"),
-        di_minus=votes["ind"].get("minus_di"),
-        rsi_ctx=rsi_ma_context(df_closed),
-        footprint=footprint,
-        ema_ctx=ema_ctx,
-    )
+    mode_data = decide_strategy_mode_enhanced(df, 
+                                   adx=votes["ind"].get("adx"),
+                                   di_plus=votes["ind"].get("plus_di"),
+                                   di_minus=votes["ind"].get("minus_di"),
+                                   rsi_ctx=rsi_ma_context(df),
+                                   footprint=footprint,
+                                   ema_ctx=ema_ctx)
     
     mode = mode_data["mode"]
     gz = snap["gz"]
@@ -2007,10 +2195,9 @@ def open_market_enhanced(side, qty, price):
     success = execute_trade_decision(side, price, qty, mode, votes, gz)
     
     if success:
+        # نحسب قوة الإشارة
         side_label = "long" if side == "buy" else "short"
-
-        # قوة الإشارة على الشمعة المغلقة
-        signal_strength = calculate_signal_strength(df_closed, votes["ind"], side_label)
+        signal_strength = calculate_signal_strength(df, votes["ind"], side_label)
         
         # نحدّد Profile جني الأرباح (سكالب خفيف / نص ترند / ترند قوي)
         trade_profile = classify_trade_profile(signal_strength, mode)
@@ -2678,7 +2865,7 @@ def sync_manual_close():
 
 # =================== ENHANCED TRADE LOOP ===================
 def trade_loop_enhanced():
-    """حلقة تداول محسنة مع Golden Zone Pro وSmart Profit AI وVWAP وOTC Detection وEMA Cross + Risk Guards"""
+    """حلقة تداول محسنة مع Golden Zone Pro وSmart Profit AI وVWAP وOTC Detection وEMA Cross + Risk Guards + KH SMC"""
     global wait_for_next_signal_side
     loop_i = 0
     
@@ -2694,32 +2881,22 @@ def trade_loop_enhanced():
             bal = balance_usdt()
             px = price_now()
             df = fetch_ohlcv()
-            
-            # نشتغل بالـ df_closed لكل التحليل/القراءة
-            df_closed = get_closed_df(df)
-
-            # RF على الشمعة المغلقة
-            info = rf_signal_live(df_closed)
-
-            # المؤشرات على الشمعة المغلقة
-            ind = compute_indicators(df_closed)
-
+            info = rf_signal_live(df)
+            ind = compute_indicators(df)
             spread_bps = orderbook_spread_bps()
             
-            # Enhanced Snapshots (كل حاجة جوه snapshot على الشمعة المغلقة)
-            snap = emit_snapshots(
-                ex, SYMBOL, df_closed,
-                balance_fn=lambda: float(bal) if bal else None,
-                pnl_fn=lambda: float(compound_pnl),
-            )
-
+            # Enhanced Snapshots
+            snap = emit_snapshots(ex, SYMBOL, df,
+                                balance_fn=lambda: float(bal) if bal else None,
+                                pnl_fn=lambda: float(compound_pnl))
+            
             # تحديث حالة الربح/الخسارة
             if STATE["open"] and px:
                 STATE["pnl"] = (px-STATE["entry"])*STATE["qty"] if STATE["side"]=="long" else (STATE["entry"]-px)*STATE["qty"]
             
             # إدارة الصفقة المفتوحة مع Smart Profit AI + Hard Stop
             if STATE["open"]:
-                manage_after_entry_enhanced(df_closed, ind, {
+                manage_after_entry_enhanced(df, ind, {
                     "price": px or info["price"], 
                     "bm": snap["bm"],
                     "flow": snap["flow"],
@@ -2731,11 +2908,21 @@ def trade_loop_enhanced():
             if spread_bps is not None and spread_bps > MAX_SPREAD_BPS:
                 reason = f"spread too high ({fmt(spread_bps,2)}bps > {MAX_SPREAD_BPS})"
             
-            council_data = council_votes_pro_enhanced(df_closed)
+            council_data = council_votes_pro_enhanced(df)
             gz = council_data.get("gz")
             footprint = council_data.get("footprint", {})
             otc = council_data.get("otc", {})
             ema_ctx = council_data.get("ema", {})
+            kh_ctx = council_data.get("kh", {})
+            
+            # KH Logging
+            log_i(
+                f"[KH] trend={kh_ctx.get('trend')} "
+                f"bos={kh_ctx.get('bos')} "
+                f"buy_zone={kh_ctx.get('buy_zone')} "
+                f"sell_zone={kh_ctx.get('sell_zone')}"
+            )
+            
             sig = None
 
             # ===== POST-BIG-WIN FILTER =====
@@ -2813,11 +3000,11 @@ def trade_loop_enhanced():
             if not STATE["open"] and sig and reason is None:
                 # تحديد نمط الصفقة (scalp / trend)
                 mode_ctx = decide_strategy_mode_enhanced(
-                    df_closed,
+                    df,
                     adx=council_data["ind"].get("adx"),
                     di_plus=council_data["ind"].get("plus_di"),
                     di_minus=council_data["ind"].get("minus_di"),
-                    rsi_ctx=rsi_ma_context(df_closed),
+                    rsi_ctx=rsi_ma_context(df),
                     footprint=footprint,
                     ema_ctx=ema_ctx,
                 )
@@ -2826,7 +3013,7 @@ def trade_loop_enhanced():
                 # ✅ حارس اتجاه السكالب
                 side_label = "long" if sig == "buy" else "short"
                 side_label, skip_scalp = enforce_scalp_trend_alignment(
-                    df_closed,
+                    df,
                     council_data["ind"],
                     side_label,
                     mode_ctx,
@@ -2839,7 +3026,7 @@ def trade_loop_enhanced():
                 # تحديث السيجنال بعد التعديل
                 sig = "buy" if side_label == "long" else "sell"
                 
-                allow_wait, wait_reason = wait_gate_allow(df_closed, info)
+                allow_wait, wait_reason = wait_gate_allow(df, info)
                 if not allow_wait:
                     reason = wait_reason
                 else:
@@ -2852,6 +3039,8 @@ def trade_loop_enhanced():
                             entry_type = "GOLDEN" if golden_entry else "OTC" if otc.get("otc_buy") or otc.get("otc_sell") else "COUNCIL"
                             if ema_label in ("strong_bull", "strong_bear"):
                                 entry_type = f"EMA_STRONG_{entry_type}"
+                            if kh_ctx.get("bos") != "none":
+                                entry_type = f"KH_{kh_ctx.get('bos')}_{entry_type}"
                             log_i(f"🎯 ENHANCED {entry_type} DECISION: {sig.upper()} | "
                                   f"Score B/S: {council_data['score_b']:.1f}/{council_data['score_s']:.1f} | "
                                   f"Signal Strength: {STATE.get('signal_strength', 0):.1f}")
@@ -2888,7 +3077,7 @@ def pretty_snapshot(bal, info, ind, spread_bps, reason=None, df=None):
         print("📈 INDICATORS & RF")
         print(f"   💲 Price {fmt(info.get('price'))} | RF filt={fmt(info.get('filter'))}  hi={fmt(info.get('hi'))} lo={fmt(info.get('lo'))}")
         print(f"   🧮 RSI={fmt(ind.get('rsi'))}  +DI={fmt(ind.get('plus_di'))}  -DI={fmt(ind.get('minus_di'))}  ADX={fmt(ind.get('adx'))}  ATR={fmt(ind.get('atr'))}")
-        print(f"   🎯 ENTRY: COUNCIL PRO + GOLDEN ENTRY + VWAP STRATEGY + OTC DETECTION + EMA CROSSOVER ENGINE  |  spread_bps={fmt(spread_bps,2)}")
+        print(f"   🎯 ENTRY: COUNCIL PRO + GOLDEN ENTRY + VWAP STRATEGY + OTC DETECTION + EMA CROSSOVER ENGINE + KH SMC  |  spread_bps={fmt(spread_bps,2)}")
         print(f"   ⏱️ closes_in ≈ {left_s}s")
         
         # عرض معلومات الـ Guards
@@ -2924,7 +3113,7 @@ app = Flask(__name__)
 @app.route("/")
 def home():
     mode='LIVE' if MODE_LIVE else 'PAPER'
-    return f"✅ Council PRO Bot — {SYMBOL} {INTERVAL} — {mode} — Enhanced Candles + Golden Zone Pro + Smart Profit AI + VWAP Strategy + OTC Detection + EMA Crossover Engine + Hard Stop Loss + Post-Big-Win Guard + Auto-Recovery"
+    return f"✅ Council PRO Bot — {SYMBOL} {INTERVAL} — {mode} — Enhanced Candles + Golden Zone Pro + Smart Profit AI + VWAP Strategy + OTC Detection + EMA Crossover Engine + Hard Stop Loss + Post-Big-Win Guard + Auto-Recovery + KH SMC Module"
 
 @app.route("/metrics")
 def metrics():
@@ -2932,7 +3121,7 @@ def metrics():
         "symbol": SYMBOL, "interval": INTERVAL, "mode": "live" if MODE_LIVE else "paper",
         "leverage": LEVERAGE, "risk_alloc": RISK_ALLOC, "price": price_now(),
         "state": STATE, "compound_pnl": compound_pnl,
-        "entry_mode": "COUNCIL_PRO_GOLDEN_ENHANCED_VWAP_OTC_EMA", "wait_for_next_signal": wait_for_next_signal_side,
+        "entry_mode": "COUNCIL_PRO_GOLDEN_ENHANCED_VWAP_OTC_EMA_KH", "wait_for_next_signal": wait_for_next_signal_side,
         "risk_guards": {
             "hard_stop_pct": abs(MAX_LOSS_PCT)*100,
             "big_win_pct": BIG_WIN_PCT*100,
@@ -2957,6 +3146,11 @@ def metrics():
             "mid_period": 21,
             "slow_period": 50
         },
+        "kh_smc": {
+            "enabled": True,
+            "left_bars": 3,
+            "right_bars": 3
+        },
         "current_guards": {
             "post_big_win_active": STATE.get("post_big_win_mode", False),
             "post_big_win_bars_left": STATE.get("post_big_win_bars_left", 0),
@@ -2971,7 +3165,7 @@ def health():
         "ok": True, "mode": "live" if MODE_LIVE else "paper",
         "open": STATE["open"], "side": STATE["side"], "qty": STATE["qty"],
         "compound_pnl": compound_pnl, "timestamp": datetime.utcnow().isoformat(),
-        "entry_mode": "COUNCIL_PRO_GOLDEN_ENHANCED_VWAP_OTC_EMA", "wait_for_next_signal": wait_for_next_signal_side,
+        "entry_mode": "COUNCIL_PRO_GOLDEN_ENHANCED_VWAP_OTC_EMA_KH", "wait_for_next_signal": wait_for_next_signal_side,
         "risk_guards": {
             "hard_stop_active": STATE.get("max_loss_price") is not None,
             "post_big_win_active": STATE.get("post_big_win_mode", False)
@@ -3015,6 +3209,7 @@ if __name__ == "__main__":
     print(colored(f"SMART PROFIT AI: Dynamic profit taking + Signal strength", "yellow"))
     print(colored(f"VWAP STRATEGY: SCALP(near {VWAP_SCALP_BAND_BPS}bps) | TREND(far {VWAP_TREND_BAND_BPS}bps)", "yellow"))
     print(colored(f"EMA CROSSOVER ENGINE: Strong/Weak Trend Detection (9/21/50)", "yellow"))
+    print(colored(f"📦 KH SMC MODULE: ChoCH / BOS / Buy-KH / Sell-KH Zones", "cyan"))
     print(colored(f"🛡️ RISK GUARDS: Hard Stop Loss (-{abs(MAX_LOSS_PCT)*100}%) | Post-Big-Win Guard (+{BIG_WIN_PCT*100}%)", "red"))
     print(colored(f"🔄 AUTO RECOVERY: Enhanced position sync on restart", "green"))
     print(colored(f"🔄 MANUAL CLOSE SYNC: Enabled (detects manual close from exchange)", "green"))
