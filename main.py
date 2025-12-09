@@ -11,6 +11,7 @@ RF Futures Bot — RF-LIVE ONLY (BingX Perp via CCXT)
 • EMA Crossover Strength Engine (Strong/Weak Trend Detection)
 • ENHANCED WITH: Hard Stop Loss, Post-Big-Win Guard, Auto-Recovery
 • ADDED: KH SMC Module (ChoCH / BOS / Buy-KH / Sell-KH Zones)
+• ADDED: STRONG ZONE FILTER - Strong-Trend Only Entries
 """
 
 import os, time, math, random, signal, sys, traceback, logging, json
@@ -45,7 +46,7 @@ SHADOW_MODE_DASHBOARD = False
 DRY_RUN = False
 
 # ==== Addon: Logging + Recovery Settings ====
-BOT_VERSION = "DOGE Council PRO v5.0 — Smart Profit AI + Golden Zone Pro + VWAP Strategy + OTC Detection + EMA Crossover Engine + Hard Stop + Post-Big-Win Guard + Auto-Recovery + KH SMC Module"
+BOT_VERSION = "DOGE Council PRO v5.0 — Smart Profit AI + Golden Zone Pro + VWAP Strategy + OTC Detection + EMA Crossover Engine + Hard Stop + Post-Big-Win Guard + Auto-Recovery + KH SMC Module + Strong Zone Filter"
 print("🔁 Booting:", BOT_VERSION, flush=True)
 
 STATE_PATH = "./bot_state.json"
@@ -207,6 +208,61 @@ def load_state() -> dict:
     except Exception as e:
         log_w(f"state load failed: {e}")
     return {}
+
+# ============================================
+#   STRONG ZONE FILTER (BUY / SELL)
+#   لازم كل صفقة تعدّي من هنا
+# ============================================
+
+def is_strong_buy_zone(analysis: dict) -> bool:
+    """قاع قوي: Golden أو Demand Box + فوليوم/Flow محترم"""
+    golden = (analysis.get("golden_zone") or {}).get("type") == "golden_bottom"
+
+    smc_ctx = analysis.get("smc_ctx") or {}
+    # بوكس طلب / Order Block Buy
+    smc_box_buy = False
+    if smc_ctx.get("order_block_entry_side") == "BUY":
+        smc_box_buy = True
+    if smc_ctx.get("best_box_side") == "BUY":
+        smc_box_buy = True
+    if smc_ctx.get("demand_box_active") is True:
+        smc_box_buy = True
+
+    # فوليوم / Flow
+    flow_ctx = analysis.get("flow_ctx") or {}
+    big_buyers = flow_ctx.get("big_buyers", False) or flow_ctx.get("pressure_side") == "BUY"
+
+    evx_ctx = analysis.get("evx") or {}
+    evx_score_buy = float(evx_ctx.get("score_buy", 0.0))
+
+    vol_ok = big_buyers or evx_score_buy >= 1.0 or analysis.get("volume_spike_buy", False)
+
+    return (golden or smc_box_buy) and vol_ok
+
+
+def is_strong_sell_zone(analysis: dict) -> bool:
+    """قمة قوية: Golden أو Supply Box + فوليوم/Flow محترم"""
+    golden = (analysis.get("golden_zone") or {}).get("type") == "golden_top"
+
+    smc_ctx = analysis.get("smc_ctx") or {}
+    # بوكس عرض / Order Block Sell
+    smc_box_sell = False
+    if smc_ctx.get("order_block_entry_side") == "SELL":
+        smc_box_sell = True
+    if smc_ctx.get("best_box_side") == "SELL":
+        smc_box_sell = True
+    if smc_ctx.get("supply_box_active") is True:
+        smc_box_sell = True
+
+    flow_ctx = analysis.get("flow_ctx") or {}
+    big_sellers = flow_ctx.get("big_sellers", False) or flow_ctx.get("pressure_side") == "SELL"
+
+    evx_ctx = analysis.get("evx") or {}
+    evx_score_sell = float(evx_ctx.get("score_sell", 0.0))
+
+    vol_ok = big_sellers or evx_score_sell >= 1.0 or analysis.get("volume_spike_sell", False)
+
+    return (golden or smc_box_sell) and vol_ok
 
 # =================== ENHANCED CANDLES MODULE WITH SMC ===================
 def _body(o,c): return abs(c-o)
@@ -656,6 +712,7 @@ def verify_execution_environment():
     print(f"📈 EMA CROSSOVER ENGINE: Strong/Weak Trend Detection", flush=True)
     print(f"🛡️ RISK GUARDS: Hard Stop Loss (-{abs(MAX_LOSS_PCT)*100}%) | Post-Big-Win Guard (+{BIG_WIN_PCT*100}%)", flush=True)
     print(f"📦 KH SMC MODULE: ChoCH / BOS / Buy-KH / Sell-KH Zones", flush=True)
+    print(f"🎯 STRONG ZONE FILTER: Strong-Trend Only Entries (Golden Zones / Order Blocks + Volume)", flush=True)
     
     if not EXECUTE_ORDERS:
         print("🟡 WARNING: EXECUTE_ORDERS=False - البوت في وضع التحليل فقط!", flush=True)
@@ -2636,9 +2693,46 @@ def smart_exit_guard(state, df, ind, flow, bm, now_price, pnl_pct, mode, side, e
         "log": None
     }
 
+# =================== TREND GUARD (PRO) ===================
+def update_trend_guard(state, ind, current_price):
+    """
+    تحديث حارس الترند الذي يمنع الإغلاق المبكر في الترندات القوية
+    """
+    adx_now = float(ind.get("adx", 0.0))
+    di_spread = float(ind.get("di_spread", 0.0))
+    
+    # الحصول على أو إنشاء حارس الترند
+    trend_guard = state.setdefault("trend_guard", {
+        "adx_peak": adx_now,
+        "max_profit_pct": 0.0,
+        "phase": "launch",   # launch / expansion / mature / exhaustion
+    })
+    
+    # تحديث القمم
+    if state.get("pnl", 0.0) > trend_guard["max_profit_pct"]:
+        trend_guard["max_profit_pct"] = state.get("pnl", 0.0)
+    
+    if adx_now > trend_guard["adx_peak"]:
+        trend_guard["adx_peak"] = adx_now
+    
+    # تصنيف مرحلة الترند
+    if adx_now >= 35:
+        phase = "mature"
+    elif adx_now >= 25:
+        phase = "expansion"
+    elif adx_now >= 18:
+        phase = "launch"
+    else:
+        phase = "weak"
+    
+    trend_guard["phase"] = phase
+    state["trend_guard"] = trend_guard
+    
+    return trend_guard
+
 # =================== ENHANCED TRADE MANAGEMENT ===================
 def manage_after_entry_enhanced(df, ind, info):
-    """إدارة محسنة للمركز مع Smart Profit AI + Smart Exit Guard + Hard Stop"""
+    """إدارة محسنة للمركز مع Smart Profit AI + Smart Exit Guard + Hard Stop + Trend Guard"""
     if not STATE["open"] or STATE["qty"] <= 0:
         return
 
@@ -2671,6 +2765,10 @@ def manage_after_entry_enhanced(df, ind, info):
     if pnl_pct > STATE.get("highest_profit_pct", 0.0):
         STATE["highest_profit_pct"] = pnl_pct
 
+    # ========= TREND GUARD (PRO) =========
+    trend_guard = update_trend_guard(STATE, ind, px)
+    drawdown = trend_guard["max_profit_pct"] - STATE.get("pnl", 0.0)
+    
     # ========= Smart Profit AI (سلم جني الأرباح الذكي) =========
     profit_decision = smart_profit_ai_decision(STATE, df, ind, mode, side, entry, px)
     
@@ -2714,6 +2812,11 @@ def manage_after_entry_enhanced(df, ind, info):
         max_pnl = STATE.get("highest_profit_pct", 0.0)
         targets_done = STATE.get("profit_targets_achieved", 0)
         side_txt = "BUY" if side == "long" else "SELL"
+        
+        # معلومات Trend Guard
+        trend_phase = trend_guard.get("phase", "unknown")
+        adx_peak = trend_guard.get("adx_peak", 0.0)
+        adx_now = float(ind.get("adx", 0.0))
 
         log_i(
             f"📊 POSITION STATUS | {side_txt} | mode={mode} | "
@@ -2723,6 +2826,10 @@ def manage_after_entry_enhanced(df, ind, info):
             f"   PnL={pnl_pct:.2f}% (max={max_pnl:.2f}%) | TP_done={targets_done} | "
             f"plan: TP1≈{tp1_pct:.2f}% / BE@{be_activate_pct:.2f}% / "
             f"TRAIL@{trail_activate_pct:.2f}% ATR×{atr_trail_mult:.2f}"
+        )
+        log_i(
+            f"   📈 TREND GUARD | phase={trend_phase} | ADX={adx_now:.1f} (peak={adx_peak:.1f}) | "
+            f"drawdown={drawdown:.2f}%"
         )
 
     # ========= الإدارة الكلاسيك (TP1 + BE + Trail + Dust) =========
@@ -2816,19 +2923,37 @@ def manage_after_entry_enhanced(df, ind, info):
         guard = None
 
     if guard and guard.get("action") != "hold":
-        if guard.get("log"):
-            log_w(guard["log"])
-        act = guard["action"]
+        allow_close = True
+        reason = guard.get("why", "")
 
-        # إحكام التريل عند إجهاد / جدار / تدفق معاكس
-        if act == "tighten":
-            STATE["trail_tightened"] = True
+        # 🛡️ Trend Guardian Override
+        if (
+            STATE.get("trade_profile") == "STRONG_TREND"
+            and trend_guard["phase"] in ("expansion", "mature")
+            and drawdown <= 0.6
+            and reason in ("hard_close_signal", "wick_exhaustion")
+        ):
+            log_i(
+                f"🛡️ TREND GUARD OVERRIDE | "
+                f"ADX={ind.get('adx', 0):.1f} phase={trend_guard['phase']} "
+                f"drawdown={drawdown:.2f}% → HOLD TRADE"
+            )
+            allow_close = False
 
-        # إغلاق صارم عند Golden Reversal أو Hard Close أو OTC Reversal
-        elif act == "close":
-            close_market_strict(guard.get("why", "smart_exit_guard"))
-            return
-        # متعمدين نتجاهل "partial" هنا عشان ما نعملش TP1 مزدوج (Smart AI + Guard)
+        if allow_close:
+            if guard.get("log"):
+                log_w(guard["log"])
+            act = guard["action"]
+
+            # إحكام التريل عند إجهاد / جدار / تدفق معاكس
+            if act == "tighten":
+                STATE["trail_tightened"] = True
+
+            # إغلاق صارم عند Golden Reversal أو Hard Close أو OTC Reversal
+            elif act == "close":
+                close_market_strict(guard.get("why", "smart_exit_guard"))
+                return
+            # متعمدين نتجاهل "partial" هنا عشان ما نعملش TP1 مزدوج (Smart AI + Guard)
 
 # =================== MANUAL CLOSE SYNC FUNCTION ===================
 def sync_manual_close():
@@ -2865,7 +2990,7 @@ def sync_manual_close():
 
 # =================== ENHANCED TRADE LOOP ===================
 def trade_loop_enhanced():
-    """حلقة تداول محسنة مع Golden Zone Pro وSmart Profit AI وVWAP وOTC Detection وEMA Cross + Risk Guards + KH SMC"""
+    """حلقة تداول محسنة مع Golden Zone Pro وSmart Profit AI وVWAP وOTC Detection وEMA Cross + Risk Guards + KH SMC + Strong Zone Filter"""
     global wait_for_next_signal_side
     loop_i = 0
     
@@ -2894,7 +3019,7 @@ def trade_loop_enhanced():
             if STATE["open"] and px:
                 STATE["pnl"] = (px-STATE["entry"])*STATE["qty"] if STATE["side"]=="long" else (STATE["entry"]-px)*STATE["qty"]
             
-            # إدارة الصفقة المفتوحة مع Smart Profit AI + Hard Stop
+            # إدارة الصفقة المفتوحة مع Smart Profit AI + Hard Stop + Trend Guard
             if STATE["open"]:
                 manage_after_entry_enhanced(df, ind, {
                     "price": px or info["price"], 
@@ -2931,28 +3056,46 @@ def trade_loop_enhanced():
                 if STATE["post_big_win_bars_left"] > 0:
                     log_i(f"🛡️ POST-BIG-WIN MODE ACTIVE: {STATE['post_big_win_bars_left']} bars remaining - Applying strict filters")
 
+            # ===== STRONG ZONE ANALYSIS =====
+            # بناء analysis dictionary للفلتر
+            analysis = {
+                "golden_zone": gz,
+                "smc_ctx": kh_ctx,  # نستخدم KH context للـ SMC boxes
+                "flow_ctx": footprint,
+                "evx": {},  # Placeholder - يمكن إضافة EVX لاحقًا
+                "volume_spike_buy": footprint.get('volume_spike') and footprint.get('delta', 0) > 0,
+                "volume_spike_sell": footprint.get('volume_spike') and footprint.get('delta', 0) < 0,
+            }
+            
+            strong_buy_zone = is_strong_buy_zone(analysis)
+            strong_sell_zone = is_strong_sell_zone(analysis)
+
             # --- Enhanced Golden Entry Pro ---
             golden_entry = False
             if (gz and gz.get("ok") and gz.get("confirmed")):
                 if gz["zone"]["type"]=="golden_bottom" and gz["score"]>=GOLDEN_ENTRY_SCORE:
                     if footprint.get('ok') and footprint.get('absorption_bull'):
-                        sig = "buy"
-                        golden_entry = True
-                        log_i(f"🎯 GOLDEN ENTRY PRO: BUY | score={gz['score']:.1f} | منطقة ذهبية مؤكدة + Footprint")
+                        if strong_buy_zone:
+                            sig = "buy"
+                            golden_entry = True
+                            log_i(f"🎯 GOLDEN ENTRY PRO: BUY | score={gz['score']:.1f} | منطقة ذهبية مؤكدة + Footprint + Strong Zone")
                 elif gz["zone"]["type"]=="golden_top" and gz["score"]>=GOLDEN_ENTRY_SCORE:
                     if footprint.get('ok') and footprint.get('absorption_bear'):
-                        sig = "sell"
-                        golden_entry = True
-                        log_i(f"🎯 GOLDEN ENTRY PRO: SELL | score={gz['score']:.1f} | منطقة ذهبية مؤكدة + Footprint")
+                        if strong_sell_zone:
+                            sig = "sell"
+                            golden_entry = True
+                            log_i(f"🎯 GOLDEN ENTRY PRO: SELL | score={gz['score']:.1f} | منطقة ذهبية مؤكدة + Footprint + Strong Zone")
 
             # --- OTC Enhanced Entry ---
             if not golden_entry and otc:
                 if otc.get("otc_buy") and otc.get("strength", 0) >= 2.0:
-                    sig = "buy"
-                    log_i(f"💰 OTC ENTRY: BUY | strength={otc.get('strength',0):.1f} | سيولة شراء مخفية قوية")
+                    if strong_buy_zone:
+                        sig = "buy"
+                        log_i(f"💰 OTC ENTRY: BUY | strength={otc.get('strength',0):.1f} | سيولة شراء مخفية قوية + Strong Zone")
                 elif otc.get("otc_sell") and otc.get("strength", 0) >= 2.0:
-                    sig = "sell"
-                    log_i(f"💰 OTC ENTRY: SELL | strength={otc.get('strength',0):.1f} | سيولة بيع مخفية قوية")
+                    if strong_sell_zone:
+                        sig = "sell"
+                        log_i(f"💰 OTC ENTRY: SELL | strength={otc.get('strength',0):.1f} | سيولة بيع مخفية قوية + Strong Zone")
 
             # --- Council Strong Entry مع تخفيف احترافي للتقاطع القوي ---
             if not golden_entry and not sig:
@@ -2992,10 +3135,26 @@ def trade_loop_enhanced():
                         sell_ok = True
                         log_i(f"✅ SELL by Council(7.x) + EMA STRONG BEAR ({sell_score:.1f})")
 
-                if buy_ok:
+                if buy_ok and strong_buy_zone:
                     sig = "buy"
-                elif sell_ok:
+                elif sell_ok and strong_sell_zone:
                     sig = "sell"
+                    
+                # إضافة لوج في حالة عدم وجود strong zone
+                if buy_ok and not strong_buy_zone:
+                    log_i(f"🛑 [ENTRY BLOCKED] BUY weak zone | strong_buy_zone=False | score={buy_score:.1f}")
+                if sell_ok and not strong_sell_zone:
+                    log_i(f"🛑 [ENTRY BLOCKED] SELL weak zone | strong_sell_zone=False | score={sell_score:.1f}")
+            
+            # ===== STRONG ZONE GUARD FINAL CHECK =====
+            if sig == "buy" and not strong_buy_zone:
+                reason = f"skip_buy_weak_zone | strong_buy_zone=False"
+                log_i(f"[ENTRY BLOCKED] BUY weak zone | {reason}")
+                sig = None
+            elif sig == "sell" and not strong_sell_zone:
+                reason = f"skip_sell_weak_zone | strong_sell_zone=False"
+                log_i(f"[ENTRY BLOCKED] SELL weak zone | {reason}")
+                sig = None
             
             if not STATE["open"] and sig and reason is None:
                 # تحديد نمط الصفقة (scalp / trend)
@@ -3041,9 +3200,13 @@ def trade_loop_enhanced():
                                 entry_type = f"EMA_STRONG_{entry_type}"
                             if kh_ctx.get("bos") != "none":
                                 entry_type = f"KH_{kh_ctx.get('bos')}_{entry_type}"
+                            if strong_buy_zone or strong_sell_zone:
+                                entry_type = f"STRONG_ZONE_{entry_type}"
+                                
                             log_i(f"🎯 ENHANCED {entry_type} DECISION: {sig.upper()} | "
                                   f"Score B/S: {council_data['score_b']:.1f}/{council_data['score_s']:.1f} | "
-                                  f"Signal Strength: {STATE.get('signal_strength', 0):.1f}")
+                                  f"Signal Strength: {STATE.get('signal_strength', 0):.1f} | "
+                                  f"Strong Zone: {'BUY' if strong_buy_zone else 'SELL' if strong_sell_zone else 'NONE'}")
                             for log_msg in council_data.get("logs", []):
                                 log_i(f"   - {log_msg}")
                     else:
@@ -3077,7 +3240,7 @@ def pretty_snapshot(bal, info, ind, spread_bps, reason=None, df=None):
         print("📈 INDICATORS & RF")
         print(f"   💲 Price {fmt(info.get('price'))} | RF filt={fmt(info.get('filter'))}  hi={fmt(info.get('hi'))} lo={fmt(info.get('lo'))}")
         print(f"   🧮 RSI={fmt(ind.get('rsi'))}  +DI={fmt(ind.get('plus_di'))}  -DI={fmt(ind.get('minus_di'))}  ADX={fmt(ind.get('adx'))}  ATR={fmt(ind.get('atr'))}")
-        print(f"   🎯 ENTRY: COUNCIL PRO + GOLDEN ENTRY + VWAP STRATEGY + OTC DETECTION + EMA CROSSOVER ENGINE + KH SMC  |  spread_bps={fmt(spread_bps,2)}")
+        print(f"   🎯 ENTRY: COUNCIL PRO + GOLDEN ENTRY + VWAP STRATEGY + OTC DETECTION + EMA CROSSOVER ENGINE + KH SMC + STRONG ZONE FILTER  |  spread_bps={fmt(spread_bps,2)}")
         print(f"   ⏱️ closes_in ≈ {left_s}s")
         
         # عرض معلومات الـ Guards
@@ -3113,7 +3276,7 @@ app = Flask(__name__)
 @app.route("/")
 def home():
     mode='LIVE' if MODE_LIVE else 'PAPER'
-    return f"✅ Council PRO Bot — {SYMBOL} {INTERVAL} — {mode} — Enhanced Candles + Golden Zone Pro + Smart Profit AI + VWAP Strategy + OTC Detection + EMA Crossover Engine + Hard Stop Loss + Post-Big-Win Guard + Auto-Recovery + KH SMC Module"
+    return f"✅ Council PRO Bot — {SYMBOL} {INTERVAL} — {mode} — Enhanced Candles + Golden Zone Pro + Smart Profit AI + VWAP Strategy + OTC Detection + EMA Crossover Engine + Hard Stop Loss + Post-Big-Win Guard + Auto-Recovery + KH SMC Module + Strong Zone Filter"
 
 @app.route("/metrics")
 def metrics():
@@ -3121,7 +3284,7 @@ def metrics():
         "symbol": SYMBOL, "interval": INTERVAL, "mode": "live" if MODE_LIVE else "paper",
         "leverage": LEVERAGE, "risk_alloc": RISK_ALLOC, "price": price_now(),
         "state": STATE, "compound_pnl": compound_pnl,
-        "entry_mode": "COUNCIL_PRO_GOLDEN_ENHANCED_VWAP_OTC_EMA_KH", "wait_for_next_signal": wait_for_next_signal_side,
+        "entry_mode": "COUNCIL_PRO_GOLDEN_ENHANCED_VWAP_OTC_EMA_KH_STRONG_ZONE", "wait_for_next_signal": wait_for_next_signal_side,
         "risk_guards": {
             "hard_stop_pct": abs(MAX_LOSS_PCT)*100,
             "big_win_pct": BIG_WIN_PCT*100,
@@ -3151,11 +3314,16 @@ def metrics():
             "left_bars": 3,
             "right_bars": 3
         },
+        "strong_zone_filter": {
+            "enabled": True,
+            "description": "BUY/SELL only from Golden Zones or Order Blocks with strong volume"
+        },
         "current_guards": {
             "post_big_win_active": STATE.get("post_big_win_mode", False),
             "post_big_win_bars_left": STATE.get("post_big_win_bars_left", 0),
             "hard_stop_price": STATE.get("max_loss_price"),
-            "last_closed_pnl_pct": STATE.get("last_closed_pnl_pct", 0.0)
+            "last_closed_pnl_pct": STATE.get("last_closed_pnl_pct", 0.0),
+            "trend_guard_active": STATE.get("trend_guard", {}).get("phase", "none") in ("expansion", "mature")
         }
     })
 
@@ -3165,10 +3333,11 @@ def health():
         "ok": True, "mode": "live" if MODE_LIVE else "paper",
         "open": STATE["open"], "side": STATE["side"], "qty": STATE["qty"],
         "compound_pnl": compound_pnl, "timestamp": datetime.utcnow().isoformat(),
-        "entry_mode": "COUNCIL_PRO_GOLDEN_ENHANCED_VWAP_OTC_EMA_KH", "wait_for_next_signal": wait_for_next_signal_side,
+        "entry_mode": "COUNCIL_PRO_GOLDEN_ENHANCED_VWAP_OTC_EMA_KH_STRONG_ZONE", "wait_for_next_signal": wait_for_next_signal_side,
         "risk_guards": {
             "hard_stop_active": STATE.get("max_loss_price") is not None,
-            "post_big_win_active": STATE.get("post_big_win_mode", False)
+            "post_big_win_active": STATE.get("post_big_win_mode", False),
+            "trend_guard_active": STATE.get("trend_guard", {}).get("phase", "none") in ("expansion", "mature")
         }
     }), 200
 
@@ -3210,7 +3379,8 @@ if __name__ == "__main__":
     print(colored(f"VWAP STRATEGY: SCALP(near {VWAP_SCALP_BAND_BPS}bps) | TREND(far {VWAP_TREND_BAND_BPS}bps)", "yellow"))
     print(colored(f"EMA CROSSOVER ENGINE: Strong/Weak Trend Detection (9/21/50)", "yellow"))
     print(colored(f"📦 KH SMC MODULE: ChoCH / BOS / Buy-KH / Sell-KH Zones", "cyan"))
-    print(colored(f"🛡️ RISK GUARDS: Hard Stop Loss (-{abs(MAX_LOSS_PCT)*100}%) | Post-Big-Win Guard (+{BIG_WIN_PCT*100}%)", "red"))
+    print(colored(f"🎯 STRONG ZONE FILTER: Strong-Trend Only Entries (Golden Zones / Order Blocks + Volume)", "green"))
+    print(colored(f"🛡️ RISK GUARDS: Hard Stop Loss (-{abs(MAX_LOSS_PCT)*100}%) | Post-Big-Win Guard (+{BIG_WIN_PCT*100}%) | Trend Guardian", "red"))
     print(colored(f"🔄 AUTO RECOVERY: Enhanced position sync on restart", "green"))
     print(colored(f"🔄 MANUAL CLOSE SYNC: Enabled (detects manual close from exchange)", "green"))
     print(colored(f"EXECUTION: {'ACTIVE' if EXECUTE_ORDERS and not DRY_RUN else 'SIMULATION'}", "yellow"))
