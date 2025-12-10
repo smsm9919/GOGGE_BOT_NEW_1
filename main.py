@@ -1136,9 +1136,13 @@ def smart_profit_ai_decision(state, df, ind, mode, side, entry_price, current_pr
     next_target_pct = tp_levels[next_target_index]
     next_target_fraction = tp_fractions[next_target_index]
     
-    # لو ما فيش signal_strength في الـ STATE لأي سبب، نحسبه احتياطيًا
-    if signal_strength <= 0.0:
-        signal_strength = calculate_signal_strength(df, ind, side)
+    # نحسب قوة الإشارة باستخدام الدالة المحسنة
+    rsi_ctx = rsi_ma_context(df)
+    footprint = compute_footprint_metrics(df)
+    ema_ctx = ema_crossover_strength(df, ind)
+    gz = ind.get("gz", {})
+    
+    signal_strength = calculate_signal_strength(side, df, ind, rsi_ctx, footprint, ema_ctx, gz)
     
     # تعديل الأهداف حسب قوة الإشارة (Fine Tuning جوه الـ Profile)
     if signal_strength >= 8.0:
@@ -1175,65 +1179,439 @@ def smart_profit_ai_decision(state, df, ind, mode, side, entry_price, current_pr
         ),
     }
 
-def calculate_signal_strength(df, ind, side):
-    """حساب قوة الإشارة للتداول"""
+# ================== ADX + ATR BEHAVIOR MONITOR ==================
+def update_adx_atr_cycle(side: str, adx: float, plus_di: float, minus_di: float, atr_mult: float, price: float):
+    """
+    يراقب سلوك ADX + ATR عبر الزمن:
+      - يسجّل هيستوري ADX/ATR/Price
+      - يلتقط آخر قمة ADX قوية (peak) واتجاهها (UP/DOWN)
+      - يحدد المرحلة الحالية:
+          * compression/chop         → سوق نايم / تجميع ضعيف
+          * post_peak_cooling        → بعد ترند قوي، مرحلة تبريد / تجميع سيولة
+          * rebuild_after_cooling    → بداية انطلاق جديد بعد التبريد
+      - يرجّع dict فيه:
+          phase / last_peak_side / ok_for_long / ok_for_short
+    """
+    global STATE
+
+    try:
+        cycle = STATE.get("adx_atr_cycle") or {}
+    except NameError:
+        # لو STATE مش متعرف لأي سبب
+        cycle = {}
+
+    hist_adx   = cycle.get("hist_adx", [])
+    hist_atrm  = cycle.get("hist_atr_mult", [])
+    hist_price = cycle.get("hist_price", [])
+
+    adx = float(adx or 0.0)
+    atr_mult = float(atr_mult or 1.0)
+    price = float(price or 0.0)
+
+    # سجّل التاريخ
+    hist_adx.append(adx)
+    hist_atrm.append(atr_mult)
+    hist_price.append(price)
+
+    # قصّهم على آخر 80 قيمة فقط
+    if len(hist_adx) > 80:
+        hist_adx = hist_adx[-80:]
+        hist_atrm = hist_atrm[-80:]
+        hist_price = hist_price[-80:]
+
+    last_peak_adx   = float(cycle.get("last_peak_adx", 0.0) or 0.0)
+    last_peak_side  = cycle.get("last_peak_side", "none")  # "up"/"down"/"none"
+    phase           = cycle.get("phase", "unknown")
+
+    # --------- اكتشاف قمة ADX جديدة (peak) ----------
+    # peak = ADX عالي (>30) وكان طالع وبيعمل أعلى قيمة في آخر 10 قيَم
+    if len(hist_adx) >= 6:
+        prev1 = hist_adx[-2]
+        prev2 = hist_adx[-3]
+        window_max = max(hist_adx[-10:])
+        if adx >= 30 and adx >= window_max and adx > prev1 and prev1 > prev2:
+            last_peak_adx = adx
+            # اتجاه الترند وقت القمة
+            if plus_di > minus_di:
+                last_peak_side = "up"
+            elif minus_di > plus_di:
+                last_peak_side = "down"
+            else:
+                last_peak_side = "none"
+            phase = "peak"
+
+    # --------- تحديد المرحلة (phase) ----------
+    # 1) لو مفيش Peak متسجّل
+    if last_peak_adx <= 0.0:
+        if adx < 15 and atr_mult < 0.9:
+            phase = "compression"  # تجميع عام
+        elif 15 <= adx < 25:
+            phase = "build"        # بداية ترند
+        else:
+            phase = phase or "unknown"
+    else:
+        # عندنا قمة قديمة، نشوف إنا فين منها
+        # بعد القمة: لو ADX نزل جامد وبقى تحت 22 ومع atr_mult < 1 ⇒ تبريد/تجميع
+        if adx < last_peak_adx - 10 and adx < 22 and atr_mult <= 1.0:
+            phase = "post_peak_cooling"
+
+        # لو كنا في تبريد وبدأ ADX يطلع تاني (rebuild) ⇒ بداية انطلاق جديد
+        if phase == "post_peak_cooling" and len(hist_adx) >= 4:
+            if hist_adx[-1] > hist_adx[-2] > hist_adx[-3] and adx >= 18:
+                phase = "rebuild_after_cooling"
+
+        # لو ADX رجع فوق 30 تاني بعد rebuild ⇒ نعتبرها قمة جديدة
+        if phase == "rebuild_after_cooling" and adx >= 30:
+            last_peak_adx = adx
+            if plus_di > minus_di:
+                last_peak_side = "up"
+            elif minus_di > plus_di:
+                last_peak_side = "down"
+            else:
+                last_peak_side = "none"
+            phase = "peak"
+
+    # --------- اشتقاق ok_for_long / ok_for_short ----------
+    ok_for_long = True
+    ok_for_short = True
+
+    # في الوضع العادي نخليهم True، ونشدّ فقط في الحالات دي:
+    # Long:
+    #   - لو آخر قمة كانت ترند هابط (last_peak_side="down")
+    #   - و إحنا في rebuild_after_cooling ⇒ بداية ترند صاعد محتمل من تحت
+    if last_peak_side == "down":
+        if phase == "rebuild_after_cooling":
+            ok_for_long = True
+        elif phase in ("post_peak_cooling", "compression"):
+            # لسه تبريد / تجميع ⇒ نخليها محتملة بس أضعف
+            ok_for_long = True
+        elif phase == "peak":
+            # قمة ترند هابط قوية ⇒ تجنّب شراء سكالب ضعيف
+            if side == "buy":
+                ok_for_long = False
+
+    # Short:
+    #   - لو آخر قمة كانت ترند صاعد (last_peak_side="up")
+    #   - و إحنا في rebuild_after_cooling ⇒ بداية ترند هابط محتمل من فوق
+    if last_peak_side == "up":
+        if phase == "rebuild_after_cooling":
+            ok_for_short = True
+        elif phase in ("post_peak_cooling", "compression"):
+            ok_for_short = True
+        elif phase == "peak":
+            if side == "sell":
+                ok_for_short = False
+
+    # تخزين الحالة
+    cycle = {
+        "hist_adx": hist_adx,
+        "hist_atr_mult": hist_atrm,
+        "hist_price": hist_price,
+        "last_peak_adx": last_peak_adx,
+        "last_peak_side": last_peak_side,
+        "phase": phase,
+        "ok_for_long": ok_for_long,
+        "ok_for_short": ok_for_short,
+    }
+
+    try:
+        STATE["adx_atr_cycle"] = cycle
+    except Exception:
+        pass
+
+    return cycle
+
+# =================== CALCULATE SIGNAL STRENGTH ===================
+def calculate_signal_strength(side, df, ind, rsi_ctx=None, footprint=None, ema_ctx=None, gz=None):
+    """
+    Engine تجميع قوة الإشارة من:
+      ADX + ATR + DI + RSI Trend-Z + EMA Cross + MACD + Stoch + Footprint + Golden Zones.
+
+    يرجّع قيمة من 0 إلى 10:
+      - ضعيف  : ~0–3
+      - متوسط : ~3–7
+      - قوي   : ~7–10
+    """
+
+    side = (side or "").lower()  # "buy" / "sell"
+
+    # ---- قراءة المؤشرات الخام ----
+    rsi       = float(ind.get("rsi", 50.0) or 50.0)
+    adx       = float(ind.get("adx", 0.0) or 0.0)
+    plus_di   = float(ind.get("plus_di", 0.0) or 0.0)
+    minus_di  = float(ind.get("minus_di", 0.0) or 0.0)
+    di_spread = float(ind.get("di_spread", abs(plus_di - minus_di)) or 0.0)
+    atr_now   = float(ind.get("atr", 0.0) or 0.0)
+
+    # MACD (لو مش موجود في ind هيشتغل بقيم افتراضية بدون كسر)
+    macd          = float(ind.get("macd", 0.0) or 0.0)
+    macd_signal   = float(ind.get("macd_signal", 0.0) or 0.0)
+    macd_prev     = float(ind.get("macd_prev", macd) or macd)
+    macd_sig_prev = float(ind.get("macd_signal_prev", macd_signal) or macd_signal)
+    macd_hist     = float(ind.get("macd_hist", macd - macd_signal) or (macd - macd_signal))
+
+    # Stochastic
+    stoch_k      = float(ind.get("stoch_k", 50.0) or 50.0)
+    stoch_d      = float(ind.get("stoch_d", 50.0) or 50.0)
+    stoch_k_prev = float(ind.get("stoch_k_prev", stoch_k) or stoch_k)
+    stoch_d_prev = float(ind.get("stoch_d_prev", stoch_d) or stoch_d)
+
+    # سياق RSI Trend-Z
+    if rsi_ctx is None:
+        rsi_ctx = rsi_ma_context(df)  # فيه trendZ + in_chop + cross
+
+    # سياق Footprint / OTC
+    if footprint is None:
+        footprint = compute_footprint_metrics(df)
+
+    # EMA fast/slow crossover (المؤشر اللي بيقيس قوة التقاطع)
+    if ema_ctx is None:
+        ema_ctx = ema_crossover_strength(df, ind)
+
+    # Golden Zone (لو محقونة في ind أو dict فاضية)
+    if gz is None:
+        gz = ind.get("gz", {}) or {}
+
+    price = float(df["close"].iloc[-1])
+
+    # ---- حساب ATR regime (Compression / Normal / Expansion) ----
+    atr_mult = 1.0
+    try:
+        c = df["close"].astype(float)
+        h = df["high"].astype(float)
+        l = df["low"].astype(float)
+        tr = pd.concat([
+            (h - l).abs(),
+            (h - c.shift(1)).abs(),
+            (l - c.shift(1)).abs()
+        ], axis=1).max(axis=1)
+
+        if len(tr) >= 20:
+            atr_base = tr.rolling(20).mean().iloc[-1]
+            if atr_now <= 0 and len(tr) >= 14:
+                atr_now = float(tr.rolling(14).mean().iloc[-1])
+            if atr_base and atr_base > 0:
+                atr_mult = float(atr_now / atr_base)
+    except Exception:
+        atr_mult = 1.0
+
+    price = float(df["close"].iloc[-1])
+
+    # ===== مراقبة سلوك ADX + ATR عبر الزمن (Cycle) =====
+    cycle = update_adx_atr_cycle(side, adx, plus_di, minus_di, atr_mult, price)
+    cycle_phase      = cycle.get("phase", "unknown")
+    cycle_ok_for_lng = cycle.get("ok_for_long", True)
+    cycle_ok_for_sht = cycle.get("ok_for_short", True)
+
     strength = 0.0
-    
-    # قوة ADX
-    adx = ind.get('adx', 0)
-    if adx > 25:
-        strength += 3.0
-    elif adx > 20:
-        strength += 2.0
-    elif adx > 15:
-        strength += 1.0
-    
-    # قوة RSI
-    rsi = ind.get('rsi', 50)
-    if (side == "long" and rsi < 70) or (side == "short" and rsi > 30):
-        strength += 2.0
-    
-    # قوة DI Spread
-    di_spread = ind.get('di_spread', 0)
-    if di_spread > 8:
-        strength += 2.0
-    elif di_spread > 5:
-        strength += 1.0
-    
-    # Footprint confirmation
-    footprint = ind.get('footprint', {})
-    if footprint.get('ok'):
-        if (side == "long" and footprint.get('delta_trend') == 'bull') or \
-           (side == "short" and footprint.get('delta_trend') == 'bear'):
-            strength += 2.0
-    
-    # Golden Zone confirmation
-    gz = ind.get('gz', {})
-    if gz.get('ok') and gz.get('confirmed'):
-        strength += 3.0
-    elif gz.get('ok'):
+
+    # ===================== 1) ADX Regime =====================
+    if adx < 15:
+        regime = "chop"      # سوق ميت / تجميع ضعيف
+        strength += 0.5
+    elif adx < 25:
+        regime = "build"     # بداية ترند
         strength += 1.5
-    
-    # EMA Crossover impact
-    ema_ctx = ema_crossover_strength(df, ind)
+    elif adx < 40:
+        regime = "trend"     # ترند صحي
+        strength += 2.5
+    else:
+        regime = "explosive" # حركة متفلتة
+        strength += 3.0
+
+    # تعزيز أو إضعاف القوة بناءً على الـ Cycle
+    if side == "buy":
+        if cycle_phase == "rebuild_after_cooling" and cycle_ok_for_lng:
+            strength += 1.5   # بداية انطلاق جديد بعد تبريد ⇒ فرصة أقوى للشراء
+        if cycle_phase == "peak" and not cycle_ok_for_lng:
+            strength *= 0.7   # قمة ترند عكس الشراء ⇒ نهدّي القوة
+
+    elif side == "sell":
+        if cycle_phase == "rebuild_after_cooling" and cycle_ok_for_sht:
+            strength += 1.5   # بداية انطلاق جديد بعد تبريد ⇒ فرصة أقوى للبيع
+        if cycle_phase == "peak" and not cycle_ok_for_sht:
+            strength *= 0.7
+
+    # اتجاه DI مع الصفقة
+    if side == "buy":
+        if plus_di > minus_di and di_spread >= 5:
+            strength += 1.5
+        elif minus_di > plus_di and di_spread >= 5:
+            strength -= 1.5
+    elif side == "sell":
+        if minus_di > plus_di and di_spread >= 5:
+            strength += 1.5
+        elif plus_di > minus_di and di_spread >= 5:
+            strength -= 1.5
+
+    # ===================== 2) RSI Trend-Z Context =====================
+    rsi_trendz  = rsi_ctx.get("trendZ")   # bull / bear / flat
+    rsi_in_chop = rsi_ctx.get("in_chop")
+    rsi_cross   = rsi_ctx.get("cross")    # bull / bear / none
+
+    if rsi_trendz == "bull":
+        if side == "buy":
+            strength += 1.0
+        elif side == "sell":
+            strength -= 0.5
+    elif rsi_trendz == "bear":
+        if side == "sell":
+            strength += 1.0
+        elif side == "buy":
+            strength -= 0.5
+
+    if rsi_in_chop:
+        strength -= 0.5  # سوق متذبذب ⇒ نقلل الثقة
+
+    # ===================== 3) EMA Fast/Slow Cross (Main Cross Engine) =====================
     ema_label = ema_ctx.get("label", "none")
-
-    if side == "long":
-        if ema_label == "strong_bull":
-            strength += 2.0
-        elif ema_label == "weak_bull":
-            strength += 1.0
-        elif ema_label in ("strong_bear", "weak_bear"):
-            # إشارة معاكسة تقلل الثقة
+    # strong_bull / weak_bull / strong_bear / weak_bear
+    if ema_label == "strong_bull":
+        if side == "buy":
+            strength += 3.0   # تقاطع صاعد قوي مع الصفقة
+        else:
+            strength -= 2.0
+    elif ema_label == "weak_bull":
+        if side == "buy":
+            strength += 1.5
+        else:
             strength -= 1.0
-    elif side == "short":
-        if ema_label == "strong_bear":
-            strength += 2.0
-        elif ema_label == "weak_bear":
-            strength += 1.0
-        elif ema_label in ("strong_bull", "weak_bull"):
+    elif ema_label == "strong_bear":
+        if side == "sell":
+            strength += 3.0
+        else:
+            strength -= 2.0
+    elif ema_label == "weak_bear":
+        if side == "sell":
+            strength += 1.5
+        else:
             strength -= 1.0
 
+    # ===================== 3-B) MACD + Stochastic Crosses =====================
+    # MACD Cross
+    macd_cross_up   = macd > macd_signal and macd_prev <= macd_sig_prev
+    macd_cross_down = macd < macd_signal and macd_prev >= macd_sig_prev
+    macd_sep        = abs(macd - macd_signal)
+
+    if macd_cross_up:
+        if side == "buy":
+            # لو الفرق كبير → تقاطع قوي
+            if macd_sep > abs(macd_hist) * 0.7:
+                strength += 1.5
+            else:
+                strength += 1.0
+        else:
+            strength -= 0.8
+    elif macd_cross_down:
+        if side == "sell":
+            if macd_sep > abs(macd_hist) * 0.7:
+                strength += 1.5
+            else:
+                strength += 1.0
+        else:
+            strength -= 0.8
+
+    # Stochastic Cross (K/D)
+    stoch_cross_up   = stoch_k > stoch_d and stoch_k_prev <= stoch_d_prev
+    stoch_cross_down = stoch_k < stoch_d and stoch_k_prev >= stoch_d_prev
+
+    if stoch_cross_up and stoch_k < 35:
+        # تقاطع صاعد من منطقة تشبع بيع
+        if side == "buy":
+            strength += 1.5
+        else:
+            strength -= 0.8
+    elif stoch_cross_down and stoch_k > 65:
+        # تقاطع هابط من منطقة تشبع شراء
+        if side == "sell":
+            strength += 1.5
+        else:
+            strength -= 0.8
+
+    # ===================== 3-C) Cross Votes (قوة التقاطع ككل) =====================
+    bull_votes = 0
+    bear_votes = 0
+
+    # EMA
+    if ema_label in ("weak_bull", "strong_bull"):
+        bull_votes += 1
+    if ema_label in ("weak_bear", "strong_bear"):
+        bear_votes += 1
+
+    # RSI cross
+    if rsi_cross == "bull":
+        bull_votes += 1
+    elif rsi_cross == "bear":
+        bear_votes += 1
+
+    # MACD
+    if macd_cross_up:
+        bull_votes += 1
+    elif macd_cross_down:
+        bear_votes += 1
+
+    # Stoch
+    if stoch_cross_up:
+        bull_votes += 1
+    elif stoch_cross_down:
+        bear_votes += 1
+
+    # تقييم قوة التقاطع:
+    # 3+ أصوات في نفس الاتجاه ⇒ تقاطع قوي
+    # 2 أصوات ⇒ تقاطع متوسط
+    # أقل ⇒ ضعيف
+    if side == "buy":
+        if bull_votes >= 3:
+            strength += 2.0   # تقاطع قوي ⇒ صفقة قوية
+        elif bull_votes == 2:
+            strength += 1.0   # تقاطع متوسط
+    elif side == "sell":
+        if bear_votes >= 3:
+            strength += 2.0
+        elif bear_votes == 2:
+            strength += 1.0
+
+    # لو في تعارض شديد (bull_votes و bear_votes كبار معًا) نقلل قليلاً
+    if bull_votes >= 2 and bear_votes >= 2:
+        strength *= 0.8
+
+    # ===================== 4) ATR / Volatility Regime =====================
+    if regime in ("build", "trend", "explosive") and atr_mult >= 1.1:
+        strength += 1.0  # ترند + توسّع في المدى ⇒ فرصة أحسن
+    if regime == "chop" and atr_mult < 0.9:
+        strength -= 1.0  # تجميع ضعيف / تذبذب ⇒ نخليها أضعف
+
+    # ===================== 5) Accumulation vs Distribution =====================
+    if adx < 18 and atr_mult <= 1.0 and footprint.get("ok"):
+        if footprint.get("absorption_bull") and side == "buy":
+            strength += 1.5
+        if footprint.get("absorption_bear") and side == "sell":
+            strength += 1.5
+
+    delta_trend = footprint.get("delta_trend")
+    if footprint.get("ok"):
+        if delta_trend == "bull":
+            if side == "buy":
+                strength += 1.0
+            else:
+                strength -= 0.8
+        elif delta_trend == "bear":
+            if side == "sell":
+                strength += 1.0
+            else:
+                strength -= 0.8
+
+    # ===================== 6) Golden Zone (قاع/قمة ذهبية) =====================
+    if gz.get("ok"):
+        z_type = gz.get("type")      # "bottom" / "top"
+        z_conf = gz.get("confirmed", False)
+
+        if side == "buy" and z_type == "bottom":
+            strength += 2.5 if z_conf else 1.5
+        elif side == "sell" and z_type == "top":
+            strength += 2.5 if z_conf else 1.5
+
+    # ===================== 7) Sanity + Clamp =====================
     strength = max(0.0, strength)
     return min(10.0, strength)
 
@@ -2234,6 +2612,7 @@ def open_market_enhanced(side, qty, price):
     votes = snap["cv"]
     footprint = votes.get("footprint", {})
     ema_ctx = votes.get("ema", {})
+    gz = snap["gz"]
     
     mode_data = decide_strategy_mode_enhanced(df, 
                                    adx=votes["ind"].get("adx"),
@@ -2244,7 +2623,6 @@ def open_market_enhanced(side, qty, price):
                                    ema_ctx=ema_ctx)
     
     mode = mode_data["mode"]
-    gz = snap["gz"]
     
     # Enhanced management config
     management_config = setup_trade_management(mode)
@@ -2252,9 +2630,10 @@ def open_market_enhanced(side, qty, price):
     success = execute_trade_decision(side, price, qty, mode, votes, gz)
     
     if success:
-        # نحسب قوة الإشارة
+        # نحسب قوة الإشارة باستخدام الدالة المحسنة
         side_label = "long" if side == "buy" else "short"
-        signal_strength = calculate_signal_strength(df, votes["ind"], side_label)
+        rsi_ctx = rsi_ma_context(df)
+        signal_strength = calculate_signal_strength(side_label, df, votes["ind"], rsi_ctx, footprint, ema_ctx, gz)
         
         # نحدّد Profile جني الأرباح (سكالب خفيف / نص ترند / ترند قوي)
         trade_profile = classify_trade_profile(signal_strength, mode)
@@ -2444,6 +2823,9 @@ STATE = {
     "last_closed_pnl_pct": 0.0,       # نسبة ربح/خسارة آخر صفقة مغلقة
     "post_big_win_mode": False,       # هل إحنا في وضع حماية بعد مكسب كبير؟
     "post_big_win_bars_left": 0,      # عدد الشموع المتبقية في وضع Post Big Win
+    
+    # --- ADX/ATR Cycle ---
+    "adx_atr_cycle": {},
 }
 compound_pnl = 0.0
 wait_for_next_signal_side = None
