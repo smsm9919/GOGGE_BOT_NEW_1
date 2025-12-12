@@ -10,6 +10,7 @@ RF Futures Bot — RF-LIVE ONLY (BingX Perp via CCXT)
 • OTC Hidden Flow Detection & Protection System
 • EMA Crossover Strength Engine (Strong/Weak Trend Detection)
 • ENHANCED WITH: Hard Stop Loss, Post-Big-Win Guard, Auto-Recovery
+• CHART PRIME: High-Volume Boxes + Liquidity Cycle Monitor
 """
 
 import os, time, math, random, signal, sys, traceback, logging, json
@@ -44,7 +45,7 @@ SHADOW_MODE_DASHBOARD = False
 DRY_RUN = False
 
 # ==== Addon: Logging + Recovery Settings ====
-BOT_VERSION = "DOGE Council PRO v5.0 — Smart Profit AI + Golden Zone Pro + VWAP Strategy + OTC Detection + EMA Crossover Engine + Hard Stop + Post-Big-Win Guard + Auto-Recovery"
+BOT_VERSION = "DOGE Council PRO v5.0 — Smart Profit AI + Golden Zone Pro + VWAP Strategy + OTC Detection + EMA Crossover Engine + Hard Stop + Post-Big-Win Guard + Auto-Recovery + ChartPrime Liquidity Monitor"
 print("🔁 Booting:", BOT_VERSION, flush=True)
 
 STATE_PATH = "./bot_state.json"
@@ -529,6 +530,7 @@ def verify_execution_environment():
     print(f"📊 VWAP STRATEGY: SCALP(near {VWAP_SCALP_BAND_BPS}bps) | TREND(far {VWAP_TREND_BAND_BPS}bps)", flush=True)
     print(f"📈 EMA CROSSOVER ENGINE: Strong/Weak Trend Detection", flush=True)
     print(f"🛡️ RISK GUARDS: Hard Stop Loss (-{abs(MAX_LOSS_PCT)*100}%) | Post-Big-Win Guard (+{BIG_WIN_PCT*100}%)", flush=True)
+    print(f"📦 CHART PRIME: High-Volume Boxes + Liquidity Cycle Monitor", flush=True)
     
     if not EXECUTE_ORDERS:
         print("🟡 WARNING: EXECUTE_ORDERS=False - البوت في وضع التحليل فقط!", flush=True)
@@ -1370,6 +1372,262 @@ def compute_ema_engine(df: pd.DataFrame,
             "slope_fast": 0.0,
         }
 
+# =================== CHART PRIME HIGH VOLUME BOXES ===================
+def compute_delta_volume(df, period=2):
+    """
+    حساب حجم الدلتا: الفرق بين حجم الشراء وحجم البيع.
+    """
+    close = df['close'].astype(float)
+    volume = df['volume'].astype(float)
+    price_change = close.diff()
+    buy_volume = volume.where(price_change > 0, 0)
+    sell_volume = volume.where(price_change < 0, 0)
+    delta_volume = buy_volume - sell_volume
+    return delta_volume
+
+def _pivot_low(series, left, right):
+    """
+    تحديد قيعان محورية.
+    """
+    lows = []
+    for i in range(left, len(series) - right):
+        if series[i] == min(series[i-left:i+right+1]):
+            lows.append(i)
+    return lows
+
+def _pivot_high(series, left, right):
+    """
+    تحديد قمم محورية.
+    """
+    highs = []
+    for i in range(left, len(series) - right):
+        if series[i] == max(series[i-left:i+right+1]):
+            highs.append(i)
+    return highs
+
+def detect_sr_high_volume_boxes(df, lookback_period=20, vol_len=2, box_width_mult=1.0, atr_len=200):
+    """
+    كشف صناديق الدعم/المقاومة عالية الحجم (ChartPrime).
+    """
+    if len(df) < lookback_period:
+        return {
+            "support_level": None,
+            "support_level_1": None,
+            "resistance_level": None,
+            "resistance_level_1": None,
+            "side": None,
+            "box_score": 0.0
+        }
+
+    close = df['close'].astype(float)
+    high = df['high'].astype(float)
+    low = df['low'].astype(float)
+    volume = df['volume'].astype(float)
+
+    # حساب ATR
+    tr = np.maximum(high - low, np.maximum(abs(high - close.shift(1)), abs(low - close.shift(1))))
+    atr = tr.rolling(atr_len).mean().iloc[-1]
+
+    # حساب حجم الدلتا
+    delta_vol = compute_delta_volume(df, vol_len)
+
+    # تحديد النقاط المحورية للقيعان والقمم
+    pivot_lows = _pivot_low(low, 3, 3)
+    pivot_highs = _pivot_high(high, 3, 3)
+
+    # جمع أحجام الدلتا عند النقاط المحورية
+    low_volumes = []
+    for idx in pivot_lows:
+        if idx < len(delta_vol):
+            low_volumes.append((low.iloc[idx], delta_vol.iloc[idx]))
+
+    high_volumes = []
+    for idx in pivot_highs:
+        if idx < len(delta_vol):
+            high_volumes.append((high.iloc[idx], delta_vol.iloc[idx]))
+
+    # تحديد مستويات الدعم (القيعان ذات الدلتا الموجبة الكبيرة)
+    support_levels = []
+    for price, vol in low_volumes:
+        if vol > 0:
+            support_levels.append((price, vol))
+
+    # تحديد مستويات المقاومة (القمم ذات الدلتا السالبة الكبيرة)
+    resistance_levels = []
+    for price, vol in high_volumes:
+        if vol < 0:
+            resistance_levels.append((price, vol))
+
+    # ترتيب المستويات حسب الحجم
+    support_levels.sort(key=lambda x: x[1], reverse=True)
+    resistance_levels.sort(key=lambda x: x[1], reverse=False)  # لأن الدلتا سالبة، الأكثر سلبية أولاً
+
+    # أخذ أقوى مستويين للدعم والمقاومة
+    support1 = support_levels[0][0] if support_levels else None
+    support2 = support_levels[1][0] if len(support_levels) > 1 else None
+    resistance1 = resistance_levels[0][0] if resistance_levels else None
+    resistance2 = resistance_levels[1][0] if len(resistance_levels) > 1 else None
+
+    # تحديد الجانب الحالي (هل السعر قريب من دعم أم مقاومة؟)
+    current_price = close.iloc[-1]
+    side = None
+    box_score = 0.0
+
+    if support1 and resistance1:
+        # حساب المسافة النسبية
+        dist_to_support = abs(current_price - support1) / current_price
+        dist_to_resistance = abs(current_price - resistance1) / current_price
+        if dist_to_support < dist_to_resistance:
+            side = "support"
+            # حساب score للدعم: يعتمد على قوة الحجم والقرب
+            vol_score = min(10, abs(support_levels[0][1]) / (volume.mean() + 1e-9) * 2)
+            proximity_score = max(0, 10 - (dist_to_support * 1000))
+            box_score = (vol_score + proximity_score) / 2
+        else:
+            side = "resistance"
+            vol_score = min(10, abs(resistance_levels[0][1]) / (volume.mean() + 1e-9) * 2)
+            proximity_score = max(0, 10 - (dist_to_resistance * 1000))
+            box_score = (vol_score + proximity_score) / 2
+
+    return {
+        "support_level": support1,
+        "support_level_1": support2,
+        "resistance_level": resistance1,
+        "resistance_level_1": resistance2,
+        "side": side,
+        "box_score": box_score
+    }
+
+# =================== ADX/ATR + BOXES LIQUIDITY MONITOR ===================
+def build_liquidity_cycle_context(
+    df: pd.DataFrame,
+    adx_cycle: dict,
+    art_cycle: dict,
+    cp_boxes: dict,
+    flow: dict,
+) -> dict:
+    """
+    مراقبة حالة السيولة/التجميع من:
+      - ADX cycle (trend/flat/exhaustion)
+      - ART/ATR cycle (accumulation/impulse/correction/distribution)
+      - High-Volume Boxes (support/resistance + score)
+      - Flow (delta_z + cvd_trend)
+    """
+    close = df["close"].astype(float)
+    price_now = float(close.iloc[-1])
+
+    trend_side = adx_cycle.get("trend_side", "chop")
+    phase      = adx_cycle.get("phase", "neutral")
+    adx_val    = float(adx_cycle.get("adx", 0.0) or 0.0)
+    rising     = bool(adx_cycle.get("rising", False))
+    falling    = bool(adx_cycle.get("falling", False))
+
+    art_phase  = art_cycle.get("phase", "unknown")
+    atr_rel    = float(art_cycle.get("atr_rel", 1.0) or 1.0)
+
+    cb_side    = cp_boxes.get("side")
+    cb_score   = float(cp_boxes.get("box_score", 0.0) or 0.0)
+    sup        = cp_boxes.get("support_level")
+    res        = cp_boxes.get("resistance_level")
+
+    delta_z   = float(flow.get("delta_z", 0.0) or 0.0)
+    cvd_trend = (flow.get("cvd_trend") or "").lower()
+
+    # قرب السعر من الصندوق
+    def _distance(level: float | None) -> float:
+        if level is None:
+            return 1e9
+        return abs(price_now - float(level)) / max(price_now, 1e-9)
+
+    dist_sup = _distance(sup)
+    dist_res = _distance(res)
+
+    near_support    = sup is not None and dist_sup <= 0.01  # 1% من السعر
+    near_resistance = res is not None and dist_res <= 0.01
+
+    # Flow bias بسيط
+    if delta_z >= 0.7 and cvd_trend == "up":
+        flow_bias = "bullish"
+    elif delta_z <= -0.7 and cvd_trend == "down":
+        flow_bias = "bearish"
+    else:
+        flow_bias = "neutral"
+
+    regime = "chop"
+    continuation_bias = "none"
+    notes = []
+
+    # 1) ترند صاعد قوي + تصحيح عند دعم بصندوق قوي + Flow شراء
+    if trend_side == "up" and phase in ("expansion", "trend") and art_phase in ("correction", "accumulation"):
+        if near_support and cb_side == "support" and cb_score >= 6.0 and flow_bias in ("bullish", "neutral"):
+            regime = "bull_accumulation"
+            continuation_bias = "up"
+            notes.append("Trend up + correction into strong support box + bullish/neutral flow")
+
+    # 2) ترند هابط قوي + تصحيح عند مقاومة بصندوق قوي + Flow بيع
+    if regime == "chop" and trend_side == "down" and phase in ("expansion", "trend") and art_phase in ("correction", "accumulation"):
+        if near_resistance and cb_side == "resistance" and cb_score >= 6.0 and flow_bias in ("bearish", "neutral"):
+            regime = "bear_accumulation"
+            continuation_bias = "down"
+            notes.append("Trend down + correction into strong resistance box + bearish/neutral flow")
+
+    # 3) ADX كان عالي وبدأ ينزل عند مقاومة → Distribution / Liquidity Sweep top
+    if regime == "chop" and near_resistance and cb_side == "resistance" and cb_score >= 6.5:
+        if phase in ("trend", "exhaustion") and falling and adx_val >= 25 and art_phase in ("distribution", "impulse"):
+            # Flow عكسي → سحب سيولة
+            if flow_bias == "bearish":
+                regime = "bear_liquidity_sweep"   # سحب سيولة من المشترين
+                continuation_bias = "down"
+                notes.append("ADX roll-over at resistance with bearish flow → liquidity sweep top")
+            else:
+                regime = "distribution_top"
+                continuation_bias = "none"
+                notes.append("ADX falling at resistance → potential distribution")
+
+    # 4) ADX كان عالي وبدأ ينزل عند دعم → accumulation bottom أو sweep bottom
+    if regime == "chop" and near_support and cb_side == "support" and cb_score >= 6.5:
+        if phase in ("trend", "exhaustion") and falling and adx_val >= 25 and art_phase in ("accumulation", "impulse"):
+            if flow_bias == "bullish":
+                regime = "bull_accumulation"
+                continuation_bias = "up"
+                notes.append("ADX roll-over at support with bullish flow → accumulation bottom")
+            else:
+                regime = "bull_liquidity_sweep"  # شمعات حمراء قوية لكن بدون Flow شراء واضح
+                continuation_bias = "up"
+                notes.append("ADX falling at support with mixed flow → possible liquidity sweep bottom")
+
+    # 5) لو لسه ما حدّدناش,
+    if regime == "chop":
+        if trend_side == "up" and adx_val >= 18 and atr_rel >= 1.0:
+            regime = "trend_up"
+            continuation_bias = "up"
+            notes.append("Generic uptrend regime")
+        elif trend_side == "down" and adx_val >= 18 and atr_rel >= 1.0:
+            regime = "trend_down"
+            continuation_bias = "down"
+            notes.append("Generic downtrend regime")
+        else:
+            regime = "chop"
+            continuation_bias = "none"
+            notes.append("Choppy / low conviction regime")
+
+    return {
+        "regime": regime,
+        "continuation_bias": continuation_bias,
+        "trend_side": trend_side,
+        "adx": adx_val,
+        "phase": phase,
+        "art_phase": art_phase,
+        "atr_rel": atr_rel,
+        "near_support": near_support,
+        "near_resistance": near_resistance,
+        "cp_box_side": cb_side,
+        "cp_box_score": cb_score,
+        "flow_bias": flow_bias,
+        "delta_z": delta_z,
+        "notes": notes,
+    }
+
 # =================== PROFESSIONAL ENTRY ENGINE HELPERS ===================
 def classify_liquidity_regime_from_footprint(footprint: dict) -> str:
     """
@@ -1486,9 +1744,9 @@ def detect_bearish_rejection_candle(df: pd.DataFrame) -> dict:
 
 def professional_entry_engine(df: pd.DataFrame, side: str, council_data: dict):
     """
-    محرك دخول احترافي:
+    محرك دخول احترافي مع فلاتر السيولة والتراكم:
       - side: "buy"/"sell"
-      - يستخدم: Golden Zone + Footprint + ADX/ART Cycle (+ EMA Cross إذا موجود)
+      - يستخدم: Golden Zone + Footprint + ADX/ART Cycle + EMA Cross + ChartPrime Boxes + Liquidity Cycle
       - يرجع (ok, info_dict)
     """
     side = (side or "").lower()
@@ -1500,9 +1758,13 @@ def professional_entry_engine(df: pd.DataFrame, side: str, council_data: dict):
     ema_ctx    = council_data.get("ema", {}) or {}
     adx_cycle  = council_data.get("adx_cycle") or analyze_adx_cycle(compute_adx_di_context(df, ADX_LEN))
     art_cycle  = council_data.get("art_cycle") or analyze_art_cycle(df, ATR_LEN, 20)
+    cp_boxes   = council_data.get("cp_boxes", {}) or {}
+    liq_cycle  = council_data.get("liquidity_cycle", {}) or {}
 
     zone_grade = compute_zone_grade_from_gz(gz)
-    liq_regime = classify_liquidity_regime_from_footprint(footprint)
+    liq_regime = liq_cycle.get("regime", "chop")
+    liq_bias   = liq_cycle.get("continuation_bias", "none")
+    liq_regime_fp = classify_liquidity_regime_from_footprint(footprint)
 
     # لو مفيش EMA Engine حالياً، نعتبر الكروس قوي افتراضيًا (ما نبلوكش صفقات كويسة)
     if ema_ctx:
@@ -1514,23 +1776,44 @@ def professional_entry_engine(df: pd.DataFrame, side: str, council_data: dict):
     trend_side = adx_cycle["trend_side"]
     art_phase  = art_cycle["phase"]
 
-    # 1) Zone Strength: لو في Golden Zone ضعيفة → بلوك
+    # ========== 1) فلتر السيولة / التجميع ==========
+    # 1.1 منع شراء في قمم سحب سيولة/توزيع
+    if side == "buy" and liq_regime in ("bear_liquidity_sweep", "distribution_top"):
+        return False, {
+            "reason": f"liquidity_regime_block_buy({liq_regime})",
+            "zone_grade": zone_grade,
+            "ema_score": cross_strength,
+            "flow_bias": liq_cycle.get("flow_bias", "neutral"),
+            "adx": adx_cycle.get("adx", 0),
+        }
+
+    # 1.2 منع بيع في قيعان تجميع/سحب سيولة لصعود
+    if side == "sell" and liq_regime in ("bull_accumulation", "bull_liquidity_sweep"):
+        return False, {
+            "reason": f"liquidity_regime_block_sell({liq_regime})",
+            "zone_grade": zone_grade,
+            "ema_score": cross_strength,
+            "flow_bias": liq_cycle.get("flow_bias", "neutral"),
+            "adx": adx_cycle.get("adx", 0),
+        }
+
+    # 2) Zone Strength: لو في Golden Zone ضعيفة → بلوك
     if gz and isinstance(gz, dict) and gz.get("ok"):
         if zone_grade == "weak":
             return False, {"reason": "weak_golden_zone", "zone_grade": zone_grade}
     # لو مفيش GZ، ما نبلوكش، لكن هنشد في باقي الشروط
 
-    # 2) Liquidity Absorption
-    if side == "buy" and liq_regime == "sell_absorption":
-        return False, {"reason": "liquidity_sell_absorption_above", "liq": liq_regime}
-    if side == "sell" and liq_regime == "buy_absorption":
-        return False, {"reason": "liquidity_buy_absorption_below", "liq": liq_regime}
+    # 3) Liquidity Absorption
+    if side == "buy" and liq_regime_fp == "sell_absorption":
+        return False, {"reason": "liquidity_sell_absorption_above", "liq": liq_regime_fp}
+    if side == "sell" and liq_regime_fp == "buy_absorption":
+        return False, {"reason": "liquidity_buy_absorption_below", "liq": liq_regime_fp}
 
-    # 3) ADX Cycle: منع الدخول في سوق نايم/تجميعي لو مفيش قاع/قمة ذهبية
+    # 4) ADX Cycle: منع الدخول في سوق نايم/تجميعي لو مفيش قاع/قمة ذهبية
     if phase in ("flat", "accumulation") and not (gz and isinstance(gz, dict) and gz.get("ok")):
         return False, {"reason": f"adx_phase_{phase}_no_gz"}
 
-    # 4) منع الدخول ضد ترند قوي إلا لو عندنا Golden Top/Bottom
+    # 5) منع الدخول ضد ترند قوي إلا لو عندنا Golden Top/Bottom
     gz_type = None
     if gz and isinstance(gz, dict):
         zone = gz.get("zone")
@@ -1542,7 +1825,7 @@ def professional_entry_engine(df: pd.DataFrame, side: str, council_data: dict):
     if side == "sell" and trend_side == "up" and gz_type != "golden_top":
         return False, {"reason": "counter_trend_sell_without_golden_top", "gz_type": gz_type}
 
-    # 5) Cross Strength من EMA Engine (لو موجود)
+    # 6) Cross Strength من EMA Engine (لو موجود)
     if gz and isinstance(gz, dict) and gz.get("ok"):
         if zone_grade == "strong" and cross_strength < 2.0:
             return False, {"reason": f"cross_weak_for_strong_zone({cross_strength:.1f})"}
@@ -1553,7 +1836,7 @@ def professional_entry_engine(df: pd.DataFrame, side: str, council_data: dict):
         if cross_strength < 2.5:
             return False, {"reason": f"cross_weak_no_zone({cross_strength:.1f})"}
 
-    # 6) شمعة رفض/ابتلاع في نفس الاتجاه
+    # 7) شمعة رفض/ابتلاع في نفس الاتجاه
     if side == "buy":
         candle = detect_bullish_rejection_candle(df)
     else:
@@ -1565,25 +1848,29 @@ def professional_entry_engine(df: pd.DataFrame, side: str, council_data: dict):
         if not strong_gz:
             return False, {"reason": "no_rejection_candle", "zone_grade": zone_grade}
 
-    # 7) ART Phase: لو Accumulation ومفيش Zone → تجنّب
+    # 8) ART Phase: لو Accumulation ومفيش Zone → تجنّب
     if art_phase == "accumulation" and not (gz and isinstance(gz, dict) and gz.get("ok")):
         return False, {"reason": "art_accumulation_no_zone"}
 
     info = {
         "zone_grade": zone_grade,
-        "liquidity": liq_regime,
+        "liquidity": liq_regime_fp,
         "adx_phase": phase,
         "adx_trend_side": trend_side,
         "art_phase": art_phase,
         "cross_strength": cross_strength,
         "candle_pattern": candle.get("pattern"),
         "gz_type": gz_type,
+        "liquidity_regime": liq_regime,
+        "liquidity_bias": liq_bias,
+        "cp_box_score": cp_boxes.get("box_score", 0),
+        "cp_box_side": cp_boxes.get("side"),
     }
     return True, info
 
 # =================== ENHANCED COUNCIL VOTING ===================
 def council_votes_pro_enhanced(df):
-    """مجلس تصويت محسّن مع Footprint + SMC + Golden Zone Pro + VWAP + OTC + EMA"""
+    """مجلس تصويت محسّن مع Footprint + SMC + Golden Zone Pro + VWAP + OTC + EMA + ChartPrime"""
     try:
         ind = compute_indicators(df)
         rsi_ctx = rsi_ma_context(df)
@@ -1609,6 +1896,19 @@ def council_votes_pro_enhanced(df):
         
         # EMA Engine Context
         ema_ctx = compute_ema_engine(df, EMA_FAST_LEN, EMA_SLOW_LEN)
+
+        # ChartPrime High-Volume Boxes
+        cp_boxes = detect_sr_high_volume_boxes(
+            df,
+            lookback_period=20,
+            vol_len=2,
+            box_width_mult=1.0,
+            atr_len=200,
+        )
+
+        # Liquidity Cycle Context
+        flow = compute_flow_metrics(df)
+        liquidity_cycle = build_liquidity_cycle_context(df, adx_cycle, art_cycle, cp_boxes, flow)
 
         votes_b = 0; votes_s = 0
         score_b = 0.0; score_s = 0.0
@@ -1657,6 +1957,34 @@ def council_votes_pro_enhanced(df):
             far_from_vwap = vwap_diff_bps >= VWAP_TREND_BAND_BPS
             above_vwap = current_price > vwap
             logs.append(f"VWAP ctx: px={current_price:.6f} vwap={vwap:.6f} Δ={vwap_diff_bps:.1f}bps")
+
+        # --- ChartPrime Boxes Boost ---
+        near_support = liquidity_cycle.get("near_support", False)
+        near_resistance = liquidity_cycle.get("near_resistance", False)
+        cb_side = cp_boxes.get("side")
+        
+        if cb_side == "support" and cp_boxes.get("box_score", 0) >= 7.0:
+            if near_support and current_price <= cp_boxes.get("support_level"):
+                votes_b += 2
+                score_b += 2.0
+                logs.append(f"📦 STRONG SUPPORT BOX (score={cp_boxes['box_score']:.1f})")
+        
+        if cb_side == "resistance" and cp_boxes.get("box_score", 0) >= 7.0:
+            if near_resistance and current_price >= cp_boxes.get("resistance_level"):
+                votes_s += 2
+                score_s += 2.0
+                logs.append(f"📦 STRONG RESISTANCE BOX (score={cp_boxes['box_score']:.1f})")
+
+        # --- Liquidity Cycle Boost ---
+        if liquidity_cycle.get("regime") == "bull_accumulation":
+            votes_b += 3
+            score_b += 2.5
+            logs.append(f"💰 BULL ACCUMULATION REGIME | {liquidity_cycle.get('notes', [''])[0]}")
+        
+        if liquidity_cycle.get("regime") == "bear_accumulation":
+            votes_s += 3
+            score_s += 2.5
+            logs.append(f"💰 BEAR ACCUMULATION REGIME | {liquidity_cycle.get('notes', [''])[0]}")
 
         # --- تصويت VWAP للسكالب (قرب من VWAP) ---
         if VWAP_ENABLED and near_vwap and cd:
@@ -1842,6 +2170,13 @@ def council_votes_pro_enhanced(df):
             "ema_score": ema_ctx.get("score"),
             "ema_fast": ema_ctx.get("ema_fast"),
             "ema_slow": ema_ctx.get("ema_slow"),
+            "cp_support": cp_boxes["support_level"],
+            "cp_support_1": cp_boxes["support_level_1"],
+            "cp_resistance": cp_boxes["resistance_level"],
+            "cp_resistance_1": cp_boxes["resistance_level_1"],
+            "cp_box_side": cp_boxes["side"],
+            "cp_box_score": cp_boxes["box_score"],
+            "liquidity_cycle": liquidity_cycle,
         })
 
         return {
@@ -1854,6 +2189,8 @@ def council_votes_pro_enhanced(df):
             "adx_cycle": adx_cycle,
             "art_cycle": art_cycle,
             "ema": ema_ctx,
+            "cp_boxes": cp_boxes,
+            "liquidity_cycle": liquidity_cycle,
         }
     except Exception as e:
         log_w(f"council_votes_pro_enhanced error: {e}")
@@ -1862,7 +2199,8 @@ def council_votes_pro_enhanced(df):
             "score_b": 0.0, "score_s": 0.0,
             "logs": [], "ind": {}, "gz": None,
             "candles": {}, "footprint": {}, "liquidity_traps": {}, "otc": {}, 
-            "adx_cycle": {}, "art_cycle": {}, "ema": {}
+            "adx_cycle": {}, "art_cycle": {}, "ema": {},
+            "cp_boxes": {}, "liquidity_cycle": {}
         }
 
 # =================== POSITION RECOVERY ===================
@@ -2328,7 +2666,7 @@ def compute_flow_metrics(df):
 # ========= Unified snapshot emitter =========
 def emit_snapshots(exchange, symbol, df, balance_fn=None, pnl_fn=None):
     """
-    يطبع Snapshot موحّد: Bookmap + Flow + Council + Strategy + Balance/PnL + VWAP + OTC + EMA
+    يطبع Snapshot موحّد: Bookmap + Flow + Council + Strategy + Balance/PnL + VWAP + OTC + EMA + ChartPrime
     """
     try:
         bm = bookmap_snapshot(exchange, symbol)
@@ -2396,11 +2734,23 @@ def emit_snapshots(exchange, symbol, df, balance_fn=None, pnl_fn=None):
             ema_label = ema_ctx.get("label", "")
             ema_score = ema_ctx.get("score", 0.0)
             ema_note = f" | 📈 EMA:{ema_label}({ema_score:.1f})"
+            
+        # ChartPrime info
+        cp_note = ""
+        cp_boxes = cv.get("cp_boxes", {})
+        if cp_boxes.get("side"):
+            cp_note = f" | 📦 {cp_boxes['side'].upper()} box({cp_boxes.get('box_score',0):.1f})"
+            
+        # Liquidity Cycle info
+        liq_note = ""
+        liq_cycle = cv.get("liquidity_cycle", {})
+        if liq_cycle.get("regime") != "chop":
+            liq_note = f" | 💧 {liq_cycle['regime'].replace('_', ' ').upper()}"
 
         if LOG_ADDONS:
             print(f"🧱 {bm_note}", flush=True)
             print(f"📦 {fl_note}", flush=True)
-            print(f"📊 {dash}{gz_note}{otc_note}{ema_note}", flush=True)
+            print(f"📊 {dash}{gz_note}{otc_note}{ema_note}{cp_note}{liq_note}", flush=True)
             print(f"{strat}{(' | ' + wallet) if wallet else ''}", flush=True)
             
             gz_snap_note = ""
@@ -2432,10 +2782,20 @@ def emit_snapshots(exchange, symbol, df, balance_fn=None, pnl_fn=None):
             ema_snap = ""
             if ema_ctx.get("label") != "none":
                 ema_snap = f" | 📈EMA:{ema_ctx.get('label','')}({ema_ctx.get('score',0):.1f})"
+                
+            # ChartPrime snapshot
+            cp_snap = ""
+            if cp_boxes.get("side"):
+                cp_snap = f" | 📦{cp_boxes['side'][:3].upper()}({cp_boxes.get('box_score',0):.1f})"
+                
+            # Liquidity snapshot
+            liq_snap = ""
+            if liq_cycle.get("regime") != "chop":
+                liq_snap = f" | 💧{liq_cycle['regime'][:8]}"
             
             print(f"🧠 SNAP | {side_hint} | votes={cv['b']}/{cv['s']} score={cv['score_b']:.1f}/{cv['score_s']:.1f} "
                   f"| ADX={cv['ind'].get('adx',0):.1f} DI={cv['ind'].get('di_spread',0):.1f} | "
-                  f"z={flow_z:.2f} | imb={bm_imb:.2f}{gz_snap_note}{vwap_info}{otc_snap}{ema_snap}", 
+                  f"z={flow_z:.2f} | imb={bm_imb:.2f}{gz_snap_note}{vwap_info}{otc_snap}{ema_snap}{cp_snap}{liq_snap}", 
                   flush=True)
             
             # إضافة معلومات Footprint وSMC
@@ -2457,6 +2817,16 @@ def emit_snapshots(exchange, symbol, df, balance_fn=None, pnl_fn=None):
             # EMA detailed info
             if ema_ctx.get("label") != "none":
                 print(f"📈 EMA CROSSOVER | {ema_ctx.get('label')} | score={ema_ctx.get('score',0):.1f} | side={ema_ctx.get('side','flat')}", flush=True)
+                
+            # ChartPrime detailed info
+            if cp_boxes.get("side"):
+                print(f"📦 CHART PRIME | {cp_boxes['side'].upper()} | score={cp_boxes.get('box_score',0):.1f} | "
+                      f"sup={cp_boxes.get('support_level','N/A')} | res={cp_boxes.get('resistance_level','N/A')}", flush=True)
+                
+            # Liquidity Cycle detailed info
+            if liq_cycle.get("regime") != "chop":
+                print(f"💧 LIQUIDITY CYCLE | {liq_cycle['regime']} | bias={liq_cycle.get('continuation_bias','none')} | "
+                      f"ADX={liq_cycle.get('adx',0):.1f} | ART={liq_cycle.get('art_phase','')}", flush=True)
             
             print("✅ ENHANCED ADDONS LIVE", flush=True)
 
@@ -2493,11 +2863,23 @@ def execute_trade_decision(side, price, qty, mode, council_data, gz_data):
     ema_ctx = council_data.get("ema", {})
     if ema_ctx.get("label") != "none":
         ema_note = f" | 📈 EMA:{ema_ctx.get('label','')}"
+        
+    # ChartPrime note
+    cp_note = ""
+    cp_boxes = council_data.get("cp_boxes", {})
+    if cp_boxes.get("side"):
+        cp_note = f" | 📦 {cp_boxes['side'][:3].upper()}({cp_boxes.get('box_score',0):.1f})"
+        
+    # Liquidity note
+    liq_note = ""
+    liq_cycle = council_data.get("liquidity_cycle", {})
+    if liq_cycle.get("regime") != "chop":
+        liq_note = f" | 💧 {liq_cycle['regime'][:8]}"
     
     votes = council_data
     print(f"🎯 EXECUTE: {side.upper()} {qty:.4f} @ {price:.6f} | "
           f"mode={mode} | votes={votes['b']}/{votes['s']} score={votes['score_b']:.1f}/{votes['score_s']:.1f}"
-          f"{gz_note}{otc_note}{ema_note}", flush=True)
+          f"{gz_note}{otc_note}{ema_note}{cp_note}{liq_note}", flush=True)
 
     try:
         if MODE_LIVE:
@@ -3231,7 +3613,7 @@ def sync_manual_close():
 
 # =================== ENHANCED TRADE LOOP ===================
 def trade_loop_enhanced():
-    """حلقة تداول محسنة مع Golden Zone Pro وSmart Profit AI وVWAP وOTC Detection وEMA Cross + Risk Guards"""
+    """حلقة تداول محسنة مع Golden Zone Pro وSmart Profit AI وVWAP وOTC Detection وEMA Cross + Risk Guards + ChartPrime"""
     global wait_for_next_signal_side
     loop_i = 0
     
@@ -3279,6 +3661,8 @@ def trade_loop_enhanced():
             footprint = council_data.get("footprint", {})
             otc = council_data.get("otc", {})
             ema_ctx = council_data.get("ema", {})
+            cp_boxes = council_data.get("cp_boxes", {})
+            liq_cycle = council_data.get("liquidity_cycle", {})
             sig = None
 
             # ===== POST-BIG-WIN FILTER =====
@@ -3309,6 +3693,24 @@ def trade_loop_enhanced():
                 elif otc.get("otc_sell") and otc.get("strength", 0) >= 2.0:
                     sig = "sell"
                     log_i(f"💰 OTC ENTRY: SELL | strength={otc.get('strength',0):.1f} | سيولة بيع مخفية قوية")
+
+            # --- ChartPrime Boxes Entry ---
+            if not golden_entry and not sig and cp_boxes:
+                if cp_boxes.get("side") == "support" and cp_boxes.get("box_score", 0) >= 7.5:
+                    sig = "buy"
+                    log_i(f"📦 CHART PRIME SUPPORT ENTRY: BUY | score={cp_boxes.get('box_score',0):.1f} | صندوق دعم قوي")
+                elif cp_boxes.get("side") == "resistance" and cp_boxes.get("box_score", 0) >= 7.5:
+                    sig = "sell"
+                    log_i(f"📦 CHART PRIME RESISTANCE ENTRY: SELL | score={cp_boxes.get('box_score',0):.1f} | صندوق مقاومة قوي")
+
+            # --- Liquidity Cycle Entry ---
+            if not golden_entry and not sig and liq_cycle:
+                if liq_cycle.get("regime") == "bull_accumulation" and liq_cycle.get("continuation_bias") == "up":
+                    sig = "buy"
+                    log_i(f"💧 LIQUIDITY CYCLE ENTRY: BUY | {liq_cycle.get('notes', [''])[0]}")
+                elif liq_cycle.get("regime") == "bear_accumulation" and liq_cycle.get("continuation_bias") == "down":
+                    sig = "sell"
+                    log_i(f"💧 LIQUIDITY CYCLE ENTRY: SELL | {liq_cycle.get('notes', [''])[0]}")
 
             # --- Council Strong Entry مع تخفيف احترافي للتقاطع القوي ---
             if not golden_entry and not sig:
@@ -3359,15 +3761,14 @@ def trade_loop_enhanced():
                 if not pro_ok:
                     reason = f"pro_entry_block: {pro_info.get('reason')}"
                     log_i(f"🛡 PRO ENTRY BLOCKED [{sig.upper()}] → {reason}")
-                    log_i(f"   • zone={pro_info.get('zone_grade')} | liq={pro_info.get('liquidity')} | "
-                          f"adx={pro_info.get('adx_phase')}({pro_info.get('adx_trend_side')}) | "
-                          f"art={pro_info.get('art_phase')} | cross={pro_info.get('cross_strength')}")
+                    log_i(f"   • zone={pro_info.get('zone_grade')} | liq={pro_info.get('liquidity_regime')}/{pro_info.get('liquidity_bias')} | "
+                          f"cp_box={pro_info.get('cp_box_side')}({pro_info.get('cp_box_score',0):.1f})")
                 else:
                     log_i(f"✅ PRO ENTRY PASS [{sig.upper()}] "
-                          f"| zone={pro_info.get('zone_grade')} | liq={pro_info.get('liquidity')} | "
-                          f"adx={pro_info.get('adx_phase')}({pro_info.get('adx_trend_side')}) | "
-                          f"art={pro_info.get('art_phase')} | cross={pro_info.get('cross_strength'):.1f} | "
-                          f"candle={pro_info.get('candle_pattern')} | gz={pro_info.get('gz_type')}")
+                          f"| zone={pro_info.get('zone_grade')} | ema={pro_info.get('ema_score'):.1f} | "
+                          f"flow={pro_info.get('flow_bias')} | adx={pro_info.get('adx', 0):.1f} | "
+                          f"liq={pro_info.get('liquidity_regime')}/{pro_info.get('liquidity_bias')} | "
+                          f"cp_box={pro_info.get('cp_box_side')}({pro_info.get('cp_box_score',0):.1f})")
                     
                     # تحديد نمط الصفقة (scalp / trend)
                     mode_ctx = decide_strategy_mode_enhanced(
@@ -3407,7 +3808,7 @@ def trade_loop_enhanced():
                             if ok:
                                 wait_for_next_signal_side = None
                                 # تسجيل قرار المجلس المحسن
-                                entry_type = "GOLDEN" if golden_entry else "OTC" if otc.get("otc_buy") or otc.get("otc_sell") else "COUNCIL"
+                                entry_type = "GOLDEN" if golden_entry else "OTC" if otc.get("otc_buy") or otc.get("otc_sell") else "CHART_PRIME" if cp_boxes.get("side") else "LIQUIDITY" if liq_cycle.get("regime") != "chop" else "COUNCIL"
                                 if ema_label in ("strong_bull", "strong_bear"):
                                     entry_type = f"EMA_STRONG_{entry_type}"
                                 
@@ -3451,7 +3852,7 @@ def pretty_snapshot(bal, info, ind, spread_bps, reason=None, df=None):
         print("📈 INDICATORS & RF")
         print(f"   💲 Price {fmt(info.get('price'))} | RF filt={fmt(info.get('filter'))}  hi={fmt(info.get('hi'))} lo={fmt(info.get('lo'))}")
         print(f"   🧮 RSI={fmt(ind.get('rsi'))}  +DI={fmt(ind.get('plus_di'))}  -DI={fmt(ind.get('minus_di'))}  ADX={fmt(ind.get('adx'))}  ATR={fmt(ind.get('atr'))}")
-        print(f"   🎯 ENTRY: COUNCIL PRO + GOLDEN ENTRY + VWAP STRATEGY + OTC DETECTION + EMA CROSSOVER ENGINE  |  spread_bps={fmt(spread_bps,2)}")
+        print(f"   🎯 ENTRY: COUNCIL PRO + GOLDEN ENTRY + VWAP STRATEGY + OTC DETECTION + EMA CROSSOVER ENGINE + CHART PRIME  |  spread_bps={fmt(spread_bps,2)}")
         print(f"   ⏱️ closes_in ≈ {left_s}s")
         
         # عرض معلومات الـ Guards
@@ -3487,7 +3888,7 @@ app = Flask(__name__)
 @app.route("/")
 def home():
     mode='LIVE' if MODE_LIVE else 'PAPER'
-    return f"✅ Council PRO Bot — {SYMBOL} {INTERVAL} — {mode} — Enhanced Candles + Golden Zone Pro + Smart Profit AI + VWAP Strategy + OTC Detection + EMA Crossover Engine + Hard Stop Loss + Post-Big-Win Guard + Auto-Recovery"
+    return f"✅ Council PRO Bot — {SYMBOL} {INTERVAL} — {mode} — Enhanced Candles + Golden Zone Pro + Smart Profit AI + VWAP Strategy + OTC Detection + EMA Crossover Engine + Hard Stop Loss + Post-Big-Win Guard + Auto-Recovery + ChartPrime"
 
 @app.route("/metrics")
 def metrics():
@@ -3495,7 +3896,7 @@ def metrics():
         "symbol": SYMBOL, "interval": INTERVAL, "mode": "live" if MODE_LIVE else "paper",
         "leverage": LEVERAGE, "risk_alloc": RISK_ALLOC, "price": price_now(),
         "state": STATE, "compound_pnl": compound_pnl,
-        "entry_mode": "COUNCIL_PRO_GOLDEN_ENHANCED_VWAP_OTC_EMA", "wait_for_next_signal": wait_for_next_signal_side,
+        "entry_mode": "COUNCIL_PRO_GOLDEN_ENHANCED_VWAP_OTC_EMA_CHARTPRIME", "wait_for_next_signal": wait_for_next_signal_side,
         "risk_guards": {
             "hard_stop_pct": abs(MAX_LOSS_PCT)*100,
             "big_win_pct": BIG_WIN_PCT*100,
@@ -3520,6 +3921,15 @@ def metrics():
             "mid_period": 21,
             "slow_period": 50
         },
+        "chart_prime": {
+            "enabled": True,
+            "lookback_period": 20,
+            "vol_len": 2
+        },
+        "liquidity_cycle": {
+            "enabled": True,
+            "regime": STATE.get("liquidity_cycle", {}).get("regime", "unknown")
+        },
         "current_guards": {
             "post_big_win_active": STATE.get("post_big_win_mode", False),
             "post_big_win_bars_left": STATE.get("post_big_win_bars_left", 0),
@@ -3534,7 +3944,7 @@ def health():
         "ok": True, "mode": "live" if MODE_LIVE else "paper",
         "open": STATE["open"], "side": STATE["side"], "qty": STATE["qty"],
         "compound_pnl": compound_pnl, "timestamp": datetime.utcnow().isoformat(),
-        "entry_mode": "COUNCIL_PRO_GOLDEN_ENHANCED_VWAP_OTC_EMA", "wait_for_next_signal": wait_for_next_signal_side,
+        "entry_mode": "COUNCIL_PRO_GOLDEN_ENHANCED_VWAP_OTC_EMA_CHARTPRIME", "wait_for_next_signal": wait_for_next_signal_side,
         "risk_guards": {
             "hard_stop_active": STATE.get("max_loss_price") is not None,
             "post_big_win_active": STATE.get("post_big_win_mode", False)
@@ -3578,6 +3988,7 @@ if __name__ == "__main__":
     print(colored(f"SMART PROFIT AI: Dynamic profit taking + Signal strength", "yellow"))
     print(colored(f"VWAP STRATEGY: SCALP(near {VWAP_SCALP_BAND_BPS}bps) | TREND(far {VWAP_TREND_BAND_BPS}bps)", "yellow"))
     print(colored(f"EMA CROSSOVER ENGINE: Strong/Weak Trend Detection (9/21/50)", "yellow"))
+    print(colored(f"📦 CHART PRIME: High-Volume Boxes + Liquidity Cycle Monitor", "green"))
     print(colored(f"🛡️ RISK GUARDS: Hard Stop Loss (-{abs(MAX_LOSS_PCT)*100}%) | Post-Big-Win Guard (+{BIG_WIN_PCT*100}%)", "red"))
     print(colored(f"🔄 AUTO RECOVERY: Enhanced position sync on restart", "green"))
     print(colored(f"🔄 MANUAL CLOSE SYNC: Enabled (detects manual close from exchange)", "green"))
