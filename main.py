@@ -11,6 +11,7 @@ RF Futures Bot — RF-LIVE ONLY (BingX Perp via CCXT)
 • EMA Crossover Strength Engine (Strong/Weak Trend Detection)
 • ENHANCED WITH: Hard Stop Loss, Post-Big-Win Guard, Auto-Recovery
 • CHART PRIME: High-Volume Boxes + Liquidity Cycle Monitor
+• HUNTER PATCH: Unified Entry, ADX/ATR Smart Monitoring, 8-Tick Iron SL
 """
 
 import os, time, math, random, signal, sys, traceback, logging, json
@@ -45,7 +46,7 @@ SHADOW_MODE_DASHBOARD = False
 DRY_RUN = False
 
 # ==== Addon: Logging + Recovery Settings ====
-BOT_VERSION = "DOGE Council PRO v5.0 — Smart Profit AI + Golden Zone Pro + VWAP Strategy + OTC Detection + EMA Crossover Engine + Hard Stop + Post-Big-Win Guard + Auto-Recovery + ChartPrime Liquidity Monitor"
+BOT_VERSION = "DOGE Council PRO v5.0 — Smart Profit AI + Golden Zone Pro + VWAP Strategy + OTC Detection + EMA Crossover Engine + Hard Stop + Post-Big-Win Guard + Auto-Recovery + ChartPrime Liquidity Monitor + HUNTER PATCH"
 print("🔁 Booting:", BOT_VERSION, flush=True)
 
 STATE_PATH = "./bot_state.json"
@@ -64,7 +65,7 @@ CVD_SMOOTH = 8
 # ================== RISK & GUARDS CONFIG ==================
 MAX_LOSS_PCT      = -0.005   # -0.50% حدّ خسارة صارم للصفقة الواحدة
 BIG_WIN_PCT       =  0.020   # +2.0% أو أكثر تعتبر صفقة Big Win
-POST_BIG_WIN_BARS =  2       # عدد الشموع بعد Big Win يتم فيها تفعيل الحذر (بعدها يرجع يشتغل عادي)
+POST_BIG_WIN_BARS =  2       # عدد الشموع بعد Big Win يتم فيها تفعيل الحذر
 
 # =================== ENHANCED SETTINGS ===================
 SYMBOL     = os.getenv("SYMBOL", "DOGE/USDT:USDT")
@@ -122,7 +123,6 @@ CLOSE_VERIFY_WAIT_S  = 2.0
 # Pacing
 BASE_SLEEP   = 5
 NEAR_CLOSE_S = 1
-# كل قد إيه نطبع حالة الصفقة وهي مفتوحة (بالثواني)
 POSITION_STATUS_LOG_INTERVAL = 30
 
 # ==== Smart Exit Tuning ===
@@ -136,14 +136,14 @@ TIME_IN_TRADE_MIN  = 8
 TRAIL_TIGHT_MULT   = 1.20
 
 # ==== OTC Hidden Flow Detection Settings ====
-OTC_WINDOW_BARS          = 5        # عدد الشموع اللي نحلّل عليها حركة السعر + الفلو
-OTC_MIN_MOVE_BPS         = 60.0     # أقل حركة سعر (بالـ bps) نعتبرها Pump/Dump (0.6%)
-OTC_MAX_VISIBLE_FLOW_PCT = 0.25     # لو الفلو الظاهر أقل من 25% من الفوليوم -> نعتبرها سيولة مخفية
-OTC_STRENGTH_SCALE       = 0.1      # مقياس لتحويل الحركة + ضعف الفلو لقوة (score)
+OTC_WINDOW_BARS          = 5
+OTC_MIN_MOVE_BPS         = 60.0
+OTC_MAX_VISIBLE_FLOW_PCT = 0.25
+OTC_STRENGTH_SCALE       = 0.1
 
 # ==== OTC Exit Tuning (بعد TP1) ====
-OTC_EXIT_MIN_STRENGTH = 2.0      # أقل قوة OTC نعتبرها تهديد حقيقي
-OTC_EXIT_MIN_PNL_PCT  = 0.60/100 # أقل ربح (0.6%) نسمح فيه بإغلاق بسبب OTC عكسي
+OTC_EXIT_MIN_STRENGTH = 2.0
+OTC_EXIT_MIN_PNL_PCT  = 0.60/100
 
 # ==== Enhanced Golden Entry Settings ====
 GOLDEN_ENTRY_SCORE = 7.0
@@ -179,12 +179,24 @@ ADX_GATE = 18
 FOOTPRINT_WINDOW = 10
 VOLUME_SPIKE_THRESHOLD = 2.0
 LIQUIDITY_TRAP_DETECTION = True
-DISPLACEMENT_THRESHOLD = 0.002  # 0.2%
+DISPLACEMENT_THRESHOLD = 0.002
 
 # ==== VWAP Settings ====
 VWAP_ENABLED = True
-VWAP_SCALP_BAND_BPS = 8.0     # قرب من VWAP = سكالب
-VWAP_TREND_BAND_BPS = 20.0    # بعيد عن VWAP = ترند قوي
+VWAP_SCALP_BAND_BPS = 8.0
+VWAP_TREND_BAND_BPS = 20.0
+
+# ===================== HUNTER PATCH CONFIG =====================
+USE_IRON_SL_TICKS = True
+HARD_SL_TICKS = 8        # 8 نقاط Bybit
+ADX_ACCUM_MAX = 15       # تحتها = تجميع
+ADX_TREND_MIN = 22       # بداية ترند
+ADX_EXIT_WEAK = 18       # ضعف ترند للخروج
+DI_EDGE = 2.0
+
+EXIT_WEAKNESS_VOTES = 2  # 2 إشارات ضعف = خروج
+MIN_PROFIT_TO_EXIT = 0.20  # % ربح أدنى قبل الخروج الذكي
+# ===============================================================
 
 # =================== PROFESSIONAL LOGGING ===================
 def log_i(msg): print(f"ℹ️ {msg}", flush=True)
@@ -211,6 +223,87 @@ def load_state() -> dict:
     except Exception as e:
         log_w(f"state load failed: {e}")
     return {}
+
+# =================== HUNTER PATCH UTILITIES ===================
+def get_tick_size(exchange, symbol):
+    try:
+        m = exchange.market(symbol)
+        p = m.get("precision", {}).get("price", None)
+        if isinstance(p, int):
+            return 10 ** (-p)
+        info = m.get("info", {}) or {}
+        for k in ("tickSize", "tick_size"):
+            if k in info and float(info[k]) > 0:
+                return float(info[k])
+    except Exception:
+        pass
+    return 0.0001  # fallback
+
+def compute_iron_sl(entry_price, side, tick_size, ticks):
+    dist = tick_size * ticks
+    return entry_price - dist if side == "long" else entry_price + dist
+
+def adx_atr_watcher(ind, state):
+    adx = float(ind.get("adx", 0))
+    atr = float(ind.get("atr", 0))
+    dip = float(ind.get("plus_di", 0))
+    dim = float(ind.get("minus_di", 0))
+
+    hist_adx = state.setdefault("hist_adx", [])
+    hist_atr = state.setdefault("hist_atr", [])
+    hist_adx.append(adx); hist_atr.append(atr)
+    if len(hist_adx) > 20: hist_adx.pop(0)
+    if len(hist_atr) > 20: hist_atr.pop(0)
+
+    adx_slope = hist_adx[-1] - hist_adx[-3] if len(hist_adx) >= 3 else 0
+    atr_ma = sum(hist_atr) / len(hist_atr)
+    atr_reg = "expand" if atr > atr_ma * 1.05 else "contract" if atr < atr_ma * 0.95 else "stable"
+
+    if adx <= ADX_ACCUM_MAX:
+        regime = "ACCUMULATION"
+    elif adx >= ADX_TREND_MIN:
+        regime = "TREND"
+    else:
+        regime = "PREP"
+
+    side = "up" if dip > dim + DI_EDGE else "down" if dim > dip + DI_EDGE else "flat"
+
+    return {
+        "adx": adx,
+        "atr": atr,
+        "adx_slope": adx_slope,
+        "atr_reg": atr_reg,
+        "regime": regime,
+        "side": side
+    }
+
+def accumulation_launch_signal(ind, state):
+    adx = ind["adx"]
+    dip = ind["plus_di"]
+    dim = ind["minus_di"]
+
+    w = state.get("watcher", {})
+    atr_reg = w.get("atr_reg")
+
+    hist_adx = state.get("hist_adx", [])
+    adx_rising = len(hist_adx) >= 3 and hist_adx[-1] > hist_adx[-2] > hist_adx[-3]
+
+    compression = adx <= ADX_ACCUM_MAX and atr_reg == "contract"
+
+    launch = compression and adx_rising and atr_reg in ("stable", "expand")
+
+    side = None
+    if launch:
+        if dip > dim + DI_EDGE:
+            side = "buy"
+        elif dim > dip + DI_EDGE:
+            side = "sell"
+
+    return {
+        "compression": compression,
+        "launch": bool(launch and side),
+        "side": side
+    }
 
 # =================== ENHANCED CANDLES MODULE WITH SMC ===================
 def _body(o,c): return abs(c-o)
@@ -531,6 +624,7 @@ def verify_execution_environment():
     print(f"📈 EMA CROSSOVER ENGINE: Strong/Weak Trend Detection", flush=True)
     print(f"🛡️ RISK GUARDS: Hard Stop Loss (-{abs(MAX_LOSS_PCT)*100}%) | Post-Big-Win Guard (+{BIG_WIN_PCT*100}%)", flush=True)
     print(f"📦 CHART PRIME: High-Volume Boxes + Liquidity Cycle Monitor", flush=True)
+    print(f"🎯 HUNTER PATCH: Unified Entry | ADX/ATR Smart Monitor | 8-Tick Iron SL", flush=True)
     
     if not EXECUTE_ORDERS:
         print("🟡 WARNING: EXECUTE_ORDERS=False - البوت في وضع التحليل فقط!", flush=True)
@@ -2971,6 +3065,15 @@ def open_market_enhanced(side, qty, price):
             "trade_profile": trade_profile,
         })
         
+        # ===================== HUNTER PATCH: IRON SL =====================
+        if USE_IRON_SL_TICKS:
+            tick = get_tick_size(ex, SYMBOL)
+            STATE["hard_sl"] = compute_iron_sl(
+                STATE["entry"], STATE["side"], tick, HARD_SL_TICKS
+            )
+            log_w(f"🎯 IRON SL SET @ {STATE['hard_sl']:.6f} (8 ticks)")
+        # ================================================================
+        
         save_state({
             "in_position": True,
             "side": "LONG" if side.upper().startswith("B") else "SHORT",
@@ -2991,6 +3094,7 @@ def open_market_enhanced(side, qty, price):
             "trail_active": False,
             "trail_tightened": False,
             "last_status_log_ts": 0.0,
+            "hard_sl": STATE.get("hard_sl"),
         })
 
         # === لوج افتتاح الصفقة + خطة جني الأرباح ===
@@ -3135,6 +3239,11 @@ STATE = {
     "last_closed_pnl_pct": 0.0,       # نسبة ربح/خسارة آخر صفقة مغلقة
     "post_big_win_mode": False,       # هل إحنا في وضع حماية بعد مكسب كبير؟
     "post_big_win_bars_left": 0,      # عدد الشموع المتبقية في وضع Post Big Win
+    
+    # --- HUNTER PATCH ---
+    "hard_sl": None,                  # ستوب حديدي 8 نقاط
+    "hist_adx": [],                   # تاريخ ADX للمراقبة
+    "hist_atr": [],                   # تاريخ ATR للمراقبة
 }
 compound_pnl = 0.0
 wait_for_next_signal_side = None
@@ -3254,6 +3363,9 @@ def _reset_after_close(reason, prev_side=None):
         "trade_profile": None,
         "signal_strength": 0.0,
         "last_status_log_ts": 0.0,
+        "hard_sl": None,  # إعادة تعيين Iron SL
+        "hist_adx": [],
+        "hist_atr": [],
     })
     save_state({"in_position": False, "position_qty": 0})
     
@@ -3386,7 +3498,7 @@ def smart_exit_guard(state, df, ind, flow, bm, now_price, pnl_pct, mode, side, e
 
 # =================== ENHANCED TRADE MANAGEMENT ===================
 def manage_after_entry_enhanced(df, ind, info):
-    """إدارة محسنة للمركز مع Smart Profit AI + Smart Exit Guard + Hard Stop"""
+    """إدارة محسنة للمركز مع Smart Profit AI + Smart Exit Guard + Hard Stop + HUNTER PATCH"""
     if not STATE["open"] or STATE["qty"] <= 0:
         return
 
@@ -3395,6 +3507,22 @@ def manage_after_entry_enhanced(df, ind, info):
     side  = STATE["side"]
     qty   = STATE["qty"]
     mode  = STATE.get("mode", "trend")
+    
+    # ========= HUNTER PATCH: IRON SL =========
+    if USE_IRON_SL_TICKS and STATE.get("hard_sl"):
+        sl = STATE["hard_sl"]
+        if side == "long" and px <= sl:
+            pnl_pct = compute_unrealized_pnl_pct(STATE, px)
+            log_w(f"🛑 IRON SL HIT (LONG) @ {px:.6f} | Loss: {pnl_pct*100:.2f}%")
+            close_market_strict("IRON_SL")
+            risk_on_trade_closed(STATE, pnl_pct)
+            return
+        elif side == "short" and px >= sl:
+            pnl_pct = compute_unrealized_pnl_pct(STATE, px)
+            log_w(f"🛑 IRON SL HIT (SHORT) @ {px:.6f} | Loss: {pnl_pct*100:.2f}%")
+            close_market_strict("IRON_SL")
+            risk_on_trade_closed(STATE, pnl_pct)
+            return
     
     # ========= HARD MAX LOSS GUARD (ستوب صارم) =========
     max_loss_price = STATE.get("max_loss_price")
@@ -3418,6 +3546,19 @@ def manage_after_entry_enhanced(df, ind, info):
 
     if pnl_pct > STATE.get("highest_profit_pct", 0.0):
         STATE["highest_profit_pct"] = pnl_pct
+
+    # ========= HUNTER PATCH: ADX/ATR WEAKNESS EXIT =========
+    watch = adx_atr_watcher(ind, STATE)
+    
+    weak_votes = 0
+    if watch["adx"] < ADX_EXIT_WEAK: weak_votes += 1
+    if watch["atr_reg"] == "contract": weak_votes += 1
+    if watch["adx_slope"] < 0: weak_votes += 1
+
+    if pnl_pct >= MIN_PROFIT_TO_EXIT and weak_votes >= EXIT_WEAKNESS_VOTES:
+        log_w(f"🛑 ADX/ATR WEAKNESS EXIT | votes={weak_votes} | pnl={pnl_pct:.2f}%")
+        close_market_strict("ADX_ATR_WEAKNESS")
+        return
 
     # ========= Smart Profit AI (سلم جني الأرباح الذكي) =========
     profit_decision = smart_profit_ai_decision(STATE, df, ind, mode, side, entry, px)
@@ -3613,7 +3754,7 @@ def sync_manual_close():
 
 # =================== ENHANCED TRADE LOOP ===================
 def trade_loop_enhanced():
-    """حلقة تداول محسنة مع Golden Zone Pro وSmart Profit AI وVWAP وOTC Detection وEMA Cross + Risk Guards + ChartPrime"""
+    """حلقة تداول محسنة مع Golden Zone Pro وSmart Profit AI وVWAP وOTC Detection وEMA Cross + Risk Guards + ChartPrime + HUNTER PATCH"""
     global wait_for_next_signal_side
     loop_i = 0
     
@@ -3651,7 +3792,7 @@ def trade_loop_enhanced():
                     **info
                 })
             
-            # قرار الدخول المحسن
+            # ===================== HUNTER PATCH: UNIFIED ENTRY DECISION =====================
             reason = None
             if spread_bps is not None and spread_bps > MAX_SPREAD_BPS:
                 reason = f"spread too high ({fmt(spread_bps,2)}bps > {MAX_SPREAD_BPS})"
@@ -3663,167 +3804,105 @@ def trade_loop_enhanced():
             ema_ctx = council_data.get("ema", {})
             cp_boxes = council_data.get("cp_boxes", {})
             liq_cycle = council_data.get("liquidity_cycle", {})
-            sig = None
 
-            # ===== POST-BIG-WIN FILTER =====
-            if STATE.get("post_big_win_mode") and not STATE["open"]:
-                # فلترة الإشارات في وضع Post-Big-Win
-                if STATE["post_big_win_bars_left"] > 0:
-                    log_i(f"🛡️ POST-BIG-WIN MODE ACTIVE: {STATE['post_big_win_bars_left']} bars remaining - Applying strict filters")
-
-            # --- Enhanced Golden Entry Pro ---
-            golden_entry = False
-            if (gz and gz.get("ok") and gz.get("confirmed")):
-                if gz["zone"]["type"]=="golden_bottom" and gz["score"]>=GOLDEN_ENTRY_SCORE:
-                    if footprint.get('ok') and footprint.get('absorption_bull'):
-                        sig = "buy"
-                        golden_entry = True
-                        log_i(f"🎯 GOLDEN ENTRY PRO: BUY | score={gz['score']:.1f} | منطقة ذهبية مؤكدة + Footprint")
-                elif gz["zone"]["type"]=="golden_top" and gz["score"]>=GOLDEN_ENTRY_SCORE:
-                    if footprint.get('ok') and footprint.get('absorption_bear'):
-                        sig = "sell"
-                        golden_entry = True
-                        log_i(f"🎯 GOLDEN ENTRY PRO: SELL | score={gz['score']:.1f} | منطقة ذهبية مؤكدة + Footprint")
-
-            # --- OTC Enhanced Entry ---
-            if not golden_entry and otc:
-                if otc.get("otc_buy") and otc.get("strength", 0) >= 2.0:
-                    sig = "buy"
-                    log_i(f"💰 OTC ENTRY: BUY | strength={otc.get('strength',0):.1f} | سيولة شراء مخفية قوية")
-                elif otc.get("otc_sell") and otc.get("strength", 0) >= 2.0:
-                    sig = "sell"
-                    log_i(f"💰 OTC ENTRY: SELL | strength={otc.get('strength',0):.1f} | سيولة بيع مخفية قوية")
-
-            # --- ChartPrime Boxes Entry ---
-            if not golden_entry and not sig and cp_boxes:
-                if cp_boxes.get("side") == "support" and cp_boxes.get("box_score", 0) >= 7.5:
-                    sig = "buy"
-                    log_i(f"📦 CHART PRIME SUPPORT ENTRY: BUY | score={cp_boxes.get('box_score',0):.1f} | صندوق دعم قوي")
-                elif cp_boxes.get("side") == "resistance" and cp_boxes.get("box_score", 0) >= 7.5:
-                    sig = "sell"
-                    log_i(f"📦 CHART PRIME RESISTANCE ENTRY: SELL | score={cp_boxes.get('box_score',0):.1f} | صندوق مقاومة قوي")
-
-            # --- Liquidity Cycle Entry ---
-            if not golden_entry and not sig and liq_cycle:
-                if liq_cycle.get("regime") == "bull_accumulation" and liq_cycle.get("continuation_bias") == "up":
-                    sig = "buy"
-                    log_i(f"💧 LIQUIDITY CYCLE ENTRY: BUY | {liq_cycle.get('notes', [''])[0]}")
-                elif liq_cycle.get("regime") == "bear_accumulation" and liq_cycle.get("continuation_bias") == "down":
-                    sig = "sell"
-                    log_i(f"💧 LIQUIDITY CYCLE ENTRY: SELL | {liq_cycle.get('notes', [''])[0]}")
-
-            # --- Council Strong Entry مع تخفيف احترافي للتقاطع القوي ---
-            if not golden_entry and not sig:
-                ema_label = ema_ctx.get("label", "none")
-                strong_bull = (ema_label == "strong_bull")
-                strong_bear = (ema_label == "strong_bear")
-
-                buy_score  = council_data["score_b"]
-                sell_score = council_data["score_s"]
-
-                buy_ok = False
-                sell_ok = False
-
-                # الأساس: 8.0 زي ما هو
-                if buy_score >= 8.0 and buy_score > sell_score:
-                    buy_ok = True
-                elif sell_score >= 8.0 and sell_score > buy_score:
-                    sell_ok = True
-
-                # ===== POST-BIG-WIN FILTER =====
-                if STATE.get("post_big_win_mode"):
-                    # في وضع Post-Big-Win نرفع السقف
-                    if buy_score >= 8.5 and buy_score > sell_score and strong_bull:
-                        buy_ok = True
-                        log_i(f"✅ BUY by Council(8.5+) + EMA STRONG BULL ({buy_score:.1f}) - POST-BIG-WIN MODE")
-                    elif sell_score >= 8.5 and sell_score > buy_score and strong_bear:
-                        sell_ok = True
-                        log_i(f"✅ SELL by Council(8.5+) + EMA STRONG BEAR ({sell_score:.1f}) - POST-BIG-WIN MODE")
-                    else:
-                        log_i(f"🛑 POST-BIG-WIN MODE: Skipping weak signal (Buy: {buy_score:.1f}, Sell: {sell_score:.1f})")
-                else:
-                    # تخفيف احترافي: 7.0 مسموح فقط لو EMA strong في نفس الاتجاه
-                    if not buy_ok and buy_score >= 7.0 and buy_score > sell_score and strong_bull:
-                        buy_ok = True
-                        log_i(f"✅ BUY by Council(7.x) + EMA STRONG BULL ({buy_score:.1f})")
-                    if not sell_ok and sell_score >= 7.0 and sell_score > buy_score and strong_bear:
-                        sell_ok = True
-                        log_i(f"✅ SELL by Council(7.x) + EMA STRONG BEAR ({sell_score:.1f})")
-
-                if buy_ok:
-                    sig = "buy"
-                elif sell_ok:
-                    sig = "sell"
+            # مراقبة ADX/ATR
+            watch = adx_atr_watcher(ind, STATE)
             
-            # طبقة محرك الدخول الاحترافي فوق أي إشارة sig قبل فتح الصفقة
-            if not STATE["open"] and sig and reason is None:
-                pro_ok, pro_info = professional_entry_engine(df, sig, council_data)
-                if not pro_ok:
-                    reason = f"pro_entry_block: {pro_info.get('reason')}"
-                    log_i(f"🛡 PRO ENTRY BLOCKED [{sig.upper()}] → {reason}")
-                    log_i(f"   • zone={pro_info.get('zone_grade')} | liq={pro_info.get('liquidity_regime')}/{pro_info.get('liquidity_bias')} | "
-                          f"cp_box={pro_info.get('cp_box_side')}({pro_info.get('cp_box_score',0):.1f})")
+            # تحقق من التجميع (Accumulation) - منع الدخول
+            cl = accumulation_launch_signal(ind, STATE)
+            if cl["compression"]:
+                log_i("🧊 ACCUMULATION: ADX منخفض + ATR contract → WAIT")
+                reason = "accumulation_no_entry"
+            
+            # تحديد إشارات الـ Zones
+            gb = gz and gz.get("ok") and gz["zone"]["type"] == "golden_bottom"
+            gt = gz and gz.get("ok") and gz["zone"]["type"] == "golden_top"
+            buy_liquidity = footprint.get('ok') and footprint.get('absorption_bull')
+            sell_liquidity = footprint.get('ok') and footprint.get('absorption_bear')
+            
+            # Flow كإشارة Order Flow
+            ob_signal = None
+            flow = snap["flow"]
+            if flow and flow.get('ok'):
+                if flow['delta_z'] >= FLOW_SPIKE_Z and flow['cvd_trend'] == 'up':
+                    ob_signal = ("bullish", flow['delta_z'])
+                elif flow['delta_z'] <= -FLOW_SPIKE_Z and flow['cvd_trend'] == 'down':
+                    ob_signal = ("bearish", flow['delta_z'])
+            
+            fvg_signal = None  # FVG غير متوفر حالياً
+            
+            zone_ok = bool(
+                gb or gt or buy_liquidity or sell_liquidity or ob_signal or fvg_signal
+            )
+
+            if not zone_ok:
+                log_i("NO TRADE: price خارج Zone")
+                reason = "no_zone"
+            elif not cl["launch"]:
+                log_i("NO TRADE: لا يوجد إطلاق (Launch) من التجميع")
+                reason = "no_launch"
+            else:
+                buy_score = 0
+                sell_score = 0
+                reasons = []
+
+                # Zones
+                if gb: buy_score += 3; reasons.append("GoldenBottom")
+                if gt: sell_score += 3; reasons.append("GoldenTop")
+                if buy_liquidity: buy_score += 2; reasons.append("BuyLiquidity")
+                if sell_liquidity: sell_score += 2; reasons.append("SellLiquidity")
+                if ob_signal and ob_signal[0] == "bullish": buy_score += 2; reasons.append("OB_bull")
+                if ob_signal and ob_signal[0] == "bearish": sell_score += 2; reasons.append("OB_bear")
+
+                # ADX / ATR logic
+                if watch["regime"] == "ACCUMULATION":
+                    reasons.append("Accumulation: wait launch")
+                elif watch["regime"] == "TREND":
+                    if watch["side"] == "up":
+                        buy_score += 2; reasons.append("Trend_Up")
+                    elif watch["side"] == "down":
+                        sell_score += 2; reasons.append("Trend_Down")
+
+                # RF trigger
+                if info.get("long"): buy_score += 1; reasons.append("RF_Long")
+                if info.get("short"): sell_score += 1; reasons.append("RF_Short")
+                
+                # Launch signal boost
+                if cl["launch"]:
+                    log_g(f"🚀 LAUNCH DETECTED → {cl['side'].upper()}")
+                    if cl["side"] == "buy":
+                        buy_score += 3; reasons.append("Launch_BUY")
+                    elif cl["side"] == "sell":
+                        sell_score += 3; reasons.append("Launch_SELL")
+
+                final_signal = None
+                if buy_score >= 6 and buy_score > sell_score + 1:
+                    final_signal = "buy"
+                elif sell_score >= 6 and sell_score > buy_score + 1:
+                    final_signal = "sell"
+
+                if not final_signal:
+                    log_i(f"NO TRADE | buy={buy_score} sell={sell_score} reasons={reasons}")
+                    reason = f"insufficient_score buy={buy_score} sell={sell_score}"
                 else:
-                    log_i(f"✅ PRO ENTRY PASS [{sig.upper()}] "
-                          f"| zone={pro_info.get('zone_grade')} | ema={pro_info.get('ema_score'):.1f} | "
-                          f"flow={pro_info.get('flow_bias')} | adx={pro_info.get('adx', 0):.1f} | "
-                          f"liq={pro_info.get('liquidity_regime')}/{pro_info.get('liquidity_bias')} | "
-                          f"cp_box={pro_info.get('cp_box_side')}({pro_info.get('cp_box_score',0):.1f})")
-                    
-                    # تحديد نمط الصفقة (scalp / trend)
-                    mode_ctx = decide_strategy_mode_enhanced(
-                        df,
-                        adx=council_data["ind"].get("adx"),
-                        di_plus=council_data["ind"].get("plus_di"),
-                        di_minus=council_data["ind"].get("minus_di"),
-                        rsi_ctx=rsi_ma_context(df),
-                        footprint=footprint,
-                        ema_ctx=ema_ctx,
-                    )
-                    trade_mode = mode_ctx.get("mode", "scalp")
-                    
-                    # ✅ حارس اتجاه السكالب
-                    side_label = "long" if sig == "buy" else "short"
-                    side_label, skip_scalp = enforce_scalp_trend_alignment(
-                        df,
-                        council_data["ind"],
-                        side_label,
-                        mode_ctx,
-                    )
-                    if skip_scalp:
-                        # سكالب في سوق مش واضح → نسيبه
-                        log_i("⏸️ Skipping scalp due to unclear trend alignment")
-                        continue
-                    
-                    # تحديث السيجنال بعد التعديل
-                    sig = "buy" if side_label == "long" else "sell"
-                    
+                    # تحقق من بوابة الانتظار
                     allow_wait, wait_reason = wait_gate_allow(df, info)
                     if not allow_wait:
                         reason = wait_reason
                     else:
+                        # فتح الصفقة
                         qty = compute_size(bal, px or info["price"])
                         if qty > 0:
-                            ok = open_market_enhanced(sig, qty, px or info["price"])
+                            ok = open_market_enhanced(final_signal, qty, px or info["price"])
                             if ok:
                                 wait_for_next_signal_side = None
-                                # تسجيل قرار المجلس المحسن
-                                entry_type = "GOLDEN" if golden_entry else "OTC" if otc.get("otc_buy") or otc.get("otc_sell") else "CHART_PRIME" if cp_boxes.get("side") else "LIQUIDITY" if liq_cycle.get("regime") != "chop" else "COUNCIL"
-                                if ema_label in ("strong_bull", "strong_bear"):
-                                    entry_type = f"EMA_STRONG_{entry_type}"
-                                
-                                ema_info = ""
-                                if ema_ctx:
-                                    ema_info = f" | EMA={ema_ctx.get('label')}({float(ema_ctx.get('score',0.0)):.1f})"
-                                    
-                                log_i(f"🎯 ENHANCED {entry_type} DECISION: {sig.upper()} | "
-                                      f"Score B/S: {council_data['score_b']:.1f}/{council_data['score_s']:.1f} | "
-                                      f"Signal Strength: {STATE.get('signal_strength', 0):.1f}{ema_info}")
-                                for log_msg in council_data.get("logs", []):
-                                    log_i(f"   - {log_msg}")
+                                log_i(f"🎯 HUNTER PATCH ENTRY: {final_signal.upper()} | buy_score={buy_score} sell_score={sell_score} reasons={reasons}")
+                            else:
+                                reason = "open_failed"
                         else:
                             reason = "qty<=0"
-            
+            # ===================== END OF HUNTER PATCH =====================
+
             loop_i += 1
             sleep_s = NEAR_CLOSE_S if time_to_candle_close(df) <= 10 else BASE_SLEEP
             time.sleep(sleep_s)
@@ -3852,18 +3931,22 @@ def pretty_snapshot(bal, info, ind, spread_bps, reason=None, df=None):
         print("📈 INDICATORS & RF")
         print(f"   💲 Price {fmt(info.get('price'))} | RF filt={fmt(info.get('filter'))}  hi={fmt(info.get('hi'))} lo={fmt(info.get('lo'))}")
         print(f"   🧮 RSI={fmt(ind.get('rsi'))}  +DI={fmt(ind.get('plus_di'))}  -DI={fmt(ind.get('minus_di'))}  ADX={fmt(ind.get('adx'))}  ATR={fmt(ind.get('atr'))}")
-        print(f"   🎯 ENTRY: COUNCIL PRO + GOLDEN ENTRY + VWAP STRATEGY + OTC DETECTION + EMA CROSSOVER ENGINE + CHART PRIME  |  spread_bps={fmt(spread_bps,2)}")
+        print(f"   🎯 ENTRY: COUNCIL PRO + GOLDEN ENTRY + VWAP STRATEGY + OTC DETECTION + EMA CROSSOVER ENGINE + CHART PRIME + HUNTER PATCH  |  spread_bps={fmt(spread_bps,2)}")
         print(f"   ⏱️ closes_in ≈ {left_s}s")
         
         # عرض معلومات الـ Guards
         print("\n🛡️ RISK GUARDS")
         if STATE["open"]:
             stop_price = STATE.get("max_loss_price")
+            hard_sl = STATE.get("hard_sl")
             current_price = info.get("price") or 0
             if stop_price:
                 stop_distance_pct = abs(stop_price - current_price) / current_price * 100
                 stop_side = "BELOW" if STATE['side'] == 'long' else "ABOVE"
                 print(f"   🔴 HARD STOP: {stop_side} {fmt(stop_price)} ({stop_distance_pct:.2f}%)")
+            if hard_sl:
+                sl_distance_pct = abs(hard_sl - current_price) / current_price * 100
+                print(f"   🎯 IRON SL: {fmt(hard_sl)} ({sl_distance_pct:.2f}%)")
         
         if STATE.get("post_big_win_mode"):
             print(f"   🛡️ POST-BIG-WIN: ACTIVE ({STATE.get('post_big_win_bars_left', 0)} bars left)")
@@ -3888,7 +3971,7 @@ app = Flask(__name__)
 @app.route("/")
 def home():
     mode='LIVE' if MODE_LIVE else 'PAPER'
-    return f"✅ Council PRO Bot — {SYMBOL} {INTERVAL} — {mode} — Enhanced Candles + Golden Zone Pro + Smart Profit AI + VWAP Strategy + OTC Detection + EMA Crossover Engine + Hard Stop Loss + Post-Big-Win Guard + Auto-Recovery + ChartPrime"
+    return f"✅ Council PRO Bot — {SYMBOL} {INTERVAL} — {mode} — Enhanced Candles + Golden Zone Pro + Smart Profit AI + VWAP Strategy + OTC Detection + EMA Crossover Engine + Hard Stop Loss + Post-Big-Win Guard + Auto-Recovery + ChartPrime + HUNTER PATCH"
 
 @app.route("/metrics")
 def metrics():
@@ -3896,7 +3979,7 @@ def metrics():
         "symbol": SYMBOL, "interval": INTERVAL, "mode": "live" if MODE_LIVE else "paper",
         "leverage": LEVERAGE, "risk_alloc": RISK_ALLOC, "price": price_now(),
         "state": STATE, "compound_pnl": compound_pnl,
-        "entry_mode": "COUNCIL_PRO_GOLDEN_ENHANCED_VWAP_OTC_EMA_CHARTPRIME", "wait_for_next_signal": wait_for_next_signal_side,
+        "entry_mode": "COUNCIL_PRO_GOLDEN_ENHANCED_VWAP_OTC_EMA_CHARTPRIME_HUNTER", "wait_for_next_signal": wait_for_next_signal_side,
         "risk_guards": {
             "hard_stop_pct": abs(MAX_LOSS_PCT)*100,
             "big_win_pct": BIG_WIN_PCT*100,
@@ -3930,10 +4013,19 @@ def metrics():
             "enabled": True,
             "regime": STATE.get("liquidity_cycle", {}).get("regime", "unknown")
         },
+        "hunter_patch": {
+            "enabled": True,
+            "iron_sl_ticks": HARD_SL_TICKS,
+            "adx_accum_max": ADX_ACCUM_MAX,
+            "adx_trend_min": ADX_TREND_MIN,
+            "adx_exit_weak": ADX_EXIT_WEAK,
+            "min_profit_to_exit": MIN_PROFIT_TO_EXIT
+        },
         "current_guards": {
             "post_big_win_active": STATE.get("post_big_win_mode", False),
             "post_big_win_bars_left": STATE.get("post_big_win_bars_left", 0),
             "hard_stop_price": STATE.get("max_loss_price"),
+            "iron_sl_price": STATE.get("hard_sl"),
             "last_closed_pnl_pct": STATE.get("last_closed_pnl_pct", 0.0)
         }
     })
@@ -3944,10 +4036,11 @@ def health():
         "ok": True, "mode": "live" if MODE_LIVE else "paper",
         "open": STATE["open"], "side": STATE["side"], "qty": STATE["qty"],
         "compound_pnl": compound_pnl, "timestamp": datetime.utcnow().isoformat(),
-        "entry_mode": "COUNCIL_PRO_GOLDEN_ENHANCED_VWAP_OTC_EMA_CHARTPRIME", "wait_for_next_signal": wait_for_next_signal_side,
+        "entry_mode": "COUNCIL_PRO_GOLDEN_ENHANCED_VWAP_OTC_EMA_CHARTPRIME_HUNTER", "wait_for_next_signal": wait_for_next_signal_side,
         "risk_guards": {
             "hard_stop_active": STATE.get("max_loss_price") is not None,
-            "post_big_win_active": STATE.get("post_big_win_mode", False)
+            "post_big_win_active": STATE.get("post_big_win_mode", False),
+            "iron_sl_active": STATE.get("hard_sl") is not None
         }
     }), 200
 
@@ -3990,6 +4083,7 @@ if __name__ == "__main__":
     print(colored(f"EMA CROSSOVER ENGINE: Strong/Weak Trend Detection (9/21/50)", "yellow"))
     print(colored(f"📦 CHART PRIME: High-Volume Boxes + Liquidity Cycle Monitor", "green"))
     print(colored(f"🛡️ RISK GUARDS: Hard Stop Loss (-{abs(MAX_LOSS_PCT)*100}%) | Post-Big-Win Guard (+{BIG_WIN_PCT*100}%)", "red"))
+    print(colored(f"🎯 HUNTER PATCH: Unified Entry | ADX/ATR Smart Monitor | Iron SL {HARD_SL_TICKS} ticks | Launch Detection", "cyan"))
     print(colored(f"🔄 AUTO RECOVERY: Enhanced position sync on restart", "green"))
     print(colored(f"🔄 MANUAL CLOSE SYNC: Enabled (detects manual close from exchange)", "green"))
     print(colored(f"EXECUTION: {'ACTIVE' if EXECUTE_ORDERS and not DRY_RUN else 'SIMULATION'}", "yellow"))
