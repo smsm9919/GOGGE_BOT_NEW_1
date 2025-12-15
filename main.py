@@ -196,6 +196,19 @@ DI_EDGE = 2.0
 
 EXIT_WEAKNESS_VOTES = 2  # 2 إشارات ضعف = خروج
 MIN_PROFIT_TO_EXIT = 0.20  # % ربح أدنى قبل الخروج الذكي
+
+# ====== NEW: TWO-MODE ENTRY (SNIPER vs TREND HUNTER) ======
+ENABLE_ZONE_SNIPER = True      # الزونا/Golden/Footprint/Flow = دخول مدروس (Sniper)
+ENABLE_TREND_HUNTER = True     # دخول حر مع الترند القوي (Hunter) حتى لو خارج الزونا
+
+# عتبات دخول (تقدر تزبطها بعد ما تشوف اللوج)
+SNIPER_MIN_TOTAL = 6.0         # أقل TotalScore لدخول الزونا
+HUNTER_MIN_TOTAL = 7.5         # أقل TotalScore لدخول الترند الحر
+
+# "Hunter" لازم يكون مع ترند حقيقي
+HUNTER_REQUIRE_TREND = True    # لازم watch.regime == TREND
+HUNTER_ADX_MIN = 18            # دخول مبكر للترند (مش لازم 22) عشان ما يفوّتش بداية الحركة
+HUNTER_DI_EDGE = 2.0           # نفس DI_EDGE لكن هنا للتأكيد
 # ===============================================================
 
 # =================== PROFESSIONAL LOGGING ===================
@@ -3805,145 +3818,138 @@ def trade_loop_enhanced():
             cp_boxes = council_data.get("cp_boxes", {})
             liq_cycle = council_data.get("liquidity_cycle", {})
 
-            # ===================== HUNTER PATCH v2 (SMART ENTRY, NOT RANDOM) =====================
-
             # مراقبة ADX/ATR
             watch = adx_atr_watcher(ind, STATE)
 
-            # Launch/Compression (كان عامل قفل كامل — هنحوّله لفلتر)
+            # تجميع/Launch (لكن مش هنخليه يقفل البوت)
             cl = accumulation_launch_signal(ind, STATE)
 
-            # Zones / Signals
-            gb = gz and gz.get("ok") and gz.get("zone") and gz["zone"]["type"] == "golden_bottom"
-            gt = gz and gz.get("ok") and gz.get("zone") and gz["zone"]["type"] == "golden_top"
-
-            buy_liquidity  = footprint.get('ok') and footprint.get('absorption_bull')
+            # ===== Zones / Liquidity / Flow signals =====
+            gb = gz and gz.get("ok") and gz["zone"]["type"] == "golden_bottom"
+            gt = gz and gz.get("ok") and gz["zone"]["type"] == "golden_top"
+            buy_liquidity = footprint.get('ok') and footprint.get('absorption_bull')
             sell_liquidity = footprint.get('ok') and footprint.get('absorption_bear')
 
-            # Flow (Order Flow spike)
+            # Flow كإشارة Order Flow
             ob_signal = None
-            flow = snap.get("flow")
+            flow = snap["flow"]
             if flow and flow.get('ok'):
-                if flow['delta_z'] >= FLOW_SPIKE_Z and flow.get('cvd_trend') == 'up':
+                if flow['delta_z'] >= FLOW_SPIKE_Z and flow['cvd_trend'] == 'up':
                     ob_signal = ("bullish", flow['delta_z'])
-                elif flow['delta_z'] <= -FLOW_SPIKE_Z and flow.get('cvd_trend') == 'down':
+                elif flow['delta_z'] <= -FLOW_SPIKE_Z and flow['cvd_trend'] == 'down':
                     ob_signal = ("bearish", flow['delta_z'])
 
-            # OTC Hidden flow (لو متوفر في council_data أو snap)
-            otc = council_data.get("otc", {}) if isinstance(council_data, dict) else {}
-            otc_buy  = bool(otc.get("otc_buy"))
-            otc_sell = bool(otc.get("otc_sell"))
+            fvg_signal = None  # FVG غير متوفر حالياً
 
-            # ChartPrime Boxes + Liquidity Cycle (دي كانت خارج zone_ok وبالتالي بتقتل الصفقات)
-            cp_boxes = council_data.get("cp_boxes", {}) if isinstance(council_data, dict) else {}
-            liq_cycle = council_data.get("liquidity_cycle", {}) if isinstance(council_data, dict) else {}
+            zone_ok = bool(gb or gt or buy_liquidity or sell_liquidity or ob_signal or fvg_signal)
 
-            cb_side = cp_boxes.get("side")
-            cb_score = float(cp_boxes.get("box_score", 0) or 0)
+            # ===== Council strength =====
+            votes_b = int(council_data.get("b", 0) or 0)
+            votes_s = int(council_data.get("s", 0) or 0)
+            score_b = float(council_data.get("score_b", 0.0) or 0.0)
+            score_s = float(council_data.get("score_s", 0.0) or 0.0)
 
-            near_support = bool(liq_cycle.get("near_support", False))
-            near_resistance = bool(liq_cycle.get("near_resistance", False))
+            # ===== Build unified scores (both modes use same scoring) =====
+            buy_score = 0.0
+            sell_score = 0.0
+            reasons = []
 
-            cp_support_ok = (cb_side == "support" and cb_score >= 5.0 and near_support)
-            cp_resist_ok  = (cb_side == "resistance" and cb_score >= 5.0 and near_resistance)
+            # Zones (Sniper evidence)
+            if gb: buy_score += 3; reasons.append("GoldenBottom")
+            if gt: sell_score += 3; reasons.append("GoldenTop")
+            if buy_liquidity: buy_score += 2; reasons.append("BuyLiquidity")
+            if sell_liquidity: sell_score += 2; reasons.append("SellLiquidity")
+            if ob_signal and ob_signal[0] == "bullish": buy_score += 2; reasons.append(f"FlowBull(z={ob_signal[1]:.2f})")
+            if ob_signal and ob_signal[0] == "bearish": sell_score += 2; reasons.append(f"FlowBear(z={ob_signal[1]:.2f})")
 
-            liq_reg = liq_cycle.get("regime")  # bull_accumulation / bear_accumulation / ...
-            bull_accum_ok = (liq_reg == "bull_accumulation")
-            bear_accum_ok = (liq_reg == "bear_accumulation")
+            # Trend context (Hunter evidence)
+            adx_v = float(ind.get("adx") or 0.0)
+            di_p = float(ind.get("plus_di") or 0.0)
+            di_m = float(ind.get("minus_di") or 0.0)
+            di_edge = abs(di_p - di_m)
 
-            # ---- SMART zone_ok (مش زون واحدة بس) ----
-            zone_ok = bool(
-                gb or gt or
-                buy_liquidity or sell_liquidity or
-                otc_buy or otc_sell or
-                (ob_signal is not None) or
-                cp_support_ok or cp_resist_ok or
-                bull_accum_ok or bear_accum_ok
-            )
+            if watch.get("regime") == "TREND":
+                if watch.get("side") == "up":
+                    buy_score += 2; reasons.append("Trend_Up(ADX/DI)")
+                elif watch.get("side") == "down":
+                    sell_score += 2; reasons.append("Trend_Down(ADX/DI)")
+            elif watch.get("regime") == "ACCUMULATION":
+                reasons.append("Accumulation")
 
-            # Debug واضح بدل "price خارج Zone" المبهم
-            log_i(
-                f"ENTRY_CTX | px={px:.6f} zone_ok={zone_ok} "
-                f"GB={gb} GT={gt} LIQ(B/S)={buy_liquidity}/{sell_liquidity} "
-                f"CP(S/R)={cp_support_ok}/{cp_resist_ok} LIQREG={liq_reg} "
-                f"OTC(B/S)={otc_buy}/{otc_sell} FLOW={ob_signal}"
-            )
+            # EMA bias (لو موجود)
+            ema_side = (ema_ctx.get("side") or "").lower()
+            if ema_side == "bull":
+                buy_score += 1.5; reasons.append("EMA_bull")
+            elif ema_side == "bear":
+                sell_score += 1.5; reasons.append("EMA_bear")
 
-            # بدل قفل التجميع: نخليه "فلتر مخاطرة"
-            # - لو تجميع (compression) بس مفيش أي Zone قوية => انتظر
-            if cl.get("compression") and not zone_ok:
-                log_i("🧊 ACCUMULATION: compression بدون zone confluence → WAIT")
-                reason = "accumulation_wait_no_zone"
-            else:
-                # ==== Score بناءً على Confluence ====
-                buy_score = 0
-                sell_score = 0
-                reasons = []
-
-                # Strong zones
-                if gb: buy_score += 3; reasons.append("GoldenBottom")
-                if gt: sell_score += 3; reasons.append("GoldenTop")
-
-                if cp_support_ok: buy_score += 2; reasons.append(f"CP_Support({cb_score:.1f})")
-                if cp_resist_ok:  sell_score += 2; reasons.append(f"CP_Resist({cb_score:.1f})")
-
-                if bull_accum_ok: buy_score += 2; reasons.append("LiqReg_BullAccum")
-                if bear_accum_ok: sell_score += 2; reasons.append("LiqReg_BearAccum")
-
-                if buy_liquidity:  buy_score += 2; reasons.append("Absorption_Bull")
-                if sell_liquidity: sell_score += 2; reasons.append("Absorption_Bear")
-
-                if otc_buy:  buy_score += 2; reasons.append("OTC_Buy")
-                if otc_sell: sell_score += 2; reasons.append("OTC_Sell")
-
-                if ob_signal and ob_signal[0] == "bullish":
-                    buy_score += 2; reasons.append(f"Flow_Bull(z={ob_signal[1]:.2f})")
-                if ob_signal and ob_signal[0] == "bearish":
-                    sell_score += 2; reasons.append(f"Flow_Bear(z={ob_signal[1]:.2f})")
-
-                # ADX/DI سياق الترند (Boost فقط — مش فيتو)
-                if watch["regime"] == "TREND":
-                    if watch["side"] == "up":
-                        buy_score += 2; reasons.append("Trend_Up(ADX/DI)")
-                    elif watch["side"] == "down":
-                        sell_score += 2; reasons.append("Trend_Down(ADX/DI)")
-
-                # ---- Launch gate: مطلوب فقط لو السوق تجميع + مفيش Trend واضح ----
-                need_launch = (watch["regime"] == "ACCUMULATION" and watch["side"] == "flat")
-                if need_launch and not cl.get("launch") and not (gb or gt or cp_support_ok or cp_resist_ok):
-                    log_i("NO TRADE: accumulation يحتاج Launch (لا يوجد Trend ولا Zone قوية)")
-                    reason = "need_launch_in_pure_accum"
+            # VWAP bias (لو موجود)
+            vwap = ind.get("vwap")
+            if vwap:
+                if info["price"] > vwap:
+                    buy_score += 1.0; reasons.append("VWAP_above")
                 else:
-                    # قرار نهائي (مدروس)
-                    final_signal = None
+                    sell_score += 1.0; reasons.append("VWAP_below")
 
-                    # Thresholds واقعية: مش عشوائية ومش عقيمة
-                    if buy_score >= 6 and buy_score > sell_score + 1:
-                        final_signal = "buy"
-                    elif sell_score >= 6 and sell_score > buy_score + 1:
-                        final_signal = "sell"
+            # Launch bonus (بدل ما يكون قفل)
+            if cl.get("launch"):
+                buy_score += 0.5
+                sell_score += 0.5
+                reasons.append("Launch")
 
-                    if not final_signal:
-                        log_i(f"NO TRADE | buy={buy_score} sell={sell_score} reasons={reasons}")
-                        reason = f"insufficient_score buy={buy_score} sell={sell_score}"
+            # دمج قوة المجلس مع السكور
+            total_buy = buy_score + (score_b * 0.60) + (votes_b * 0.15)
+            total_sell = sell_score + (score_s * 0.60) + (votes_s * 0.15)
+
+            # ===== Decide which mode is allowed =====
+            sniper_allowed = ENABLE_ZONE_SNIPER and zone_ok
+            hunter_allowed = ENABLE_TREND_HUNTER
+
+            # Hunter لازم يكون ترند فعلي + ADX/DI محترم (عشان يصطاد الانهيارات/الانفجارات)
+            if hunter_allowed and HUNTER_REQUIRE_TREND:
+                hunter_allowed = (watch.get("regime") == "TREND")
+
+            if hunter_allowed:
+                hunter_allowed = (adx_v >= HUNTER_ADX_MIN) and (di_edge >= HUNTER_DI_EDGE)
+
+            # ===== Final entry decision =====
+            final_signal = None
+
+            # 1) Zone Sniper (مدروس)
+            if sniper_allowed and (max(total_buy, total_sell) >= SNIPER_MIN_TOTAL):
+                final_signal = "BUY" if total_buy > total_sell else "SELL"
+                reasons.append("MODE=SNIPER")
+
+            # 2) Trend Hunter (حر + صياد ترند)
+            elif hunter_allowed and (max(total_buy, total_sell) >= HUNTER_MIN_TOTAL):
+                final_signal = "BUY" if total_buy > total_sell else "SELL"
+                reasons.append("MODE=HUNTER")
+
+            else:
+                # ما نقفلش البوت على "خارج الزونا"… نقول السبب الحقيقي
+                if cl.get("compression") and not cl.get("launch"):
+                    reason = "accumulation_wait_no_launch"
+                    log_i("🧊 NO TRADE: Accumulation بدون Launch (مش ترند واضح)")
+                else:
+                    reason = f"weak_signal totals(B={total_buy:.2f},S={total_sell:.2f})"
+                    log_i(f"NO TRADE: weak signal | total_buy={total_buy:.2f} total_sell={total_sell:.2f} | zone_ok={zone_ok} | regime={watch.get('regime')}")
+
+            # لو طلع قرار دخول، كمّل منطقك القديم لفتح الصفقة
+            if final_signal and not reason:
+                # احترام شرط الانتظار بعد الإغلاق (لو موجود فوق في اللوب)
+                # + احترام cooldown/spread guards الموجودة عندك
+                qty = compute_size(bal, px or info["price"])
+                if qty > 0:
+                    ok = open_market_enhanced(final_signal, qty, px or info["price"])
+                    if ok:
+                        wait_for_next_signal_side = None
+                        log_i(f"🎯 ENTRY → {final_signal} | total_buy={total_buy:.2f} total_sell={total_sell:.2f} | "
+                              f"ADX={adx_v:.1f} DI={di_p:.1f}/{di_m:.1f} | reasons={reasons}")
                     else:
-                        # انتظار الإشارة (Gate)
-                        allow_wait, wait_reason = wait_gate_allow(df, info)
-                        if not allow_wait:
-                            reason = wait_reason
-                        else:
-                            qty = compute_size(bal, px or info["price"])
-                            if qty > 0:
-                                ok = open_market_enhanced(final_signal, qty, px or info["price"])
-                                if ok:
-                                    wait_for_next_signal_side = None
-                                    log_i(f"🎯 HUNTER v2 ENTRY: {final_signal.upper()} | buy={buy_score} sell={sell_score} reasons={reasons}")
-                                else:
-                                    reason = "open_failed"
-                            else:
-                                reason = "qty<=0"
+                        reason = "open_failed"
+                else:
+                    reason = "qty<=0"
 
-            # ===================== END OF HUNTER PATCH v2 =====================
             # ===================== END OF HUNTER PATCH =====================
 
             loop_i += 1
