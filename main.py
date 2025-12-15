@@ -3796,7 +3796,7 @@ def trade_loop_enhanced():
             reason = None
             if spread_bps is not None and spread_bps > MAX_SPREAD_BPS:
                 reason = f"spread too high ({fmt(spread_bps,2)}bps > {MAX_SPREAD_BPS})"
-            
+
             council_data = council_votes_pro_enhanced(df)
             gz = council_data.get("gz")
             footprint = council_data.get("footprint", {})
@@ -3805,102 +3805,145 @@ def trade_loop_enhanced():
             cp_boxes = council_data.get("cp_boxes", {})
             liq_cycle = council_data.get("liquidity_cycle", {})
 
+            # ===================== HUNTER PATCH v2 (SMART ENTRY, NOT RANDOM) =====================
+
             # مراقبة ADX/ATR
             watch = adx_atr_watcher(ind, STATE)
-            
-            # تحقق من التجميع (Accumulation) - منع الدخول
+
+            # Launch/Compression (كان عامل قفل كامل — هنحوّله لفلتر)
             cl = accumulation_launch_signal(ind, STATE)
-            if cl["compression"]:
-                log_i("🧊 ACCUMULATION: ADX منخفض + ATR contract → WAIT")
-                reason = "accumulation_no_entry"
-            
-            # تحديد إشارات الـ Zones
-            gb = gz and gz.get("ok") and gz["zone"]["type"] == "golden_bottom"
-            gt = gz and gz.get("ok") and gz["zone"]["type"] == "golden_top"
-            buy_liquidity = footprint.get('ok') and footprint.get('absorption_bull')
+
+            # Zones / Signals
+            gb = gz and gz.get("ok") and gz.get("zone") and gz["zone"]["type"] == "golden_bottom"
+            gt = gz and gz.get("ok") and gz.get("zone") and gz["zone"]["type"] == "golden_top"
+
+            buy_liquidity  = footprint.get('ok') and footprint.get('absorption_bull')
             sell_liquidity = footprint.get('ok') and footprint.get('absorption_bear')
-            
-            # Flow كإشارة Order Flow
+
+            # Flow (Order Flow spike)
             ob_signal = None
-            flow = snap["flow"]
+            flow = snap.get("flow")
             if flow and flow.get('ok'):
-                if flow['delta_z'] >= FLOW_SPIKE_Z and flow['cvd_trend'] == 'up':
+                if flow['delta_z'] >= FLOW_SPIKE_Z and flow.get('cvd_trend') == 'up':
                     ob_signal = ("bullish", flow['delta_z'])
-                elif flow['delta_z'] <= -FLOW_SPIKE_Z and flow['cvd_trend'] == 'down':
+                elif flow['delta_z'] <= -FLOW_SPIKE_Z and flow.get('cvd_trend') == 'down':
                     ob_signal = ("bearish", flow['delta_z'])
-            
-            fvg_signal = None  # FVG غير متوفر حالياً
-            
+
+            # OTC Hidden flow (لو متوفر في council_data أو snap)
+            otc = council_data.get("otc", {}) if isinstance(council_data, dict) else {}
+            otc_buy  = bool(otc.get("otc_buy"))
+            otc_sell = bool(otc.get("otc_sell"))
+
+            # ChartPrime Boxes + Liquidity Cycle (دي كانت خارج zone_ok وبالتالي بتقتل الصفقات)
+            cp_boxes = council_data.get("cp_boxes", {}) if isinstance(council_data, dict) else {}
+            liq_cycle = council_data.get("liquidity_cycle", {}) if isinstance(council_data, dict) else {}
+
+            cb_side = cp_boxes.get("side")
+            cb_score = float(cp_boxes.get("box_score", 0) or 0)
+
+            near_support = bool(liq_cycle.get("near_support", False))
+            near_resistance = bool(liq_cycle.get("near_resistance", False))
+
+            cp_support_ok = (cb_side == "support" and cb_score >= 5.0 and near_support)
+            cp_resist_ok  = (cb_side == "resistance" and cb_score >= 5.0 and near_resistance)
+
+            liq_reg = liq_cycle.get("regime")  # bull_accumulation / bear_accumulation / ...
+            bull_accum_ok = (liq_reg == "bull_accumulation")
+            bear_accum_ok = (liq_reg == "bear_accumulation")
+
+            # ---- SMART zone_ok (مش زون واحدة بس) ----
             zone_ok = bool(
-                gb or gt or buy_liquidity or sell_liquidity or ob_signal or fvg_signal
+                gb or gt or
+                buy_liquidity or sell_liquidity or
+                otc_buy or otc_sell or
+                (ob_signal is not None) or
+                cp_support_ok or cp_resist_ok or
+                bull_accum_ok or bear_accum_ok
             )
 
-            if not zone_ok:
-                log_i("NO TRADE: price خارج Zone")
-                reason = "no_zone"
-            elif not cl["launch"]:
-                log_i("NO TRADE: لا يوجد إطلاق (Launch) من التجميع")
-                reason = "no_launch"
+            # Debug واضح بدل "price خارج Zone" المبهم
+            log_i(
+                f"ENTRY_CTX | px={px:.6f} zone_ok={zone_ok} "
+                f"GB={gb} GT={gt} LIQ(B/S)={buy_liquidity}/{sell_liquidity} "
+                f"CP(S/R)={cp_support_ok}/{cp_resist_ok} LIQREG={liq_reg} "
+                f"OTC(B/S)={otc_buy}/{otc_sell} FLOW={ob_signal}"
+            )
+
+            # بدل قفل التجميع: نخليه "فلتر مخاطرة"
+            # - لو تجميع (compression) بس مفيش أي Zone قوية => انتظر
+            if cl.get("compression") and not zone_ok:
+                log_i("🧊 ACCUMULATION: compression بدون zone confluence → WAIT")
+                reason = "accumulation_wait_no_zone"
             else:
+                # ==== Score بناءً على Confluence ====
                 buy_score = 0
                 sell_score = 0
                 reasons = []
 
-                # Zones
+                # Strong zones
                 if gb: buy_score += 3; reasons.append("GoldenBottom")
                 if gt: sell_score += 3; reasons.append("GoldenTop")
-                if buy_liquidity: buy_score += 2; reasons.append("BuyLiquidity")
-                if sell_liquidity: sell_score += 2; reasons.append("SellLiquidity")
-                if ob_signal and ob_signal[0] == "bullish": buy_score += 2; reasons.append("OB_bull")
-                if ob_signal and ob_signal[0] == "bearish": sell_score += 2; reasons.append("OB_bear")
 
-                # ADX / ATR logic
-                if watch["regime"] == "ACCUMULATION":
-                    reasons.append("Accumulation: wait launch")
-                elif watch["regime"] == "TREND":
+                if cp_support_ok: buy_score += 2; reasons.append(f"CP_Support({cb_score:.1f})")
+                if cp_resist_ok:  sell_score += 2; reasons.append(f"CP_Resist({cb_score:.1f})")
+
+                if bull_accum_ok: buy_score += 2; reasons.append("LiqReg_BullAccum")
+                if bear_accum_ok: sell_score += 2; reasons.append("LiqReg_BearAccum")
+
+                if buy_liquidity:  buy_score += 2; reasons.append("Absorption_Bull")
+                if sell_liquidity: sell_score += 2; reasons.append("Absorption_Bear")
+
+                if otc_buy:  buy_score += 2; reasons.append("OTC_Buy")
+                if otc_sell: sell_score += 2; reasons.append("OTC_Sell")
+
+                if ob_signal and ob_signal[0] == "bullish":
+                    buy_score += 2; reasons.append(f"Flow_Bull(z={ob_signal[1]:.2f})")
+                if ob_signal and ob_signal[0] == "bearish":
+                    sell_score += 2; reasons.append(f"Flow_Bear(z={ob_signal[1]:.2f})")
+
+                # ADX/DI سياق الترند (Boost فقط — مش فيتو)
+                if watch["regime"] == "TREND":
                     if watch["side"] == "up":
-                        buy_score += 2; reasons.append("Trend_Up")
+                        buy_score += 2; reasons.append("Trend_Up(ADX/DI)")
                     elif watch["side"] == "down":
-                        sell_score += 2; reasons.append("Trend_Down")
+                        sell_score += 2; reasons.append("Trend_Down(ADX/DI)")
 
-                # RF trigger
-                if info.get("long"): buy_score += 1; reasons.append("RF_Long")
-                if info.get("short"): sell_score += 1; reasons.append("RF_Short")
-                
-                # Launch signal boost
-                if cl["launch"]:
-                    log_g(f"🚀 LAUNCH DETECTED → {cl['side'].upper()}")
-                    if cl["side"] == "buy":
-                        buy_score += 3; reasons.append("Launch_BUY")
-                    elif cl["side"] == "sell":
-                        sell_score += 3; reasons.append("Launch_SELL")
-
-                final_signal = None
-                if buy_score >= 6 and buy_score > sell_score + 1:
-                    final_signal = "buy"
-                elif sell_score >= 6 and sell_score > buy_score + 1:
-                    final_signal = "sell"
-
-                if not final_signal:
-                    log_i(f"NO TRADE | buy={buy_score} sell={sell_score} reasons={reasons}")
-                    reason = f"insufficient_score buy={buy_score} sell={sell_score}"
+                # ---- Launch gate: مطلوب فقط لو السوق تجميع + مفيش Trend واضح ----
+                need_launch = (watch["regime"] == "ACCUMULATION" and watch["side"] == "flat")
+                if need_launch and not cl.get("launch") and not (gb or gt or cp_support_ok or cp_resist_ok):
+                    log_i("NO TRADE: accumulation يحتاج Launch (لا يوجد Trend ولا Zone قوية)")
+                    reason = "need_launch_in_pure_accum"
                 else:
-                    # تحقق من بوابة الانتظار
-                    allow_wait, wait_reason = wait_gate_allow(df, info)
-                    if not allow_wait:
-                        reason = wait_reason
+                    # قرار نهائي (مدروس)
+                    final_signal = None
+
+                    # Thresholds واقعية: مش عشوائية ومش عقيمة
+                    if buy_score >= 6 and buy_score > sell_score + 1:
+                        final_signal = "buy"
+                    elif sell_score >= 6 and sell_score > buy_score + 1:
+                        final_signal = "sell"
+
+                    if not final_signal:
+                        log_i(f"NO TRADE | buy={buy_score} sell={sell_score} reasons={reasons}")
+                        reason = f"insufficient_score buy={buy_score} sell={sell_score}"
                     else:
-                        # فتح الصفقة
-                        qty = compute_size(bal, px or info["price"])
-                        if qty > 0:
-                            ok = open_market_enhanced(final_signal, qty, px or info["price"])
-                            if ok:
-                                wait_for_next_signal_side = None
-                                log_i(f"🎯 HUNTER PATCH ENTRY: {final_signal.upper()} | buy_score={buy_score} sell_score={sell_score} reasons={reasons}")
-                            else:
-                                reason = "open_failed"
+                        # انتظار الإشارة (Gate)
+                        allow_wait, wait_reason = wait_gate_allow(df, info)
+                        if not allow_wait:
+                            reason = wait_reason
                         else:
-                            reason = "qty<=0"
+                            qty = compute_size(bal, px or info["price"])
+                            if qty > 0:
+                                ok = open_market_enhanced(final_signal, qty, px or info["price"])
+                                if ok:
+                                    wait_for_next_signal_side = None
+                                    log_i(f"🎯 HUNTER v2 ENTRY: {final_signal.upper()} | buy={buy_score} sell={sell_score} reasons={reasons}")
+                                else:
+                                    reason = "open_failed"
+                            else:
+                                reason = "qty<=0"
+
+            # ===================== END OF HUNTER PATCH v2 =====================
             # ===================== END OF HUNTER PATCH =====================
 
             loop_i += 1
@@ -3926,7 +3969,7 @@ def pretty_snapshot(bal, info, ind, spread_bps, reason=None, df=None):
     if LOG_LEGACY:
         left_s = time_to_candle_close(df) if df is not None else 0
         print(colored("─"*100,"cyan"))
-        print(colored(f"📊 {SYMBOL} {INTERVAL} • {'LIVE' if MODE_LIVE else 'PAPER'} • {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC","cyan"))
+        print(colored(f"📊 {SYMBOL} {INTERVAL} • {'LIVE' if MODE_LIVE else 'PAPER'} • {datetime.utcnow().strftime('%Y-%m-d %H:%M:%S')} UTC","cyan"))
         print(colored("─"*100,"cyan"))
         print("📈 INDICATORS & RF")
         print(f"   💲 Price {fmt(info.get('price'))} | RF filt={fmt(info.get('filter'))}  hi={fmt(info.get('hi'))} lo={fmt(info.get('lo'))}")
