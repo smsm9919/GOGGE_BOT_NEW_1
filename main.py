@@ -12,6 +12,7 @@ RF Futures Bot — RF-LIVE ONLY (BingX Perp via CCXT)
 • ENHANCED WITH: Hard Stop Loss, Post-Big-Win Guard, Auto-Recovery
 • CHART PRIME: High-Volume Boxes + Liquidity Cycle Monitor
 • HUNTER PATCH: Unified Entry, ADX/ATR Smart Monitoring, 8-Tick Iron SL
+• FIXED: Hedge Mode Execution Bug + Exhaustion Engine for Wave End Detection
 """
 
 import os, time, math, random, signal, sys, traceback, logging, json
@@ -210,6 +211,16 @@ HUNTER_REQUIRE_TREND = True    # لازم watch.regime == TREND
 HUNTER_ADX_MIN = 18            # دخول مبكر للترند (مش لازم 22) عشان ما يفوّتش بداية الحركة
 HUNTER_DI_EDGE = 2.0           # نفس DI_EDGE لكن هنا للتأكيد
 # ===============================================================
+
+# =================== EXHAUSTION ENGINE CONFIG ===================
+EXHAUSTION_SCORE_THRESHOLD = 6.0  # درجة الإرهاق الدنيا لمنع الدخول المتأخر
+EXHAUSTION_TRIM_PERCENT = 0.30    # إغلاق 30% من المركز عند الإرهاق
+EXHAUSTION_TRAIL_TIGHTEN = True   # تشديد التريل عند الإرهاق
+EXHAUSTION_ADX_DROP_MIN = 2.0     # أقل انخفاض في ADX للإشارة لضعف الترند
+EXHAUSTION_ATR_EXPANSION_THRESH = 1.15  # ATR توسع 15% ثم انكماش
+EXHAUSTION_SHRINK_CANDLE_RATIO = 0.8   # شمعة صغيرة بعد شمعة كبيرة
+EXHAUSTION_LONG_WICK_RATIO = 0.45      # نسبة الفتيلة الطويلة
+EXHAUSTION_RSI_DIVERGENCE = True       # كشف انحراف RSI
 
 # =================== PROFESSIONAL LOGGING ===================
 def log_i(msg): print(f"ℹ️ {msg}", flush=True)
@@ -1975,9 +1986,193 @@ def professional_entry_engine(df: pd.DataFrame, side: str, council_data: dict):
     }
     return True, info
 
+# =================== EXHAUSTION ENGINE ===================
+def compute_exhaustion_score(df, side=None):
+    """
+    حساب درجة إرهاق الموجة الحالية.
+    side: 'long' أو 'short' أو None
+    إرجاع: (score, reasons, rev_confirm)
+    """
+    if len(df) < 20:
+        return 0.0, [], False
+
+    score = 0.0
+    reasons = []
+    
+    # 1) ضعف الترند: ADX كان عالي وبدأ يهبط
+    adx_ctx = compute_adx_di_context(df, ADX_LEN)
+    adx = adx_ctx.get('adx', 0)
+    adx_prev = adx_ctx.get('adx_prev', adx)
+    
+    if adx > 30 and (adx_prev - adx) >= EXHAUSTION_ADX_DROP_MIN:
+        score += 2.0
+        reasons.append(f"ADX drop from {adx_prev:.1f} to {adx:.1f}")
+    
+    # 2) DI edge يتقلص (ضعف قوة الترند)
+    plus_di = adx_ctx.get('plus_di', 0)
+    minus_di = adx_ctx.get('minus_di', 0)
+    di_edge = abs(plus_di - minus_di)
+    
+    if di_edge < DI_EDGE:
+        score += 1.0
+        reasons.append(f"DI edge shrinks to {di_edge:.1f}")
+    
+    # 3) ATR توسع ثم انكماش
+    atr_series = compute_atr_series(df, ATR_LEN)
+    if len(atr_series) >= 20:
+        atr = atr_series.iloc[-1]
+        atr_prev = atr_series.iloc[-2]
+        atr_ma20 = atr_series.rolling(20).mean().iloc[-1]
+        
+        if atr_prev > atr_ma20 * EXHAUSTION_ATR_EXPANSION_THRESH and atr < atr_prev * 0.97:
+            score += 1.0
+            reasons.append("ATR expansion then contraction")
+    
+    # 4) شموع تتقلص (Shrinking candles)
+    if len(df) >= 3:
+        current_candle = df.iloc[-1]
+        prev_candle = df.iloc[-2]
+        current_range = float(current_candle['high']) - float(current_candle['low'])
+        prev_range = float(prev_candle['high']) - float(prev_candle['low'])
+        
+        if current_range < prev_range * EXHAUSTION_SHRINK_CANDLE_RATIO:
+            score += 1.0
+            reasons.append("Shrinking candle after large move")
+    
+    # 5) فتائل طويلة (نهاية الهبوط للبيع، نهاية الصعود للشراء)
+    current_candle = df.iloc[-1]
+    high = float(current_candle['high'])
+    low = float(current_candle['low'])
+    close = float(current_candle['close'])
+    open_ = float(current_candle['open'])
+    candle_range = high - low
+    
+    if candle_range > 0:
+        lower_wick = min(close, open_) - low
+        upper_wick = high - max(close, open_)
+        
+        if side == 'long' or side == 'buy':
+            # شراء: فتيلة علوية طويلة = إرهاق الصعود
+            if upper_wick / candle_range > EXHAUSTION_LONG_WICK_RATIO:
+                score += 2.0
+                reasons.append("Long upper wick (exhaustion for long)")
+        elif side == 'short' or side == 'sell':
+            # بيع: فتيلة سفلية طويلة = إرهاق الهبوط
+            if lower_wick / candle_range > EXHAUSTION_LONG_WICK_RATIO:
+                score += 2.0
+                reasons.append("Long lower wick (exhaustion for short)")
+        else:
+            # بدون مركز: ننظر للفتيلتين
+            if upper_wick / candle_range > EXHAUSTION_LONG_WICK_RATIO:
+                score += 1.0
+                reasons.append("Long upper wick")
+            if lower_wick / candle_range > EXHAUSTION_LONG_WICK_RATIO:
+                score += 1.0
+                reasons.append("Long lower wick")
+    
+    # 6) نمط شمعة انعكاسية
+    candles = compute_enhanced_candles(df)
+    if side in ['long', 'buy'] and candles.get('sell'):
+        score += 2.0
+        reasons.append("Bearish reversal candle pattern")
+    elif side in ['short', 'sell'] and candles.get('buy'):
+        score += 2.0
+        reasons.append("Bullish reversal candle pattern")
+    
+    # 7) RSI Divergence (انحراف)
+    if EXHAUSTION_RSI_DIVERGENCE:
+        rsi_series = compute_rsi(df['close'].astype(float), 14)
+        if len(rsi_series) >= 5:
+            current_rsi = rsi_series.iloc[-1]
+            prev_rsi = rsi_series.iloc[-2]
+            current_low = float(df['low'].iloc[-1])
+            prev_low = float(df['low'].iloc[-2])
+            current_high = float(df['high'].iloc[-1])
+            prev_high = float(df['high'].iloc[-2])
+            
+            # انحراف هابط: سعر يعمل قاع جديد و RSI لا (إشارة شراء)
+            if current_low < prev_low and current_rsi > prev_rsi:
+                score += 2.0
+                reasons.append("Bullish RSI divergence")
+            
+            # انحراف صاعد: سعر يعمل قمة جديدة و RSI لا (إشارة بيع)
+            if current_high > prev_high and current_rsi < prev_rsi:
+                score += 2.0
+                reasons.append("Bearish RSI divergence")
+    
+    # تأكيد الارتداد (Rev Confirm)
+    rev_confirm = False
+    if len(df) >= 5:
+        if side in ['long', 'buy']:
+            # للشراء: كسر آخر قمة صغيرة
+            last_high = float(df['high'].iloc[-2])
+            current_close = float(df['close'].iloc[-1])
+            if current_close > last_high:
+                rev_confirm = True
+                reasons.append("Close above last swing high (reversal confirmation)")
+        elif side in ['short', 'sell']:
+            # للبيع: كسر آخر قاع صغير
+            last_low = float(df['low'].iloc[-2])
+            current_close = float(df['close'].iloc[-1])
+            if current_close < last_low:
+                rev_confirm = True
+                reasons.append("Close below last swing low (reversal confirmation)")
+    
+    return score, reasons, rev_confirm
+
+def exhaustion_entry_guard(df, side, council_data):
+    """
+    حارس دخول ضد الإرهاق:
+    - يمنع فتح صفقات جديدة في نهاية الموجة
+    - يرجع (allow, reason)
+    """
+    exh_score, exh_reasons, rev_confirm = compute_exhaustion_score(df, side)
+    
+    if exh_score >= EXHAUSTION_SCORE_THRESHOLD:
+        reason = f"Exhaustion score too high ({exh_score:.1f} >= {EXHAUSTION_SCORE_THRESHOLD}): {', '.join(exh_reasons[:3])}"
+        return False, reason
+    
+    # إذا كان هناك تأكيد انعكاس ضد اتجاهنا، نمنع الدخول
+    if rev_confirm:
+        if (side == 'buy' and council_data.get('trend_side') == 'down') or \
+           (side == 'sell' and council_data.get('trend_side') == 'up'):
+            return False, "Reversal confirmed against our direction"
+    
+    return True, "OK"
+
+def exhaustion_position_management(state, df, pnl_frac):
+    """
+    إدارة الصفقة الحالية بناءً على درجة الإرهاق
+    يرجع: (action, reason, params)
+    """
+    if not state.get("open"):
+        return "hold", "No open position", {}
+    
+    side = state.get("side")
+    exh_score, exh_reasons, rev_confirm = compute_exhaustion_score(df, side)
+    
+    # إذا كانت درجة الإرهاق عالية والربح جيد
+    if exh_score >= EXHAUSTION_SCORE_THRESHOLD and pnl_frac > 0:
+        # إغلاق جزئي
+        if not state.get("exhaustion_trim_done", False):
+            state["exhaustion_trim_done"] = True
+            reason = f"Exhaustion trim: score={exh_score:.1f}, reasons: {', '.join(exh_reasons[:2])}"
+            return "partial", reason, {"fraction": EXHAUSTION_TRIM_PERCENT}
+        
+        # تشديد التريل
+        if EXHAUSTION_TRAIL_TIGHTEN and not state.get("exhaustion_tightened", False):
+            state["exhaustion_tightened"] = True
+            return "tighten", "Exhaustion trail tightening", {"multiplier": TRAIL_TIGHT_MULT}
+    
+    # إذا كان هناك تأكيد انعكاس
+    if rev_confirm and pnl_frac > 0:
+        return "close", f"Reversal confirmed: {', '.join(exh_reasons[:2])}", {}
+    
+    return "hold", "OK", {}
+
 # =================== ENHANCED COUNCIL VOTING ===================
 def council_votes_pro_enhanced(df):
-    """مجلس تصويت محسّن مع Footprint + SMC + Golden Zone Pro + VWAP + OTC + EMA + ChartPrime"""
+    """مجلس تصويت محسّن مع Footprint + SMC + Golden Zone Pro + VWAP + OTC + EMA + ChartPrime + Exhaustion Engine"""
     try:
         ind = compute_indicators(df)
         rsi_ctx = rsi_ma_context(df)
@@ -2241,6 +2436,21 @@ def council_votes_pro_enhanced(df):
             score_s += 0.5
             logs.append("📉 DI- Cross DOWN → ميل هابط محتمل")
 
+        # ==== Exhaustion Engine Impact ====
+        # حساب درجة الإرهاق لكل اتجاه
+        exh_score_buy, exh_reasons_buy, _ = compute_exhaustion_score(df, 'buy')
+        exh_score_sell, exh_reasons_sell, _ = compute_exhaustion_score(df, 'sell')
+        
+        # إرهاق الشراء (نهاية الهبوط) يزيد قوة البيع
+        if exh_score_buy >= EXHAUSTION_SCORE_THRESHOLD:
+            score_s += exh_score_buy * 0.3
+            logs.append(f"🛑 BUY Exhaustion (score={exh_score_buy:.1f}) → boost SELL")
+        
+        # إرهاق البيع (نهاية الصعود) يزيد قوة الشراء
+        if exh_score_sell >= EXHAUSTION_SCORE_THRESHOLD:
+            score_b += exh_score_sell * 0.3
+            logs.append(f"🛑 SELL Exhaustion (score={exh_score_sell:.1f}) → boost BUY")
+
         # تخفيف النطاق المحايد
         if rsi_ctx["in_chop"]:
             score_b *= 0.7; score_s *= 0.7; logs.append("⚖️ RSI محايد — تخفيض ثقة")
@@ -2284,6 +2494,8 @@ def council_votes_pro_enhanced(df):
             "cp_box_side": cp_boxes["side"],
             "cp_box_score": cp_boxes["box_score"],
             "liquidity_cycle": liquidity_cycle,
+            "exh_score_buy": exh_score_buy,
+            "exh_score_sell": exh_score_sell,
         })
 
         return {
@@ -2298,6 +2510,8 @@ def council_votes_pro_enhanced(df):
             "ema": ema_ctx,
             "cp_boxes": cp_boxes,
             "liquidity_cycle": liquidity_cycle,
+            "exh_score_buy": exh_score_buy,
+            "exh_score_sell": exh_score_sell,
         }
     except Exception as e:
         log_w(f"council_votes_pro_enhanced error: {e}")
@@ -2307,7 +2521,8 @@ def council_votes_pro_enhanced(df):
             "logs": [], "ind": {}, "gz": None,
             "candles": {}, "footprint": {}, "liquidity_traps": {}, "otc": {}, 
             "adx_cycle": {}, "art_cycle": {}, "ema": {},
-            "cp_boxes": {}, "liquidity_cycle": {}
+            "cp_boxes": {}, "liquidity_cycle": {},
+            "exh_score_buy": 0.0, "exh_score_sell": 0.0
         }
 
 # =================== POSITION RECOVERY ===================
@@ -2773,7 +2988,7 @@ def compute_flow_metrics(df):
 # ========= Unified snapshot emitter =========
 def emit_snapshots(exchange, symbol, df, balance_fn=None, pnl_fn=None):
     """
-    يطبع Snapshot موحّد: Bookmap + Flow + Council + Strategy + Balance/PnL + VWAP + OTC + EMA + ChartPrime
+    يطبع Snapshot موحّد: Bookmap + Flow + Council + Strategy + Balance/PnL + VWAP + OTC + EMA + ChartPrime + Exhaustion
     """
     try:
         bm = bookmap_snapshot(exchange, symbol)
@@ -2838,15 +3053,13 @@ def emit_snapshots(exchange, symbol, df, balance_fn=None, pnl_fn=None):
         ema_note = ""
         ema_ctx = cv.get("ema", {})
         if ema_ctx.get("label") != "none":
-            ema_label = ema_ctx.get("label", "")
-            ema_score = ema_ctx.get("score", 0.0)
-            ema_note = f" | 📈 EMA:{ema_label}({ema_score:.1f})"
+            ema_note = f" | 📈 EMA:{ema_ctx.get('label','')}"
             
         # ChartPrime info
         cp_note = ""
         cp_boxes = cv.get("cp_boxes", {})
         if cp_boxes.get("side"):
-            cp_note = f" | 📦 {cp_boxes['side'].upper()} box({cp_boxes.get('box_score',0):.1f})"
+            cp_note = f" | 📦 {cp_boxes['side'][:3].upper()}({cp_boxes.get('box_score',0):.1f})"
             
         # Liquidity Cycle info
         liq_note = ""
@@ -2854,10 +3067,17 @@ def emit_snapshots(exchange, symbol, df, balance_fn=None, pnl_fn=None):
         if liq_cycle.get("regime") != "chop":
             liq_note = f" | 💧 {liq_cycle['regime'].replace('_', ' ').upper()}"
 
+        # Exhaustion info
+        exh_note = ""
+        if cv.get('exh_score_buy', 0) >= EXHAUSTION_SCORE_THRESHOLD:
+            exh_note = f" | 🛑 BUY Exhaustion({cv['exh_score_buy']:.1f})"
+        elif cv.get('exh_score_sell', 0) >= EXHAUSTION_SCORE_THRESHOLD:
+            exh_note = f" | 🛑 SELL Exhaustion({cv['exh_score_sell']:.1f})"
+
         if LOG_ADDONS:
             print(f"🧱 {bm_note}", flush=True)
             print(f"📦 {fl_note}", flush=True)
-            print(f"📊 {dash}{gz_note}{otc_note}{ema_note}{cp_note}{liq_note}", flush=True)
+            print(f"📊 {dash}{gz_note}{otc_note}{ema_note}{cp_note}{liq_note}{exh_note}", flush=True)
             print(f"{strat}{(' | ' + wallet) if wallet else ''}", flush=True)
             
             gz_snap_note = ""
@@ -2900,9 +3120,16 @@ def emit_snapshots(exchange, symbol, df, balance_fn=None, pnl_fn=None):
             if liq_cycle.get("regime") != "chop":
                 liq_snap = f" | 💧{liq_cycle['regime'][:8]}"
             
+            # Exhaustion snapshot
+            exh_snap = ""
+            if cv.get('exh_score_buy', 0) >= EXHAUSTION_SCORE_THRESHOLD:
+                exh_snap = f" | 🛑BUY-EXH({cv['exh_score_buy']:.1f})"
+            elif cv.get('exh_score_sell', 0) >= EXHAUSTION_SCORE_THRESHOLD:
+                exh_snap = f" | 🛑SELL-EXH({cv['exh_score_sell']:.1f})"
+            
             print(f"🧠 SNAP | {side_hint} | votes={cv['b']}/{cv['s']} score={cv['score_b']:.1f}/{cv['score_s']:.1f} "
                   f"| ADX={cv['ind'].get('adx',0):.1f} DI={cv['ind'].get('di_spread',0):.1f} | "
-                  f"z={flow_z:.2f} | imb={bm_imb:.2f}{gz_snap_note}{vwap_info}{otc_snap}{ema_snap}{cp_snap}{liq_snap}", 
+                  f"z={flow_z:.2f} | imb={bm_imb:.2f}{gz_snap_note}{vwap_info}{otc_snap}{ema_snap}{cp_snap}{liq_snap}{exh_snap}", 
                   flush=True)
             
             # إضافة معلومات Footprint وSMC
@@ -2935,6 +3162,11 @@ def emit_snapshots(exchange, symbol, df, balance_fn=None, pnl_fn=None):
                 print(f"💧 LIQUIDITY CYCLE | {liq_cycle['regime']} | bias={liq_cycle.get('continuation_bias','none')} | "
                       f"ADX={liq_cycle.get('adx',0):.1f} | ART={liq_cycle.get('art_phase','')}", flush=True)
             
+            # Exhaustion detailed info
+            if cv.get('exh_score_buy', 0) >= EXHAUSTION_SCORE_THRESHOLD or cv.get('exh_score_sell', 0) >= EXHAUSTION_SCORE_THRESHOLD:
+                print(f"🛑 EXHAUSTION ENGINE | BUY={cv.get('exh_score_buy',0):.1f} | SELL={cv.get('exh_score_sell',0):.1f} | "
+                      f"Threshold={EXHAUSTION_SCORE_THRESHOLD}", flush=True)
+            
             print("✅ ENHANCED ADDONS LIVE", flush=True)
 
         return {"bm": bm, "flow": flow, "cv": cv, "mode": mode, "gz": gz, "wallet": wallet}
@@ -2943,9 +3175,27 @@ def emit_snapshots(exchange, symbol, df, balance_fn=None, pnl_fn=None):
         return {"bm": None, "flow": None, "cv": {"b":0,"s":0,"score_b":0.0,"score_s":0.0,"ind":{}},
                 "mode": {"mode":"n/a"}, "gz": None, "wallet": ""}
 
+# =================== FIXED EXECUTION FUNCTIONS FOR HEDGE MODE ===================
+def _params_open(side):
+    """إصلاح مشكلة Hedge Mode: side يجب أن يكون BUY/SELL و positionSide LONG/SHORT"""
+    if POSITION_MODE == "hedge":
+        position_side = "LONG" if side == "buy" else "SHORT"
+        return {"positionSide": position_side, "reduceOnly": False}
+    return {"positionSide": "BOTH", "reduceOnly": False}
+
+def _params_close():
+    """إصلاح مشكلة Hedge Mode للإغلاق"""
+    if POSITION_MODE == "hedge":
+        side = STATE.get("side")
+        if side == "long":
+            return {"positionSide": "LONG", "reduceOnly": True}
+        else:
+            return {"positionSide": "SHORT", "reduceOnly": True}
+    return {"positionSide": "BOTH", "reduceOnly": True}
+
 # =================== EXECUTION MANAGER ===================
 def execute_trade_decision(side, price, qty, mode, council_data, gz_data):
-    """تنفيذ قرار التداول مع التسجيل الواضح"""
+    """تنفيذ قرار التداول مع التسجيل الواضح والإصلاح لـ Hedge Mode"""
     if not EXECUTE_ORDERS or DRY_RUN:
         log_i(f"DRY_RUN: {side} {qty:.4f} @ {price:.6f} | mode={mode}")
         return True
@@ -2983,15 +3233,25 @@ def execute_trade_decision(side, price, qty, mode, council_data, gz_data):
     if liq_cycle.get("regime") != "chop":
         liq_note = f" | 💧 {liq_cycle['regime'][:8]}"
     
+    # Exhaustion note
+    exh_note = ""
+    exh_buy = council_data.get('exh_score_buy', 0)
+    exh_sell = council_data.get('exh_score_sell', 0)
+    if side == 'buy' and exh_buy >= EXHAUSTION_SCORE_THRESHOLD:
+        exh_note = f" | 🛑 BUY Exhaustion({exh_buy:.1f})"
+    elif side == 'sell' and exh_sell >= EXHAUSTION_SCORE_THRESHOLD:
+        exh_note = f" | 🛑 SELL Exhaustion({exh_sell:.1f})"
+    
     votes = council_data
     print(f"🎯 EXECUTE: {side.upper()} {qty:.4f} @ {price:.6f} | "
           f"mode={mode} | votes={votes['b']}/{votes['s']} score={votes['score_b']:.1f}/{votes['score_s']:.1f}"
-          f"{gz_note}{otc_note}{ema_note}{cp_note}{liq_note}", flush=True)
+          f"{gz_note}{otc_note}{ema_note}{cp_note}{liq_note}{exh_note}", flush=True)
 
     try:
         if MODE_LIVE:
-            ex.set_leverage(LEVERAGE, SYMBOL, params={"side": "BOTH"})
-            ex.create_order(SYMBOL, "market", side, qty, None, _params_open(side))
+            # إصلاح Hedge Mode: التأكد من استخدام المعلمات الصحيحة
+            params = _params_open(side)
+            ex.create_order(SYMBOL, "market", side, qty, None, params)
         
         log_g(f"✅ EXECUTED: {side.upper()} {qty:.4f} @ {price:.6f}")
         return True
@@ -3044,6 +3304,12 @@ def open_market_enhanced(side, qty, price):
     mode = mode_data["mode"]
     gz = snap["gz"]
     
+    # Exhaustion Entry Guard - منع الدخول المتأخر
+    exh_check, exh_reason = exhaustion_entry_guard(df, side, votes["ind"])
+    if not exh_check:
+        log_w(f"⏸️ ENTRY BLOCKED by Exhaustion Engine: {exh_reason}")
+        return False
+    
     # Enhanced management config
     management_config = setup_trade_management(mode)
     
@@ -3076,6 +3342,8 @@ def open_market_enhanced(side, qty, price):
             "management": management_config,
             "signal_strength": signal_strength,
             "trade_profile": trade_profile,
+            "exhaustion_trim_done": False,
+            "exhaustion_tightened": False,
         })
         
         # ===================== HUNTER PATCH: IRON SL =====================
@@ -3108,6 +3376,8 @@ def open_market_enhanced(side, qty, price):
             "trail_tightened": False,
             "last_status_log_ts": 0.0,
             "hard_sl": STATE.get("hard_sl"),
+            "exhaustion_trim_done": False,
+            "exhaustion_tightened": False,
         })
 
         # === لوج افتتاح الصفقة + خطة جني الأرباح ===
@@ -3257,6 +3527,10 @@ STATE = {
     "hard_sl": None,                  # ستوب حديدي 8 نقاط
     "hist_adx": [],                   # تاريخ ADX للمراقبة
     "hist_atr": [],                   # تاريخ ATR للمراقبة
+    
+    # --- Exhaustion Engine ---
+    "exhaustion_trim_done": False,    # هل تم إغلاق جزئي بسبب الإرهاق؟
+    "exhaustion_tightened": False,    # هل تم تشديد التريل بسبب الإرهاق؟
 }
 compound_pnl = 0.0
 wait_for_next_signal_side = None
@@ -3281,16 +3555,6 @@ def wait_gate_allow(df, info):
     return False, f"wait-for-next-RF({wait_for_next_signal_side})"
 
 # =================== ORDERS ===================
-def _params_open(side):
-    if POSITION_MODE == "hedge":
-        return {"positionSide": "LONG" if side=="buy" else "SHORT", "reduceOnly": False}
-    return {"positionSide": "BOTH", "reduceOnly": False}
-
-def _params_close():
-    if POSITION_MODE == "hedge":
-        return {"positionSide": "LONG" if STATE.get("side")=="long" else "SHORT", "reduceOnly": True}
-    return {"positionSide": "BOTH", "reduceOnly": True}
-
 def _read_position():
     try:
         poss = ex.fetch_positions(params={"type":"swap"})
@@ -3379,6 +3643,8 @@ def _reset_after_close(reason, prev_side=None):
         "hard_sl": None,  # إعادة تعيين Iron SL
         "hist_adx": [],
         "hist_atr": [],
+        "exhaustion_trim_done": False,
+        "exhaustion_tightened": False,
     })
     save_state({"in_position": False, "position_qty": 0})
     
@@ -3511,7 +3777,7 @@ def smart_exit_guard(state, df, ind, flow, bm, now_price, pnl_pct, mode, side, e
 
 # =================== ENHANCED TRADE MANAGEMENT ===================
 def manage_after_entry_enhanced(df, ind, info):
-    """إدارة محسنة للمركز مع Smart Profit AI + Smart Exit Guard + Hard Stop + HUNTER PATCH"""
+    """إدارة محسنة للمركز مع Smart Profit AI + Smart Exit Guard + Hard Stop + HUNTER PATCH + Exhaustion Engine"""
     if not STATE["open"] or STATE["qty"] <= 0:
         return
 
@@ -3559,6 +3825,32 @@ def manage_after_entry_enhanced(df, ind, info):
 
     if pnl_pct > STATE.get("highest_profit_pct", 0.0):
         STATE["highest_profit_pct"] = pnl_pct
+
+    # ========= Exhaustion Engine Management =========
+    pnl_frac = pnl_pct / 100.0
+    exh_action, exh_reason, exh_params = exhaustion_position_management(STATE, df, pnl_frac)
+    
+    if exh_action == "partial":
+        close_fraction = exh_params.get("fraction", EXHAUSTION_TRIM_PERCENT)
+        close_qty = safe_qty(qty * close_fraction)
+        if close_qty > 0:
+            close_side = "sell" if side == "long" else "buy"
+            if MODE_LIVE and EXECUTE_ORDERS and not DRY_RUN:
+                try:
+                    ex.create_order(SYMBOL, "market", close_side, close_qty, None, _params_close())
+                    log_g(f"✅ EXHAUSTION TRIM: closed {close_fraction*100:.0f}% | {exh_reason}")
+                    STATE["qty"] = safe_qty(qty - close_qty)
+                except Exception as e:
+                    log_e(f"❌ Exhaustion trim failed: {e}")
+    
+    elif exh_action == "tighten":
+        STATE["trail_tightened"] = True
+        log_i(f"🛡️ EXHAUSTION TRAIL TIGHTENING: {exh_reason}")
+    
+    elif exh_action == "close":
+        log_w(f"🛑 EXHAUSTION CLOSE: {exh_reason}")
+        close_market_strict(f"exhaustion_close_{side}")
+        return
 
     # ========= HUNTER PATCH: ADX/ATR WEAKNESS EXIT =========
     watch = adx_atr_watcher(ind, STATE)
@@ -3767,7 +4059,7 @@ def sync_manual_close():
 
 # =================== ENHANCED TRADE LOOP ===================
 def trade_loop_enhanced():
-    """حلقة تداول محسنة مع Golden Zone Pro وSmart Profit AI وVWAP وOTC Detection وEMA Cross + Risk Guards + ChartPrime + HUNTER PATCH"""
+    """حلقة تداول محسنة مع Golden Zone Pro وSmart Profit AI وVWAP وOTC Detection وEMA Cross + Risk Guards + ChartPrime + HUNTER PATCH + Exhaustion Engine"""
     global wait_for_next_signal_side
     loop_i = 0
     
@@ -3796,7 +4088,7 @@ def trade_loop_enhanced():
             if STATE["open"] and px:
                 STATE["pnl"] = (px-STATE["entry"])*STATE["qty"] if STATE["side"]=="long" else (STATE["entry"]-px)*STATE["qty"]
             
-            # إدارة الصفقة المفتوحة مع Smart Profit AI + Hard Stop
+            # إدارة الصفقة المفتوحة مع Smart Profit AI + Hard Stop + Exhaustion Engine
             if STATE["open"]:
                 manage_after_entry_enhanced(df, ind, {
                     "price": px or info["price"], 
@@ -3897,6 +4189,18 @@ def trade_loop_enhanced():
                 sell_score += 0.5
                 reasons.append("Launch")
 
+            # Exhaustion penalty (عقوبة الدخول المتأخر)
+            exh_buy = council_data.get('exh_score_buy', 0)
+            exh_sell = council_data.get('exh_score_sell', 0)
+            
+            if exh_buy >= EXHAUSTION_SCORE_THRESHOLD:
+                buy_score *= 0.5  # تخفيض قوة الشراء عند إرهاق البيع
+                reasons.append(f"BuyExhaustion({exh_buy:.1f})")
+            
+            if exh_sell >= EXHAUSTION_SCORE_THRESHOLD:
+                sell_score *= 0.5  # تخفيض قوة البيع عند إرهاق الشراء
+                reasons.append(f"SellExhaustion({exh_sell:.1f})")
+
             # دمج قوة المجلس مع السكور
             total_buy = buy_score + (score_b * 0.60) + (votes_b * 0.15)
             total_sell = sell_score + (score_s * 0.60) + (votes_s * 0.15)
@@ -3911,6 +4215,18 @@ def trade_loop_enhanced():
 
             if hunter_allowed:
                 hunter_allowed = (adx_v >= HUNTER_ADX_MIN) and (di_edge >= HUNTER_DI_EDGE)
+
+            # ===== Exhaustion Entry Guard =====
+            # منع الدخول في نهاية الموجة
+            if total_buy > total_sell and exh_buy >= EXHAUSTION_SCORE_THRESHOLD:
+                reason = f"BUY blocked by exhaustion (score={exh_buy:.1f} >= {EXHAUSTION_SCORE_THRESHOLD})"
+                log_w(f"⏸️ {reason}")
+                total_buy = 0
+            
+            if total_sell > total_buy and exh_sell >= EXHAUSTION_SCORE_THRESHOLD:
+                reason = f"SELL blocked by exhaustion (score={exh_sell:.1f} >= {EXHAUSTION_SCORE_THRESHOLD})"
+                log_w(f"⏸️ {reason}")
+                total_sell = 0
 
             # ===== Final entry decision =====
             final_signal = None
@@ -3940,7 +4256,7 @@ def trade_loop_enhanced():
                 # + احترام cooldown/spread guards الموجودة عندك
                 qty = compute_size(bal, px or info["price"])
                 if qty > 0:
-                    ok = open_market_enhanced(final_signal, qty, px or info["price"])
+                    ok = open_market_enhanced(final_signal.lower(), qty, px or info["price"])
                     if ok:
                         wait_for_next_signal_side = None
                         log_i(f"🎯 ENTRY → {final_signal} | total_buy={total_buy:.2f} total_sell={total_sell:.2f} | "
@@ -3980,7 +4296,7 @@ def pretty_snapshot(bal, info, ind, spread_bps, reason=None, df=None):
         print("📈 INDICATORS & RF")
         print(f"   💲 Price {fmt(info.get('price'))} | RF filt={fmt(info.get('filter'))}  hi={fmt(info.get('hi'))} lo={fmt(info.get('lo'))}")
         print(f"   🧮 RSI={fmt(ind.get('rsi'))}  +DI={fmt(ind.get('plus_di'))}  -DI={fmt(ind.get('minus_di'))}  ADX={fmt(ind.get('adx'))}  ATR={fmt(ind.get('atr'))}")
-        print(f"   🎯 ENTRY: COUNCIL PRO + GOLDEN ENTRY + VWAP STRATEGY + OTC DETECTION + EMA CROSSOVER ENGINE + CHART PRIME + HUNTER PATCH  |  spread_bps={fmt(spread_bps,2)}")
+        print(f"   🎯 ENTRY: COUNCIL PRO + GOLDEN ENTRY + VWAP STRATEGY + OTC DETECTION + EMA CROSSOVER ENGINE + CHART PRIME + HUNTER PATCH + EXHAUSTION ENGINE  |  spread_bps={fmt(spread_bps,2)}")
         print(f"   ⏱️ closes_in ≈ {left_s}s")
         
         # عرض معلومات الـ Guards
@@ -4020,7 +4336,7 @@ app = Flask(__name__)
 @app.route("/")
 def home():
     mode='LIVE' if MODE_LIVE else 'PAPER'
-    return f"✅ Council PRO Bot — {SYMBOL} {INTERVAL} — {mode} — Enhanced Candles + Golden Zone Pro + Smart Profit AI + VWAP Strategy + OTC Detection + EMA Crossover Engine + Hard Stop Loss + Post-Big-Win Guard + Auto-Recovery + ChartPrime + HUNTER PATCH"
+    return f"✅ Council PRO Bot — {SYMBOL} {INTERVAL} — {mode} — Enhanced Candles + Golden Zone Pro + Smart Profit AI + VWAP Strategy + OTC Detection + EMA Crossover Engine + Hard Stop Loss + Post-Big-Win Guard + Auto-Recovery + ChartPrime + HUNTER PATCH + Exhaustion Engine"
 
 @app.route("/metrics")
 def metrics():
@@ -4028,7 +4344,7 @@ def metrics():
         "symbol": SYMBOL, "interval": INTERVAL, "mode": "live" if MODE_LIVE else "paper",
         "leverage": LEVERAGE, "risk_alloc": RISK_ALLOC, "price": price_now(),
         "state": STATE, "compound_pnl": compound_pnl,
-        "entry_mode": "COUNCIL_PRO_GOLDEN_ENHANCED_VWAP_OTC_EMA_CHARTPRIME_HUNTER", "wait_for_next_signal": wait_for_next_signal_side,
+        "entry_mode": "COUNCIL_PRO_GOLDEN_ENHANCED_VWAP_OTC_EMA_CHARTPRIME_HUNTER_EXHAUSTION", "wait_for_next_signal": wait_for_next_signal_side,
         "risk_guards": {
             "hard_stop_pct": abs(MAX_LOSS_PCT)*100,
             "big_win_pct": BIG_WIN_PCT*100,
@@ -4070,12 +4386,21 @@ def metrics():
             "adx_exit_weak": ADX_EXIT_WEAK,
             "min_profit_to_exit": MIN_PROFIT_TO_EXIT
         },
+        "exhaustion_engine": {
+            "enabled": True,
+            "score_threshold": EXHAUSTION_SCORE_THRESHOLD,
+            "trim_percent": EXHAUSTION_TRIM_PERCENT,
+            "trail_tighten": EXHAUSTION_TRAIL_TIGHTEN,
+            "adx_drop_min": EXHAUSTION_ADX_DROP_MIN
+        },
         "current_guards": {
             "post_big_win_active": STATE.get("post_big_win_mode", False),
             "post_big_win_bars_left": STATE.get("post_big_win_bars_left", 0),
             "hard_stop_price": STATE.get("max_loss_price"),
             "iron_sl_price": STATE.get("hard_sl"),
-            "last_closed_pnl_pct": STATE.get("last_closed_pnl_pct", 0.0)
+            "last_closed_pnl_pct": STATE.get("last_closed_pnl_pct", 0.0),
+            "exhaustion_trim_done": STATE.get("exhaustion_trim_done", False),
+            "exhaustion_tightened": STATE.get("exhaustion_tightened", False)
         }
     })
 
@@ -4085,11 +4410,13 @@ def health():
         "ok": True, "mode": "live" if MODE_LIVE else "paper",
         "open": STATE["open"], "side": STATE["side"], "qty": STATE["qty"],
         "compound_pnl": compound_pnl, "timestamp": datetime.utcnow().isoformat(),
-        "entry_mode": "COUNCIL_PRO_GOLDEN_ENHANCED_VWAP_OTC_EMA_CHARTPRIME_HUNTER", "wait_for_next_signal": wait_for_next_signal_side,
+        "entry_mode": "COUNCIL_PRO_GOLDEN_ENHANCED_VWAP_OTC_EMA_CHARTPRIME_HUNTER_EXHAUSTION", "wait_for_next_signal": wait_for_next_signal_side,
         "risk_guards": {
             "hard_stop_active": STATE.get("max_loss_price") is not None,
             "post_big_win_active": STATE.get("post_big_win_mode", False),
-            "iron_sl_active": STATE.get("hard_sl") is not None
+            "iron_sl_active": STATE.get("hard_sl") is not None,
+            "exhaustion_trim_done": STATE.get("exhaustion_trim_done", False),
+            "exhaustion_tightened": STATE.get("exhaustion_tightened", False)
         }
     }), 200
 
@@ -4133,6 +4460,8 @@ if __name__ == "__main__":
     print(colored(f"📦 CHART PRIME: High-Volume Boxes + Liquidity Cycle Monitor", "green"))
     print(colored(f"🛡️ RISK GUARDS: Hard Stop Loss (-{abs(MAX_LOSS_PCT)*100}%) | Post-Big-Win Guard (+{BIG_WIN_PCT*100}%)", "red"))
     print(colored(f"🎯 HUNTER PATCH: Unified Entry | ADX/ATR Smart Monitor | Iron SL {HARD_SL_TICKS} ticks | Launch Detection", "cyan"))
+    print(colored(f"🛑 EXHAUSTION ENGINE: Wave End Detection | Score Threshold={EXHAUSTION_SCORE_THRESHOLD} | Trim={EXHAUSTION_TRIM_PERCENT*100}%", "magenta"))
+    print(colored(f"🔧 FIXED: Hedge Mode Execution Bug + Late Entry Prevention", "green"))
     print(colored(f"🔄 AUTO RECOVERY: Enhanced position sync on restart", "green"))
     print(colored(f"🔄 MANUAL CLOSE SYNC: Enabled (detects manual close from exchange)", "green"))
     print(colored(f"EXECUTION: {'ACTIVE' if EXECUTE_ORDERS and not DRY_RUN else 'SIMULATION'}", "yellow"))
