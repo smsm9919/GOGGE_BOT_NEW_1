@@ -6,6 +6,7 @@ RF Futures Bot — RF-LIVE ONLY (BingX Perp via CCXT)
 • Dynamic TP ladder + Breakeven + ATR-trailing
 • Smart Exit Management + Wait-for-next-signal
 • Professional Logging & Dashboard
+• HYBRID BALANCED PRO (DOGE 15m) - Structure/SR + Liquidity + Market State
 """
 
 import os, time, math, random, signal, sys, traceback, logging, json
@@ -40,7 +41,7 @@ SHADOW_MODE_DASHBOARD = False
 DRY_RUN = False
 
 # ==== Addon: Logging + Recovery Settings ====
-BOT_VERSION = "DOGE Council PRO v4.0 — Candles + Golden System"
+BOT_VERSION = "DOGE Council PRO v4.0 — Candles + Golden System + HYBRID BALANCED"
 print("🔁 Booting:", BOT_VERSION, flush=True)
 
 STATE_PATH = "./bot_state.json"
@@ -137,6 +138,31 @@ TREND_ATR_MULT = 1.8
 MAX_TRADES_PER_HOUR = 6
 COOLDOWN_SECS_AFTER_CLOSE = 60
 ADX_GATE = 17
+
+# =================== HYBRID BALANCED (DOGE 15m) ===================
+HYBRID_ENABLED = True
+
+# Entry thresholds (Balanced)
+ENTRY_SCORE_BASE = 8.0
+ENTRY_SCORE_IGNITION = 6.5      # دخول مبكر "متوازن" بعد أول تأكيد
+ENTRY_SCORE_TREND = 6.0         # دخول ترند أقوى
+
+# DOGE 15m behavior thresholds
+DOGE_ADX_ACCUM_MAX = 13.0
+DOGE_ADX_BUILD_MIN = 13.0
+DOGE_ADX_IGNITION_MIN = 18.0
+DOGE_ADX_STRONG = 25.0
+DOGE_ADX_EXHAUST = 35.0
+
+DOGE_DI_SPREAD_BUILD = 4.0
+DOGE_DI_SPREAD_DOM = 8.0
+
+# Volatility shock & breakout rules
+SHOCK_RANGE_ATR_MULT = 2.2      # Candle range shock (pump/dump)
+BREAK_BODY_ATR_MULT  = 0.25     # Body confirm vs ATR (avoid wick-only breaks)
+FAKE_WICK_ATR_MULT   = 0.15     # Wick sweep threshold vs ATR
+SR_ZONE_ATR_BUFFER   = 0.35     # zone buffer around swing levels (ATR-based)
+VOL_BOOST_MULT       = 1.25     # volume boost for breakout confirmation
 
 # =================== PROFESSIONAL LOGGING ===================
 def log_i(msg): print(f"ℹ️ {msg}", flush=True)
@@ -416,16 +442,188 @@ def decide_strategy_mode(df, adx=None, di_plus=None, di_minus=None, rsi_ctx=None
     
     return {"mode": mode, "why": why}
 
+# =================== STRUCTURE/LIQUIDITY ENGINE ===================
+def analyze_structure_liquidity(df: pd.DataFrame, ind: dict, lookback: int = 90, swing_w: int = 8):
+    """
+    Structure & Liquidity Engine (DOGE 15m):
+    - يحدد آخر Support/Resistance (Swing Low/High)
+    - يميز: breakout / breakdown / fakeout / rejection / sweep
+    - يحسب pump/dump shock (ATR spike + range shock)
+    Returns dict:
+      {
+        "support": float|None, "resistance": float|None,
+        "event": "breakout|breakdown|fakeout_up|fakeout_dn|rejection|none",
+        "liq": "grab_up|grab_dn|absorption|none",
+        "strength": 0..100,
+        "notes": [..],
+        "metrics": {...}
+      }
+    """
+    out = {
+        "support": None, "resistance": None,
+        "event": "none", "liq": "none",
+        "strength": 0, "notes": [], "metrics": {}
+    }
+    try:
+        if df is None or len(df) < max(lookback, 60):
+            out["notes"].append("short_df")
+            return out
+
+        d = df.tail(lookback).copy()
+        o = d["open"].astype(float)
+        h = d["high"].astype(float)
+        l = d["low"].astype(float)
+        c = d["close"].astype(float)
+        v = d["volume"].astype(float)
+
+        atr = float(ind.get("atr", 0.0) or 0.0)
+        atr = max(atr, 1e-9)
+
+        # ---- Swing detection (simple & stable)
+        def last_swing_high(series, w):
+            idx = None
+            for i in range(w, len(series)-w):
+                cur = series.iloc[i]
+                if cur >= series.iloc[i-w:i].max() and cur >= series.iloc[i+1:i+w+1].max():
+                    idx = series.index[i]
+            return idx
+
+        def last_swing_low(series, w):
+            idx = None
+            for i in range(w, len(series)-w):
+                cur = series.iloc[i]
+                if cur <= series.iloc[i-w:i].min() and cur <= series.iloc[i+1:i+w+1].min():
+                    idx = series.index[i]
+            return idx
+
+        sh_idx = last_swing_high(h, swing_w)
+        sl_idx = last_swing_low(l, swing_w)
+
+        resistance = float(h.loc[sh_idx]) if sh_idx is not None else float(h.max())
+        support = float(l.loc[sl_idx]) if sl_idx is not None else float(l.min())
+
+        # zone buffer (ATR-based)
+        buf = SR_ZONE_ATR_BUFFER * atr
+        rz_hi = resistance + buf
+        rz_lo = resistance - buf
+        sz_hi = support + buf
+        sz_lo = support - buf
+
+        # last candles
+        o1, h1, l1, c1 = float(o.iloc[-1]), float(h.iloc[-1]), float(l.iloc[-1]), float(c.iloc[-1])
+        o0, h0, l0, c0 = float(o.iloc[-2]), float(h.iloc[-2]), float(l.iloc[-2]), float(c.iloc[-2])
+
+        body1 = abs(c1 - o1)
+        rng1 = (h1 - l1)
+        body0 = abs(c0 - o0)
+        rng0 = (h0 - l0)
+
+        # volume context
+        vma = float(v.rolling(20).mean().iloc[-1] or 1e-9)
+        v1 = float(v.iloc[-1])
+        vol_boost = (v1 / max(vma, 1e-9))
+
+        # shock detection (pump/dump)
+        shock = rng1 >= (SHOCK_RANGE_ATR_MULT * atr) and vol_boost >= VOL_BOOST_MULT
+
+        # helper flags around zones
+        broke_up_wick = (h1 > rz_hi) and (c1 < rz_hi)      # swept above then rejected
+        broke_dn_wick = (l1 < sz_lo) and (c1 > sz_lo)      # swept below then rejected
+
+        broke_up_close = (c1 > rz_hi) and (body1 >= BREAK_BODY_ATR_MULT * atr)
+        broke_dn_close = (c1 < sz_lo) and (body1 >= BREAK_BODY_ATR_MULT * atr)
+
+        # fakeout confirmation (2-candle)
+        # Fakeout Up: candle breaks above but closes back in + next candle red/weak
+        fakeout_up = broke_up_wick and (c1 < rz_hi) and (c0 <= rz_hi or c0 <= resistance)
+        # Fakeout Down: candle breaks below but closes back in + next candle green/weak
+        fakeout_dn = broke_dn_wick and (c1 > sz_lo) and (c0 >= sz_lo or c0 >= support)
+
+        # rejection (touch & reject without real break)
+        rejection_r = (h1 >= rz_lo and c1 < rz_lo and body1 >= FAKE_WICK_ATR_MULT * atr)
+        rejection_s = (l1 <= sz_hi and c1 > sz_hi and body1 >= FAKE_WICK_ATR_MULT * atr)
+
+        event = "none"
+        liq = "none"
+        notes = []
+        strength = 50
+
+        if fakeout_up:
+            event = "fakeout_up"
+            liq = "grab_up"
+            strength = 78
+            notes += ["fake_break_above_res", "liq_grab_up"]
+        elif fakeout_dn:
+            event = "fakeout_dn"
+            liq = "grab_dn"
+            strength = 78
+            notes += ["fake_break_below_sup", "liq_grab_dn"]
+        elif broke_up_close:
+            event = "breakout"
+            strength = 82
+            notes += ["close_above_res", "body_confirm"]
+            if vol_boost >= VOL_BOOST_MULT: notes.append("vol_confirm")
+            if shock: notes.append("⚠️ shock_pump")
+        elif broke_dn_close:
+            event = "breakdown"
+            strength = 82
+            notes += ["close_below_sup", "body_confirm"]
+            if vol_boost >= VOL_BOOST_MULT: notes.append("vol_confirm")
+            if shock: notes.append("⚠️ shock_dump")
+        elif rejection_r:
+            event = "rejection"
+            strength = 66
+            notes += ["rejection_at_res"]
+        elif rejection_s:
+            event = "rejection"
+            strength = 66
+            notes += ["rejection_at_sup"]
+
+        # improve strength if shock + direction clear
+        if shock:
+            strength = min(95, strength + 8)
+
+        out["support"] = support
+        out["resistance"] = resistance
+        out["event"] = event
+        out["liq"] = liq
+        out["strength"] = int(max(0, min(100, strength)))
+        out["notes"] = notes[:8]
+        out["metrics"] = {
+            "atr": atr, "buf": buf,
+            "rz_lo": rz_lo, "rz_hi": rz_hi,
+            "sz_lo": sz_lo, "sz_hi": sz_hi,
+            "range": rng1, "body": body1,
+            "vol_boost": vol_boost,
+            "shock": bool(shock),
+            "close": c1
+        }
+        return out
+
+    except Exception as e:
+        out["notes"] = [f"error:{e}"]
+        out["strength"] = 0
+        return out
+
 # =================== ENHANCED COUNCIL VOTING ===================
 def council_votes_pro_enhanced(df):
-    """مجلس تصويت محسّن مع RSI+MA والمناطق الذهبية + الشموع"""
+    """مجلس تصويت محسّن مع RSI+MA والمناطق الذهبية + الشموع + HYBRID"""
     try:
         ind = compute_indicators(df)
         rsi_ctx = rsi_ma_context(df)
         gz = golden_zone_check(df, ind)
-
-        # جديد: حساب الشموع
         cd = compute_candles(df)
+
+        # =================== HYBRID: Market + Structure/Liquidity ===================
+        mon = analyze_market_state(df, ind)
+        sl  = analyze_structure_liquidity(df, ind)
+
+        mstate = mon.get("state", "NA")
+        mbias  = mon.get("bias", "neutral")
+        mconf  = mon.get("confidence", 0)
+
+        sev = sl.get("event", "none")
+        sstr = sl.get("strength", 0)
 
         votes_b = 0; votes_s = 0
         score_b = 0.0; score_s = 0.0
@@ -475,7 +673,38 @@ def council_votes_pro_enhanced(df):
         if adx < ADX_GATE:
             score_b *= 0.85; score_s *= 0.85; logs.append(f"🛡️ ADX Gate ({adx:.1f} < {ADX_GATE})")
 
-        # ضمّ إشارات الشموع ليتوفّر لباقي المنظومة (إدارة/خروج)
+        # =================== HYBRID BOOSTS (Balanced - BUY/SELL same power) ===================
+
+        # 1) Market regime boosts (balanced)
+        if HYBRID_ENABLED and mconf >= 65:
+            if mstate in ("IGNITION_UP", "ACCUMULATION_BOTTOM") and mbias == "bull":
+                votes_b += 2; score_b += 1.5; logs.append(f"🧠 Hybrid: Ignition/Bottom → BUY boost (conf={mconf})")
+            if mstate in ("IGNITION_DOWN", "ACCUMULATION_TOP") and mbias == "bear":
+                votes_s += 2; score_s += 1.5; logs.append(f"🧠 Hybrid: Ignition/Top → SELL boost (conf={mconf})")
+
+            if mstate == "TREND_UP" and mbias == "bull":
+                votes_b += 1; score_b += 1.0; logs.append("🧠 Hybrid: TrendUp boost")
+            if mstate == "TREND_DOWN" and mbias == "bear":
+                votes_s += 1; score_s += 1.0; logs.append("🧠 Hybrid: TrendDown boost")
+
+            if mstate in ("CHOP", "MIXED"):
+                score_b *= 0.85; score_s *= 0.85; logs.append("🧠 Hybrid: Chop dampening ×0.85")
+
+        # 2) Structure/Liquidity boosts (key edge on DOGE)
+        if HYBRID_ENABLED and sstr >= 70:
+            # True breakout/breakdown → trade continuation
+            if sev == "breakout":
+                votes_b += 2; score_b += 1.8; logs.append("🧱 Breakout confirmed → BUY boost")
+            if sev == "breakdown":
+                votes_s += 2; score_s += 1.8; logs.append("🧱 Breakdown confirmed → SELL boost")
+
+            # Fakeouts → reversal
+            if sev == "fakeout_up":
+                votes_s += 2; score_s += 1.8; logs.append("🧲 Fakeout above RES → SELL reversal boost")
+            if sev == "fakeout_dn":
+                votes_b += 2; score_b += 1.8; logs.append("🧲 Fakeout below SUP → BUY reversal boost")
+
+        # expose to downstream (loop/exit/logs)
         ind.update({
             "rsi_ma": rsi_ctx["rsi_ma"],
             "rsi_trendz": rsi_ctx["trendZ"],
@@ -485,7 +714,14 @@ def council_votes_pro_enhanced(df):
             "candle_sell_score": cd["score_sell"],
             "wick_up_big": cd["wick_up_big"],
             "wick_dn_big": cd["wick_dn_big"],
-            "candle_tags": cd["pattern"]
+            "candle_tags": cd["pattern"],
+            "mon": mon,
+            "sl": sl,
+            "mstate": mstate,
+            "mbias": mbias,
+            "mconf": mconf,
+            "sev": sev,
+            "sstr": sstr,
         })
 
         return {
@@ -1444,11 +1680,15 @@ def smart_exit_guard(state, df, ind, flow, bm, now_price, pnl_pct, mode, side, e
     else:
         adx_slope = 0.0
 
+    # =================== HYBRID STRUCTURE/LIQUIDITY DATA ===================
+    mon = analyze_market_state(df, ind) if df is not None else None
+    sl = analyze_structure_liquidity(df, ind) if df is not None else None
+    sev = sl.get("event") if sl else "none"
+    sstr = sl.get("strength", 0) if sl else 0
+    shock = bool(sl.get("metrics", {}).get("shock")) if sl else False
+
     # =================== EARLY INVALIDATION EXIT (Wrong entry cut) ===================
     # الفكرة: لو دخلنا غلط، نقفل بدري بخسارة صغيرة بدل ما تكبر.
-    mon = analyze_market_state(df, ind) if df is not None else None
-
-    # حارس: اشتغل بدري فقط أول شموع الصفقة
     bars_in = int(state.get("bars", 0) or 0)
 
     if mon and bars_in <= 4:
@@ -1483,6 +1723,17 @@ def smart_exit_guard(state, df, ind, flow, bm, now_price, pnl_pct, mode, side, e
         if st in ("CHOP", "ACCUMULATION") and adx < 15:
             invalid += 1
 
+        # 5) Structure/liquidity invalidation (strong)
+        if sstr >= 75:
+            if side == "long" and sev in ("breakdown", "fakeout_up"):
+                invalid += 2
+            if side == "short" and sev in ("breakout", "fakeout_dn"):
+                invalid += 2
+
+        # 6) Shock protection (pump/dump wrong side)
+        if shock and pnl_pct <= -0.0015:
+            invalid += 2
+
         # Threshold: 2+ signals + small loss => cut
         # pnl_pct هنا داخل الدالة = نسبة (مثلاً 0.003 = 0.3%)، لأنك بتمرر pnl_pct/100 من manage_after_entry.
         # فـ -0.0025 = -0.25%
@@ -1492,6 +1743,19 @@ def smart_exit_guard(state, df, ind, flow, bm, now_price, pnl_pct, mode, side, e
                 "why": "early_invalidation",
                 "log": f"❌ INVALIDATION CLOSE | pnl={pnl_pct*100:.2f}% | st={st} bias={mon.get('bias')} invalid={invalid}"
             }
+
+    # =================== HYBRID HOLD-TP (trend ride) ===================
+    if mon:
+        mstate = mon.get("state", "NA")
+        mconf  = mon.get("confidence", 0)
+        mbias  = mon.get("bias", "neutral")
+
+        # If trend strong & in our favor → avoid premature strict close, prefer tighten/partial
+        if mstate in ("TREND_UP", "TREND_DOWN") and mconf >= 70 and adx >= DOGE_ADX_STRONG:
+            # If no strong reversal signals, keep riding
+            if not ((side == "long" and mbias == "bear") or (side == "short" and mbias == "bull")):
+                # soften strict close triggers later in function by hinting mode
+                state["hold_tp"] = True
 
     # حساب الفتائل
     wick_signal = False
@@ -1577,7 +1841,7 @@ def smart_exit_guard(state, df, ind, flow, bm, now_price, pnl_pct, mode, side, e
 
 # =================== ENHANCED TRADE LOOP ===================
 def trade_loop_enhanced():
-    """حلقة تداول محسنة مع Golden Entry ومجلس الإدارة"""
+    """حلقة تداول محسنة مع Golden Entry ومجلس الإدارة + HYBRID"""
     global wait_for_next_signal_side
     loop_i = 0
     
@@ -1609,7 +1873,7 @@ def trade_loop_enhanced():
                     **info
                 })
             
-            # قرار الدخول باستخدام مجلس الإدارة المحسن + Golden Entry
+            # قرار الدخول باستخدام مجلس الإدارة المحسن + Golden Entry + HYBRID
             reason = None
             if spread_bps is not None and spread_bps > MAX_SPREAD_BPS:
                 reason = f"spread too high ({fmt(spread_bps,2)}bps > {MAX_SPREAD_BPS})"
@@ -1627,16 +1891,69 @@ def trade_loop_enhanced():
                     sig = "sell" 
                     log_i(f"🎯 GOLDEN ENTRY: SELL | score={gz['score']:.1f} | منطقة ذهبية قوية")
 
-            # لو مفيش Golden، استخدم السكور المعتاد
-            if sig is None:
-                if council_data["score_b"] > council_data["score_s"] and council_data["score_b"] >= 8.0:
+            # =================== HYBRID ENTRY (Balanced - DOGE 15m) ===================
+            mon = analyze_market_state(df, ind)
+            sl  = analyze_structure_liquidity(df, ind)
+
+            mstate = mon.get("state", "NA")
+            mbias  = mon.get("bias", "neutral")
+            mconf  = mon.get("confidence", 0)
+
+            sev  = sl.get("event", "none")
+            sstr = sl.get("strength", 0)
+
+            # Dynamic threshold by regime (Balanced)
+            need = ENTRY_SCORE_BASE
+            if HYBRID_ENABLED and mconf >= 65:
+                if mstate in ("IGNITION_UP", "IGNITION_DOWN"):
+                    need = ENTRY_SCORE_IGNITION
+                elif mstate in ("TREND_UP", "TREND_DOWN"):
+                    need = ENTRY_SCORE_TREND
+
+            # Structure priority override (only when strong & confirmed)
+            # - breakout/breakdown: continuation
+            # - fakeout: reversal
+            if sig is None and HYBRID_ENABLED and sstr >= 80 and mconf >= 65:
+                if sev == "breakout" and mbias == "bull" and ind.get("adx", 0) >= DOGE_ADX_IGNITION_MIN:
                     sig = "buy"
-                elif council_data["score_s"] > council_data["score_b"] and council_data["score_s"] >= 8.0:
+                    log_i("🧱 HYBRID OVERRIDE: BREAKOUT → BUY")
+                elif sev == "breakdown" and mbias == "bear" and ind.get("adx", 0) >= DOGE_ADX_IGNITION_MIN:
+                    sig = "sell"
+                    log_i("🧱 HYBRID OVERRIDE: BREAKDOWN → SELL")
+                elif sev == "fakeout_up":
+                    sig = "sell"
+                    log_i("🧲 HYBRID OVERRIDE: FAKEOUT_UP → SELL (reversal)")
+                elif sev == "fakeout_dn":
+                    sig = "buy"
+                    log_i("🧲 HYBRID OVERRIDE: FAKEOUT_DN → BUY (reversal)")
+
+            # If no override, use council score with dynamic 'need'
+            if sig is None:
+                if (council_data["score_b"] > council_data["score_s"]) and (council_data["score_b"] >= need):
+                    sig = "buy"
+                elif (council_data["score_s"] > council_data["score_b"]) and (council_data["score_s"] >= need):
                     sig = "sell"
             
             if not STATE["open"] and sig and reason is None:
                 # التحقق من سياسة الانتظار
                 allow_wait, wait_reason = wait_gate_allow(df, info)
+
+                # Hybrid unlock: allow entry even if wait gate blocks, ONLY on strong confirmed events
+                if (not allow_wait) and HYBRID_ENABLED:
+                    mon = analyze_market_state(df, ind)
+                    sl  = analyze_structure_liquidity(df, ind)
+                    mstate = mon.get("state", "NA")
+                    mconf  = mon.get("confidence", 0)
+                    sev    = sl.get("event", "none")
+                    sstr   = sl.get("strength", 0)
+
+                    strong_event = (sev in ("breakout", "breakdown", "fakeout_up", "fakeout_dn")) and (sstr >= 85)
+                    strong_regime = (mstate in ("IGNITION_UP", "IGNITION_DOWN", "TREND_UP", "TREND_DOWN")) and (mconf >= 75)
+
+                    if strong_event and strong_regime:
+                        allow_wait = True
+                        log_w(f"🟣 HYBRID UNLOCK: bypass wait gate ({wait_reason}) | event={sev} s={sstr} | state={mstate} conf={mconf}")
+
                 if not allow_wait:
                     reason = wait_reason
                 else:
@@ -1645,7 +1962,6 @@ def trade_loop_enhanced():
                         ok = open_market(sig, qty, px or info["price"])
                         if ok:
                             wait_for_next_signal_side = None
-                            # تسجيل قرار المجلس
                             log_i(f"🎯 COUNCIL DECISION: {sig.upper()} | "
                                   f"Score B/S: {council_data['score_b']:.1f}/{council_data['score_s']:.1f} | "
                                   f"Votes B/S: {council_data['b']}/{council_data['s']}")
@@ -1712,7 +2028,7 @@ app = Flask(__name__)
 @app.route("/")
 def home():
     mode='LIVE' if MODE_LIVE else 'PAPER'
-    return f"✅ Council PRO Bot — {SYMBOL} {INTERVAL} — {mode} — Candles + Golden Entry + Smart Exit"
+    return f"✅ Council PRO Bot — {SYMBOL} {INTERVAL} — {mode} — Candles + Golden Entry + Smart Exit + HYBRID BALANCED"
 
 @app.route("/metrics")
 def metrics():
@@ -1720,7 +2036,7 @@ def metrics():
         "symbol": SYMBOL, "interval": INTERVAL, "mode": "live" if MODE_LIVE else "paper",
         "leverage": LEVERAGE, "risk_alloc": RISK_ALLOC, "price": price_now(),
         "state": STATE, "compound_pnl": compound_pnl,
-        "entry_mode": "COUNCIL_PRO_GOLDEN", "wait_for_next_signal": wait_for_next_signal_side,
+        "entry_mode": "COUNCIL_PRO_GOLDEN_HYBRID", "wait_for_next_signal": wait_for_next_signal_side,
         "guards": {"max_spread_bps": MAX_SPREAD_BPS, "final_chunk_qty": FINAL_CHUNK_QTY}
     })
 
@@ -1730,7 +2046,7 @@ def health():
         "ok": True, "mode": "live" if MODE_LIVE else "paper",
         "open": STATE["open"], "side": STATE["side"], "qty": STATE["qty"],
         "compound_pnl": compound_pnl, "timestamp": datetime.utcnow().isoformat(),
-        "entry_mode": "COUNCIL_PRO_GOLDEN", "wait_for_next_signal": wait_for_next_signal_side
+        "entry_mode": "COUNCIL_PRO_GOLDEN_HYBRID", "wait_for_next_signal": wait_for_next_signal_side
     }), 200
 
 def keepalive_loop():
@@ -1764,6 +2080,7 @@ if __name__ == "__main__":
     print(colored(f"RISK: {int(RISK_ALLOC*100)}% × {LEVERAGE}x  •  COUNCIL_PRO=ENABLED", "yellow"))
     print(colored(f"GOLDEN ENTRY: score≥{GOLDEN_ENTRY_SCORE} | ADX≥{GOLDEN_ENTRY_ADX}", "yellow"))
     print(colored(f"CANDLES: Full patterns + Wick exhaustion + Golden reversal", "yellow"))
+    print(colored(f"HYBRID BALANCED: Structure/SR + Liquidity + Market State", "green"))
     print(colored(f"EXECUTION: {'ACTIVE' if EXECUTE_ORDERS and not DRY_RUN else 'SIMULATION'}", "yellow"))
     
     logging.info("service starting…")
