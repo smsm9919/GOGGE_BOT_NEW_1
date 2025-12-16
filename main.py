@@ -62,8 +62,13 @@ SYMBOL     = os.getenv("SYMBOL", "DOGE/USDT:USDT")
 INTERVAL   = os.getenv("INTERVAL", "15m")
 LEVERAGE   = int(os.getenv("LEVERAGE", 10))
 RISK_ALLOC = float(os.getenv("RISK_ALLOC", 0.60))
-POSITION_MODE = os.getenv("BINGX_POSITION_MODE", "oneway")
-FORCE_HEDGE_MODE = True  # حل مشكلة Hedge Mode
+
+# 🔧 FIX: Hedge Mode حل نهائي
+FORCE_HEDGE_MODE = True
+if FORCE_HEDGE_MODE:
+    POSITION_MODE = "hedge"
+else:
+    POSITION_MODE = os.getenv("BINGX_POSITION_MODE", "oneway")
 
 # RF Settings
 RF_SOURCE = "close"
@@ -285,6 +290,7 @@ def verify_execution_environment():
     print(f"🔧 EXECUTE_ORDERS: {EXECUTE_ORDERS} | SHADOW_MODE: {SHADOW_MODE_DASHBOARD} | DRY_RUN: {DRY_RUN}", flush=True)
     print(f"🎯 GOLDEN ENTRY: score={GOLDEN_ENTRY_SCORE} | ADX={GOLDEN_ENTRY_ADX}", flush=True)
     print(f"📈 CANDLES: Full patterns + Wick exhaustion + Golden reversal", flush=True)
+    print(f"🔄 HEDGE MODE: {'ENABLED' if FORCE_HEDGE_MODE else 'DISABLED'}", flush=True)
     
     if not EXECUTE_ORDERS:
         print("🟡 WARNING: EXECUTE_ORDERS=False - البوت في وضع التحليل فقط!", flush=True)
@@ -568,7 +574,7 @@ def analyze_structure_liquidity(df: pd.DataFrame, ind: dict, lookback: int = 90,
         elif broke_dn_close:
             event = "breakdown"
             strength = 82
-            notes += ["close_below_sup", "body_confirm"]
+            notes += ["close_below_sup", "body_confirm")
             if vol_boost >= VOL_BOOST_MULT: notes.append("vol_confirm")
             if shock: notes.append("⚠️ shock_dump")
         elif rejection_r:
@@ -844,12 +850,16 @@ def load_market_specs():
         log_w(f"load_market_specs: {e}")
 
 def ensure_leverage_mode():
+    """🔧 FIX: Hedge Mode حل نهائي للرافعة المالية"""
     try:
-        try:
+        if FORCE_HEDGE_MODE:
+            # ضبط الرافعة للجانبين في وضع Hedge
+            ex.set_leverage(LEVERAGE, SYMBOL, params={"side": "LONG"})
+            ex.set_leverage(LEVERAGE, SYMBOL, params={"side": "SHORT"})
+            log_g(f"Hedge Mode: leverage set for both sides: {LEVERAGE}x")
+        else:
             ex.set_leverage(LEVERAGE, SYMBOL, params={"side": "BOTH"})
-            log_g(f"leverage set: {LEVERAGE}x")
-        except Exception as e:
-            log_w(f"set_leverage warn: {e}")
+            log_g(f"OneWay Mode: leverage set: {LEVERAGE}x")
         log_i(f"position mode: {POSITION_MODE}")
     except Exception as e:
         log_w(f"ensure_leverage_mode: {e}")
@@ -1071,8 +1081,22 @@ def emit_snapshots(exchange, symbol, df, balance_fn=None, pnl_fn=None):
                 "mode": {"mode":"n/a"}, "gz": None, "wallet": ""}
 
 # =================== EXECUTION MANAGER ===================
+def _params_open(side):
+    """🔧 FIX: Hedge Mode حل نهائي"""
+    if FORCE_HEDGE_MODE:
+        # في Hedge Mode نرسل positionSide إجباري
+        return {"positionSide": "LONG" if side.lower()=="buy" else "SHORT", "reduceOnly": False}
+    return {"positionSide": "BOTH", "reduceOnly": False}
+
+def _params_close():
+    """🔧 FIX: Hedge Mode حل نهائي للإغلاق"""
+    if FORCE_HEDGE_MODE:
+        current_side = STATE.get("side", "long")
+        return {"positionSide": "LONG" if current_side=="long" else "SHORT", "reduceOnly": True}
+    return {"positionSide": "BOTH", "reduceOnly": True}
+
 def execute_trade_decision(side, price, qty, mode, council_data, gz_data):
-    """تنفيذ قرار التداول مع التسجيل الواضح"""
+    """🔧 FIX: تنفيذ قرار التداول مع Hedge Mode"""
     if not EXECUTE_ORDERS or DRY_RUN:
         log_i(f"DRY_RUN: {side} {qty:.4f} @ {price:.6f} | mode={mode}")
         return True
@@ -1092,8 +1116,17 @@ def execute_trade_decision(side, price, qty, mode, council_data, gz_data):
 
     try:
         if MODE_LIVE:
-            ex.set_leverage(LEVERAGE, SYMBOL, params={"side": "BOTH"})
-            ex.create_order(SYMBOL, "market", side, qty, None, _params_open(side))
+            # 🔧 تحديث الرافعة قبل التنفيذ
+            ensure_leverage_mode()
+            
+            # 🔧 إعداد الباراميترات مع Hedge Mode
+            params = _params_open(side)
+            
+            # 🔧 تسجيل الباراميترات للتحقق
+            log_i(f"🧾 ORDER PARAMS → side={side.upper()} qty={qty:.4f} posSide={params.get('positionSide')}")
+            
+            # 🔧 التنفيذ مع التحقق من Hedge Mode
+            ex.create_order(SYMBOL, "market", side, qty, None, params)
         
         log_g(f"✅ EXECUTED: {side.upper()} {qty:.4f} @ {price:.6f}")
         return True
@@ -1122,8 +1155,14 @@ def setup_trade_management(mode):
 
 # =================== ENHANCED TRADE EXECUTION ===================
 def open_market_enhanced(side, qty, price):
+    """🔧 FIX: فتح صفقة محسنة مع Hedge Mode"""
     if qty <= 0: 
         log_e("skip open (qty<=0)")
+        return False
+    
+    # 🔧 حارس Hedge Mode: منع الدخول إذا فيه صفقة مفتوحة
+    if FORCE_HEDGE_MODE and STATE.get("open"):
+        log_w("⛔ Skip entry: already in position (hedge guard)")
         return False
     
     df = fetch_ohlcv()
@@ -1474,17 +1513,6 @@ def wait_gate_allow(df, info):
     return False, f"wait-for-next-RF({wait_for_next_signal_side})"
 
 # =================== ORDERS ===================
-def _params_open(side):
-    if FORCE_HEDGE_MODE:  # حل مشكلة Hedge Mode
-        return {"positionSide": "LONG" if side=="buy" else "SHORT", "reduceOnly": False}
-    return {"positionSide": "BOTH", "reduceOnly": False}
-
-def _params_close():
-    if FORCE_HEDGE_MODE:  # حل مشكلة Hedge Mode
-        current_side = "LONG" if STATE.get("side")=="long" else "SHORT"
-        return {"positionSide": current_side, "reduceOnly": True}
-    return {"positionSide": "BOTH", "reduceOnly": True}
-
 def _read_position():
     try:
         poss = ex.fetch_positions(params={"type":"swap"})
@@ -1508,22 +1536,32 @@ def compute_size(balance, price):
     return safe_qty(raw)
 
 def close_market_strict(reason="STRICT"):
+    """🔧 FIX: إغلاق صارم مع Hedge Mode"""
     global compound_pnl, wait_for_next_signal_side
     exch_qty, exch_side, exch_entry = _read_position()
     if exch_qty <= 0:
         if STATE.get("open"):
             _reset_after_close(reason)
         return
+    
     side_to_close = "sell" if (exch_side=="long") else "buy"
     qty_to_close  = safe_qty(exch_qty)
+    
     attempts=0; last_error=None
     while attempts < CLOSE_RETRY_ATTEMPTS:
         try:
             if MODE_LIVE and EXECUTE_ORDERS and not DRY_RUN:
-                params = _params_close(); params["reduceOnly"]=True
+                params = _params_close()
+                params["reduceOnly"] = True
+                
+                # 🔧 تسجيل الباراميترات للتحقق
+                log_i(f"🧾 CLOSE PARAMS → side={side_to_close.upper()} qty={qty_to_close:.4f} posSide={params.get('positionSide')}")
+                
                 ex.create_order(SYMBOL,"market",side_to_close,qty_to_close,None,params)
+            
             time.sleep(CLOSE_VERIFY_WAIT_S)
             left_qty, _, _ = _read_position()
+            
             if left_qty <= 0:
                 px = price_now() or STATE.get("entry")
                 entry_px = STATE.get("entry") or exch_entry or px
@@ -1535,12 +1573,18 @@ def close_market_strict(reason="STRICT"):
                 logging.info(f"STRICT_CLOSE {side} pnl={pnl} total={compound_pnl}")
                 _reset_after_close(reason, prev_side=side)
                 return
+            
             qty_to_close = safe_qty(left_qty)
             attempts += 1
             log_w(f"strict close retry {attempts}/{CLOSE_RETRY_ATTEMPTS} — residual={fmt(left_qty,4)}")
             time.sleep(CLOSE_VERIFY_WAIT_S)
+            
         except Exception as e:
-            last_error = e; logging.error(f"close_market_strict attempt {attempts+1}: {e}"); attempts += 1; time.sleep(CLOSE_VERIFY_WAIT_S)
+            last_error = e
+            logging.error(f"close_market_strict attempt {attempts+1}: {e}")
+            attempts += 1
+            time.sleep(CLOSE_VERIFY_WAIT_S)
+    
     log_e(f"STRICT CLOSE FAILED after {CLOSE_RETRY_ATTEMPTS} attempts — last error: {last_error}")
     logging.critical(f"STRICT CLOSE FAILED — last_error={last_error}")
 
@@ -1594,7 +1638,10 @@ def manage_after_entry_enhanced(df, ind, info):
             close_side = "sell" if side == "long" else "buy"
             if MODE_LIVE and EXECUTE_ORDERS and not DRY_RUN:
                 try:
-                    ex.create_order(SYMBOL, "market", close_side, partial_qty, None, _params_close())
+                    # 🔧 إغلاق جزئي مع Hedge Mode
+                    params = _params_close()
+                    params["reduceOnly"] = True
+                    ex.create_order(SYMBOL, "market", close_side, partial_qty, None, params)
                     log_g(f"✅ PARTIAL CLOSE: {partial_qty:.4f} | {exit_signal['why']}")
                     STATE["partial_taken"] = True
                     STATE["qty"] = safe_qty(qty - partial_qty)
@@ -1626,7 +1673,10 @@ def manage_after_entry_enhanced(df, ind, info):
             close_side = "sell" if STATE["side"] == "long" else "buy"
             if MODE_LIVE and EXECUTE_ORDERS and not DRY_RUN:
                 try:
-                    ex.create_order(SYMBOL, "market", close_side, close_qty, None, _params_close())
+                    # 🔧 TP1 مع Hedge Mode
+                    params = _params_close()
+                    params["reduceOnly"] = True
+                    ex.create_order(SYMBOL, "market", close_side, close_qty, None, params)
                     log_g(f"✅ TP1 HIT: closed {close_fraction*100}%")
                 except Exception as e:
                     log_e(f"❌ TP1 close failed: {e}")
@@ -2030,12 +2080,14 @@ app = Flask(__name__)
 @app.route("/")
 def home():
     mode='LIVE' if MODE_LIVE else 'PAPER'
-    return f"✅ Council PRO Bot — {SYMBOL} {INTERVAL} — {mode} — Candles + Golden Entry + Smart Exit + HYBRID BALANCED"
+    hedge_status = "HEDGE" if FORCE_HEDGE_MODE else "ONEWAY"
+    return f"✅ Council PRO Bot — {SYMBOL} {INTERVAL} — {mode} — {hedge_status} — Candles + Golden Entry + Smart Exit + HYBRID BALANCED"
 
 @app.route("/metrics")
 def metrics():
     return jsonify({
         "symbol": SYMBOL, "interval": INTERVAL, "mode": "live" if MODE_LIVE else "paper",
+        "hedge_mode": FORCE_HEDGE_MODE,
         "leverage": LEVERAGE, "risk_alloc": RISK_ALLOC, "price": price_now(),
         "state": STATE, "compound_pnl": compound_pnl,
         "entry_mode": "COUNCIL_PRO_GOLDEN_HYBRID", "wait_for_next_signal": wait_for_next_signal_side,
@@ -2046,6 +2098,7 @@ def metrics():
 def health():
     return jsonify({
         "ok": True, "mode": "live" if MODE_LIVE else "paper",
+        "hedge_mode": FORCE_HEDGE_MODE,
         "open": STATE["open"], "side": STATE["side"], "qty": STATE["qty"],
         "compound_pnl": compound_pnl, "timestamp": datetime.utcnow().isoformat(),
         "entry_mode": "COUNCIL_PRO_GOLDEN_HYBRID", "wait_for_next_signal": wait_for_next_signal_side
@@ -2080,6 +2133,7 @@ if __name__ == "__main__":
 
     print(colored(f"MODE: {'LIVE' if MODE_LIVE else 'PAPER'}  •  {SYMBOL}  •  {INTERVAL}", "yellow"))
     print(colored(f"RISK: {int(RISK_ALLOC*100)}% × {LEVERAGE}x  •  COUNCIL_PRO=ENABLED", "yellow"))
+    print(colored(f"HEDGE MODE: {'ENABLED' if FORCE_HEDGE_MODE else 'DISABLED'}", "yellow"))
     print(colored(f"GOLDEN ENTRY: score≥{GOLDEN_ENTRY_SCORE} | ADX≥{GOLDEN_ENTRY_ADX}", "yellow"))
     print(colored(f"CANDLES: Full patterns + Wick exhaustion + Golden reversal", "yellow"))
     print(colored(f"HYBRID BALANCED: Structure/SR + Liquidity + Market State", "green"))
