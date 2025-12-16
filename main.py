@@ -574,7 +574,7 @@ def analyze_structure_liquidity(df: pd.DataFrame, ind: dict, lookback: int = 90,
         elif broke_dn_close:
             event = "breakdown"
             strength = 82
-            notes += ["close_below_sup", "body_confirm")
+            notes += ["close_below_sup", "body_confirm"]
             if vol_boost >= VOL_BOOST_MULT: notes.append("vol_confirm")
             if shock: notes.append("⚠️ shock_dump")
         elif rejection_r:
