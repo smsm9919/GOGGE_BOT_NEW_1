@@ -974,8 +974,199 @@ def compute_indicators(df: pd.DataFrame):
     return {
         "rsi": float(rsi.iloc[i]), "plus_di": float(plus_di.iloc[i]),
         "minus_di": float(minus_di.iloc[i]), "dx": float(dx.iloc[i]),
-        "adx": float(adx.iloc[i]), "atr": float(atr.iloc[i])
+        "adx": float(adx.iloc[i]), "atr": float(atr.iloc[i]),
+        # prev for slopes
+        "adx_prev": float(adx.iloc[i-1]),
+        "atr_prev": float(atr.iloc[i-1]),
+        "rsi_prev": float(rsi.iloc[i-1]),
     }
+
+def analyze_market_state(df: pd.DataFrame, ind: dict, side_hint: str = None):
+    """
+    Market Monitoring Engine (ADX/DI/ATR/RSI/VWAP/EMA):
+    يحدد: تجميع/إشعال/ترند/تصحيح/شوب + انحياز (bull/bear) + ثقة + ملاحظات.
+    - يعتمد على df + ind (آخر قيم مؤشرات).
+    - لا يغير أي منطق دخول لوحده، فقط يعطي "قراءة" تستخدمها في الدخول والخروج واللوج.
+    """
+    out = {
+        "state": "NA",
+        "bias": "neutral",
+        "confidence": 0,
+        "notes": [],
+        "metrics": {}
+    }
+    try:
+        if df is None or len(df) < 60:
+            out["state"] = "NA_SHORT_DF"
+            out["confidence"] = 0
+            out["notes"].append("short_df")
+            return out
+
+        c = df["close"].astype(float)
+        h = df["high"].astype(float)
+        l = df["low"].astype(float)
+        o = df["open"].astype(float)
+        v = df["volume"].astype(float)
+
+        # ---- Last indicator values (already computed)
+        adx      = float(ind.get("adx", 0.0) or 0.0)
+        plus_di  = float(ind.get("plus_di", 0.0) or 0.0)
+        minus_di = float(ind.get("minus_di", 0.0) or 0.0)
+        atr      = float(ind.get("atr", 0.0) or 0.0)
+        rsi      = float(ind.get("rsi", 50.0) or 50.0)
+        rsi_ma   = float(ind.get("rsi_ma", 50.0) or 50.0)
+
+        # ---- Direction + dominance
+        di_spread = abs(plus_di - minus_di)
+        bias = "bull" if plus_di > minus_di else ("bear" if minus_di > plus_di else "neutral")
+
+        # ---- Slopes (use *_prev if available; otherwise estimate from local history)
+        adx_prev = float(ind.get("adx_prev", adx) or adx)
+        atr_prev = float(ind.get("atr_prev", atr) or atr)
+        rsi_prev = float(ind.get("rsi_prev", rsi) or rsi)
+
+        adx_slope = adx - adx_prev
+        atr_slope = atr - atr_prev
+        rsi_slope = rsi - rsi_prev
+
+        # ---- ATR regime via ratio
+        # compute an ATR baseline using recent True Range (approx, stable enough for regime)
+        tr = pd.concat([(h - l).abs(), (h - c.shift(1)).abs(), (l - c.shift(1)).abs()], axis=1).max(axis=1)
+        atr_base = float(tr.rolling(50).mean().iloc[-1] or 1e-9)
+        atr_ratio = (atr / max(atr_base, 1e-9)) if atr > 0 else 0.0
+
+        # ---- VWAP (value)
+        tp = (h + l + c) / 3.0
+        vwap = float((tp * v).rolling(50).sum().iloc[-1] / max(v.rolling(50).sum().iloc[-1], 1e-9))
+        px = float(c.iloc[-1])
+        vwap_dist_bps = ((px - vwap) / max(vwap, 1e-9)) * 10000.0
+
+        # ---- EMAs (context)
+        ema50  = float(c.ewm(span=50, adjust=False).mean().iloc[-1])
+        ema100 = float(c.ewm(span=100, adjust=False).mean().iloc[-1])
+        ema200 = float(c.ewm(span=200, adjust=False).mean().iloc[-1])
+
+        # ---- Momentum confirmation (RSI)
+        rsi_bull = (rsi > rsi_ma) and (rsi >= 50)
+        rsi_bear = (rsi < rsi_ma) and (rsi <= 50)
+        rsi_neutral = (45 <= rsi <= 55)
+
+        # ---- Volatility regime labels
+        if atr_ratio < 0.90:
+            atr_reg = "compression"
+        elif atr_ratio > 1.40:
+            atr_reg = "climax"
+        elif atr_ratio > 1.15 and atr_slope > 0:
+            atr_reg = "expansion"
+        else:
+            atr_reg = "normal"
+
+        # ---- ADX regime labels
+        if adx < 15:
+            adx_reg = "low"
+        elif adx < 20:
+            adx_reg = "build"
+        elif adx < 25:
+            adx_reg = "mid"
+        elif adx < 30:
+            adx_reg = "trend"
+        else:
+            adx_reg = "strong"
+
+        # ---- Compose states (business logic)
+        notes = []
+        conf = 0
+
+        # CHOP / NO TREND
+        if adx < 15 and atr_reg in ("compression", "normal") and di_spread < DI_SPREAD_TREND and rsi_neutral:
+            state = "CHOP"
+            conf = 60
+            notes += ["adx<15", f"atr_{atr_reg}", "di_spread_low", "rsi_neutral"]
+
+        # ACCUMULATION bottom/top (value + bias weakening + compression)
+        elif adx < 15 and atr_reg == "compression":
+            # value tilt via VWAP + EMAs
+            if bias == "bear" and vwap_dist_bps < 0 and px < ema50:
+                state = "ACCUMULATION_BOTTOM"
+                conf = 70
+                notes += ["atr_compression", "adx_low", "below_vwap", "below_ema50", "bear_bias_fading?"]
+            elif bias == "bull" and vwap_dist_bps > 0 and px > ema50:
+                state = "ACCUMULATION_TOP"
+                conf = 70
+                notes += ["atr_compression", "adx_low", "above_vwap", "above_ema50", "bull_bias_fading?"]
+            else:
+                state = "ACCUMULATION"
+                conf = 65
+                notes += ["atr_compression", "adx_low", f"bias={bias}"]
+
+        # IGNITION (early launch): ADX building + ATR expansion + momentum agrees
+        elif (adx_reg in ("build", "mid")) and (adx_slope > 0) and (atr_reg in ("expansion", "normal")):
+            if bias == "bull" and rsi_bull and (px >= vwap or px >= ema50):
+                state = "IGNITION_UP"
+                conf = 78
+                notes += ["adx_building", f"atr_{atr_reg}", "rsi_bull", "value_flip_up"]
+            elif bias == "bear" and rsi_bear and (px <= vwap or px <= ema50):
+                state = "IGNITION_DOWN"
+                conf = 78
+                notes += ["adx_building", f"atr_{atr_reg}", "rsi_bear", "value_flip_down"]
+            else:
+                state = "BUILDING"
+                conf = 62
+                notes += ["adx_building", f"atr_{atr_reg}", "momentum_mixed"]
+
+        # TREND states
+        elif adx >= ADX_TREND_MIN and di_spread >= DI_SPREAD_TREND:
+            if bias == "bull":
+                state = "TREND_UP"
+                conf = 82 if adx >= 25 else 74
+                notes += ["adx_trend", "di_spread_ok", "bull_dominance"]
+            else:
+                state = "TREND_DOWN"
+                conf = 82 if adx >= 25 else 74
+                notes += ["adx_trend", "di_spread_ok", "bear_dominance"]
+
+        # CORRECTION / WEAKENING (ADX falling but bias unchanged)
+        elif adx_slope < 0 and adx >= 18 and di_spread >= (DI_SPREAD_TREND * 0.6):
+            state = "CORRECTION"
+            conf = 66
+            notes += ["adx_falling", "trend_weakening", f"bias={bias}", f"atr_{atr_reg}"]
+
+        else:
+            state = "MIXED"
+            conf = 55
+            notes += [f"adx={adx_reg}", f"atr={atr_reg}", f"bias={bias}"]
+
+        # Extra risk flags
+        if atr_reg == "climax":
+            notes.append("⚠️ atr_climax_risk")
+            conf = max(40, conf - 10)
+
+        if rsi_neutral:
+            notes.append("rsi_neutral_band")
+            conf = max(35, conf - 5)
+
+        # Fill outputs
+        out["state"] = state
+        out["bias"] = bias
+        out["confidence"] = int(max(0, min(100, conf)))
+        out["notes"] = notes[:8]
+
+        out["metrics"] = {
+            "adx": adx, "adx_slope": adx_slope,
+            "plus_di": plus_di, "minus_di": minus_di, "di_spread": di_spread,
+            "atr": atr, "atr_slope": atr_slope, "atr_ratio": atr_ratio,
+            "rsi": rsi, "rsi_ma": rsi_ma, "rsi_slope": rsi_slope,
+            "vwap": vwap, "vwap_dist_bps": vwap_dist_bps,
+            "ema50": ema50, "ema100": ema100, "ema200": ema200,
+            "price": px
+        }
+        return out
+
+    except Exception as e:
+        out["state"] = "NA_ERROR"
+        out["confidence"] = 0
+        out["notes"] = [f"error:{e}"]
+        return out
 
 # =================== RANGE FILTER ===================
 def _rng_size(src: pd.Series, qty: float, n: int) -> pd.Series:
@@ -1253,6 +1444,55 @@ def smart_exit_guard(state, df, ind, flow, bm, now_price, pnl_pct, mode, side, e
     else:
         adx_slope = 0.0
 
+    # =================== EARLY INVALIDATION EXIT (Wrong entry cut) ===================
+    # الفكرة: لو دخلنا غلط، نقفل بدري بخسارة صغيرة بدل ما تكبر.
+    mon = analyze_market_state(df, ind) if df is not None else None
+
+    # حارس: اشتغل بدري فقط أول شموع الصفقة
+    bars_in = int(state.get("bars", 0) or 0)
+
+    if mon and bars_in <= 4:
+        invalid = 0
+
+        # 1) Bias ضد الصفقة + DI dominance واضح
+        if side == "long" and mon.get("bias") == "bear" and ind.get("minus_di", 0) > ind.get("plus_di", 0):
+            invalid += 1
+        if side == "short" and mon.get("bias") == "bull" and ind.get("plus_di", 0) > ind.get("minus_di", 0):
+            invalid += 1
+
+        # 2) RSI flip ضد الصفقة
+        if side == "long" and rsi < rsi_ma:
+            invalid += 1
+        if side == "short" and rsi > rsi_ma:
+            invalid += 1
+
+        # 3) Value context ضد الصفقة (VWAP)
+        vwap = mon.get("metrics", {}).get("vwap", None)
+        px = mon.get("metrics", {}).get("price", now_price)
+        if vwap:
+            if side == "long" and px < vwap:
+                invalid += 1
+            if side == "short" and px > vwap:
+                invalid += 1
+
+        # 4) Market state says "wrong regime"
+        st = mon.get("state")
+        if st in ("CHOP", "ACCUMULATION", "ACCUMULATION_BOTTOM", "ACCUMULATION_TOP") and atr < 1e-9:
+            # (rare) ignore if no ATR
+            pass
+        if st in ("CHOP", "ACCUMULATION") and adx < 15:
+            invalid += 1
+
+        # Threshold: 2+ signals + small loss => cut
+        # pnl_pct هنا داخل الدالة = نسبة (مثلاً 0.003 = 0.3%)، لأنك بتمرر pnl_pct/100 من manage_after_entry.
+        # فـ -0.0025 = -0.25%
+        if invalid >= 2 and pnl_pct <= -0.0025:
+            return {
+                "action": "close",
+                "why": "early_invalidation",
+                "log": f"❌ INVALIDATION CLOSE | pnl={pnl_pct*100:.2f}% | st={st} bias={mon.get('bias')} invalid={invalid}"
+            }
+
     # حساب الفتائل
     wick_signal = False
     if len(df) > 0:
@@ -1440,6 +1680,17 @@ def pretty_snapshot(bal, info, ind, spread_bps, reason=None, df=None):
         print("📈 INDICATORS & RF")
         print(f"   💲 Price {fmt(info.get('price'))} | RF filt={fmt(info.get('filter'))}  hi={fmt(info.get('hi'))} lo={fmt(info.get('lo'))}")
         print(f"   🧮 RSI={fmt(ind.get('rsi'))}  +DI={fmt(ind.get('plus_di'))}  -DI={fmt(ind.get('minus_di'))}  ADX={fmt(ind.get('adx'))}  ATR={fmt(ind.get('atr'))}")
+        # 🧠 Market monitor (Regime)
+        mon = analyze_market_state(df, ind) if df is not None else None
+        if mon and mon.get("state"):
+            print(colored(
+                f"   🧠 MARKET={mon['state']} | bias={mon['bias']} | conf={mon['confidence']}% "
+                f"| atrR={fmt(mon['metrics'].get('atr_ratio'),2)} vwapΔbps={fmt(mon['metrics'].get('vwap_dist_bps'),1)}",
+                "magenta"
+            ))
+            if mon.get("notes"):
+                for n in mon["notes"]:
+                    print(colored(f"      • {n}", "magenta"))
         print(f"   🎯 ENTRY: COUNCIL PRO + GOLDEN ENTRY  |  spread_bps={fmt(spread_bps,2)}")
         print(f"   ⏱️ closes_in ≈ {left_s}s")
         print("\n🧭 POSITION")
