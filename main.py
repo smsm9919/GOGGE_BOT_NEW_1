@@ -63,6 +63,7 @@ INTERVAL   = os.getenv("INTERVAL", "15m")
 LEVERAGE   = int(os.getenv("LEVERAGE", 10))
 RISK_ALLOC = float(os.getenv("RISK_ALLOC", 0.60))
 POSITION_MODE = os.getenv("BINGX_POSITION_MODE", "oneway")
+FORCE_HEDGE_MODE = True  # حل مشكلة Hedge Mode
 
 # RF Settings
 RF_SOURCE = "close"
@@ -1474,13 +1475,14 @@ def wait_gate_allow(df, info):
 
 # =================== ORDERS ===================
 def _params_open(side):
-    if POSITION_MODE == "hedge":
+    if FORCE_HEDGE_MODE:  # حل مشكلة Hedge Mode
         return {"positionSide": "LONG" if side=="buy" else "SHORT", "reduceOnly": False}
     return {"positionSide": "BOTH", "reduceOnly": False}
 
 def _params_close():
-    if POSITION_MODE == "hedge":
-        return {"positionSide": "LONG" if STATE.get("side")=="long" else "SHORT", "reduceOnly": True}
+    if FORCE_HEDGE_MODE:  # حل مشكلة Hedge Mode
+        current_side = "LONG" if STATE.get("side")=="long" else "SHORT"
+        return {"positionSide": current_side, "reduceOnly": True}
     return {"positionSide": "BOTH", "reduceOnly": True}
 
 def _read_position():
