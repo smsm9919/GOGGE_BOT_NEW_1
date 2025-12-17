@@ -385,9 +385,9 @@ def market_state_engine(df, ind, px, extra_zones=None):
     bias : bull / bear / neutral
     plus: breakout/breakdown confirmed, liquidity grabs, shock
     """
-    adx = _tf(ind.get("adx"), 0.0)
-    pdi = _tf(ind.get("plus_di"), 0.0)
-    mdi = _tf(ind.get("minus_di"), 0.0)
+    adx = _tf(ind.get("adx", 0.0))
+    pdi = _tf(ind.get("plus_di", 0.0))
+    mdi = _tf(ind.get("minus_di", 0.0))
 
     bias = "neutral"
     if pdi > mdi: bias = "bull"
@@ -2962,6 +2962,16 @@ def ensure_leverage_mode():
             log_g(f"leverage set: {LEVERAGE}x")
         except Exception as e:
             log_w(f"set_leverage warn: {e}")
+        
+        # ========== إغلاق Hedge وإجبار OneWay ==========
+        try:
+            ex.set_position_mode(False, SYMBOL)  # force OneWay (NOT hedge)
+            POSITION_MODE = "oneway"
+            log_g(f"✅ Position mode set to OneWay (Hedge disabled)")
+        except Exception as e:
+            log_w(f"set_position_mode error: {e} - تأكد من تغيير Position Mode في واجهة BingX")
+        # ================================================
+        
         log_i(f"position mode: {POSITION_MODE}")
     except Exception as e:
         log_w(f"ensure_leverage_mode: {e}")
