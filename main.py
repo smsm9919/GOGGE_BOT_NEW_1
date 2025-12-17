@@ -12,6 +12,7 @@ RF Futures Bot — RF-LIVE ONLY (BingX Perp via CCXT)
 • ENHANCED WITH: Hard Stop Loss, Post-Big-Win Guard, Auto-Recovery
 • CHART PRIME: High-Volume Boxes + Liquidity Cycle Monitor
 • HUNTER PATCH: Unified Entry, ADX/ATR Smart Monitoring, 8-Tick Iron SL
+• MARKET STATE ENGINE: Accumulation / Liquidity / Breakout / Shock Detection
 """
 
 import os, time, math, random, signal, sys, traceback, logging, json
@@ -46,7 +47,7 @@ SHADOW_MODE_DASHBOARD = False
 DRY_RUN = False
 
 # ==== Addon: Logging + Recovery Settings ====
-BOT_VERSION = "DOGE Council PRO v5.0 — Smart Profit AI + Golden Zone Pro + VWAP Strategy + OTC Detection + EMA Crossover Engine + Hard Stop + Post-Big-Win Guard + Auto-Recovery + ChartPrime Liquidity Monitor + HUNTER PATCH"
+BOT_VERSION = "DOGE Council PRO v6.0 — Smart Profit AI + Golden Zone Pro + VWAP Strategy + OTC Detection + EMA Crossover Engine + Hard Stop + Post-Big-Win Guard + Auto-Recovery + ChartPrime Liquidity Monitor + HUNTER PATCH + Market State Engine"
 print("🔁 Booting:", BOT_VERSION, flush=True)
 
 STATE_PATH = "./bot_state.json"
@@ -255,6 +256,218 @@ def gate_block(gate_name: str, gate_value=None, missing: str = "", extra: dict =
         ctx = {k: extra.get(k) for k in keys if k in extra}
         log_w(f"   ↳ ctx: {ctx}")
 
+# ===================== MARKET STATE ENGINE (ACCUM / LIQ / BREAK / SHOCK) =====================
+
+def _tf(x, d=0.0):
+    try:
+        return float(x)
+    except:
+        return d
+
+def _body_ratio(o,h,l,c):
+    rng = max(1e-12, float(h)-float(l))
+    return abs(float(c)-float(o))/rng
+
+def detect_sr_pivots(df, lookback=80):
+    """SR بسيط وعملي (Fallback)"""
+    if df is None or len(df) < max(lookback, 30):
+        return {"ok": False}
+    d = df.tail(lookback)
+    sup = float(d["low"].astype(float).min())
+    res = float(d["high"].astype(float).max())
+    return {"ok": True, "support": sup, "resistance": res, "src": f"pivot{lookback}"}
+
+def atr_regime(ind, px):
+    atr = _tf(ind.get("atr"), 0.0)
+    if px <= 0 or atr <= 0:
+        return {"regime":"unknown","atr":atr,"atr_pct":0.0,"buf_atr":0.40}
+    atr_pct = atr/px
+    # نظام بسيط، مضبوط للـ 15m
+    if atr_pct >= 0.020:
+        return {"regime":"explosion","atr":atr,"atr_pct":atr_pct,"buf_atr":0.50}
+    if atr_pct >= 0.012:
+        return {"regime":"high","atr":atr,"atr_pct":atr_pct,"buf_atr":0.40}
+    if atr_pct >= 0.007:
+        return {"regime":"normal","atr":atr,"atr_pct":atr_pct,"buf_atr":0.35}
+    return {"regime":"quiet","atr":atr,"atr_pct":atr_pct,"buf_atr":0.30}
+
+def breakout_confirmed(df, ind, bias, level):
+    """
+    bias='buy' => close فوق المقاومة
+    bias='sell' => close تحت الدعم
+    شروط: Close + Body محترم + ADX/DI يؤيد
+    """
+    if df is None or len(df) < 3 or level is None:
+        return {"ok": False, "why": "no_df_or_level"}
+
+    o = float(df["open"].iloc[-1]); c = float(df["close"].iloc[-1])
+    h = float(df["high"].iloc[-1]); l = float(df["low"].iloc[-1])
+    body_r = _body_ratio(o,h,l,c)
+
+    adx = _tf(ind.get("adx"), 0.0)
+    pdi = _tf(ind.get("plus_di"), 0.0)
+    mdi = _tf(ind.get("minus_di"), 0.0)
+    di_spread = abs(pdi-mdi)
+
+    BODY_MIN = 0.55
+    ADX_MIN = 18.0
+    DI_MIN  = 8.0
+
+    cond_body = body_r >= BODY_MIN
+    cond_adx  = adx >= ADX_MIN
+    cond_di   = di_spread >= DI_MIN
+
+    if bias == "buy":
+        cond_lvl = c > float(level)
+        cond_dir = pdi >= mdi
+        ok = cond_lvl and cond_body and cond_adx and cond_di and cond_dir
+        why = f"c>{level}:{cond_lvl} body={cond_body}({body_r:.2f}) adx={cond_adx}({adx:.1f}) di={cond_di}({di_spread:.1f}) dir={cond_dir}"
+        return {"ok": ok, "why": why}
+
+    cond_lvl = c < float(level)
+    cond_dir = mdi >= pdi
+    ok = cond_lvl and cond_body and cond_adx and cond_di and cond_dir
+    why = f"c<{level}:{cond_lvl} body={cond_body}({body_r:.2f}) adx={cond_adx}({adx:.1f}) di={cond_di}({di_spread:.1f}) dir={cond_dir}"
+    return {"ok": ok, "why": why}
+
+def liquidity_grab(df, sr, px, atr):
+    """
+    كشف سحب السيولة (Fakeout): wick فوق مقاومة/تحت دعم + رجوع بالإغلاق.
+    """
+    if df is None or len(df) < 3 or not sr.get("ok") or atr <= 0:
+        return {"ok": False}
+
+    o = float(df["open"].iloc[-1]); c = float(df["close"].iloc[-1])
+    h = float(df["high"].iloc[-1]); l = float(df["low"].iloc[-1])
+    sup = float(sr["support"]); res = float(sr["resistance"])
+    buf = 0.20 * atr  # صغير عشان يمسك السحب الحقيقي
+
+    fake_up = (h > res + buf) and (c < res - buf*0.25)   # طلع فوق وبعدين قفل جوه
+    fake_dn = (l < sup - buf) and (c > sup + buf*0.25)   # نزل تحت وبعدين قفل جوه
+
+    return {"ok": True, "fakeout_up": bool(fake_up), "fakeout_dn": bool(fake_dn), "support": sup, "resistance": res}
+
+def shock_detector(df, ind, px):
+    """
+    انفجار/انهيار: ATR% عالي + جسم كبير + حجم أعلى من MA20
+    """
+    if df is None or len(df) < 25 or px <= 0:
+        return {"shock": False}
+
+    reg = atr_regime(ind, px)
+    atr = reg["atr"]
+    if atr <= 0:
+        return {"shock": False}
+
+    vol = df["volume"].astype(float)
+    vma = float(vol.tail(20).mean() or 1e-9)
+    v1 = float(vol.iloc[-1])
+
+    o = float(df["open"].iloc[-1]); c = float(df["close"].iloc[-1])
+    h = float(df["high"].iloc[-1]); l = float(df["low"].iloc[-1])
+    body = abs(c-o)
+    rng  = h-l
+
+    atr_pct_ok = reg["atr_pct"] >= 0.012
+    body_ok = body >= 1.2*atr
+    vol_ok  = v1 >= 1.5*vma
+
+    shock = atr_pct_ok and body_ok and vol_ok
+    direction = "pump" if c>o else "dump"
+    strength = int(min(100, (40 if atr_pct_ok else 0) + (35 if body_ok else 0) + (25 if vol_ok else 0)))
+
+    return {"shock": bool(shock), "dir": direction, "strength": strength, "atr_pct": reg["atr_pct"], "body_atr": body/max(1e-12,atr), "vol_mult": v1/max(1e-12,vma), "regime": reg["regime"]}
+
+def market_state_engine(df, ind, px, extra_zones=None):
+    """
+    يطلع حالة سوق موحّدة:
+    phase: ACCUM / PREP / TREND / EXPANSION
+    bias : bull / bear / neutral
+    plus: breakout/breakdown confirmed, liquidity grabs, shock
+    """
+    adx = _tf(ind.get("adx"), 0.0)
+    pdi = _tf(ind.get("plus_di"), 0.0)
+    mdi = _tf(ind.get("minus_di"), 0.0)
+
+    bias = "neutral"
+    if pdi > mdi: bias = "bull"
+    elif mdi > pdi: bias = "bear"
+
+    reg = atr_regime(ind, px)
+    sr = detect_sr_pivots(df, lookback=80)
+
+    # phase logic
+    if adx < 15 and reg["regime"] in ["quiet","normal"]:
+        phase = "ACCUMULATION"
+    elif adx < 22:
+        phase = "PREP"
+    elif adx < 30:
+        phase = "TREND"
+    else:
+        phase = "TREND_STRONG"
+
+    # Confirmed breakouts
+    brk = {"ok": False}; bdn = {"ok": False}
+    if sr.get("ok"):
+        brk = breakout_confirmed(df, ind, "buy", sr["resistance"])
+        bdn = breakout_confirmed(df, ind, "sell", sr["support"])
+
+        if brk["ok"] or bdn["ok"]:
+            phase = "EXPANSION"
+
+    # Liquidity grab
+    liq = liquidity_grab(df, sr, px, reg["atr"])
+
+    # Shock
+    shock = shock_detector(df, ind, px)
+
+    return {
+        "ok": True,
+        "phase": phase,
+        "bias": bias,
+        "sr": sr,
+        "atr_regime": reg,
+        "breakout_up": brk,
+        "breakout_dn": bdn,
+        "liq": liq,
+        "shock": shock
+    }
+
+def momentum_gate_log(ms):
+    """Gate لوج واضح: ليه Momentum اتفعل أو اترفض"""
+    if not ms or not ms.get("ok"):
+        return
+
+    sh = ms["shock"]
+    brk_up = ms["breakout_up"]
+    brk_dn = ms["breakout_dn"]
+    liq = ms["liq"]
+    reg = ms["atr_regime"]
+
+    # Momentum is allowed if shock OR confirmed breakout/breakdown
+    allow = bool(sh.get("shock") or brk_up.get("ok") or brk_dn.get("ok"))
+    reason = "clear"
+    if sh.get("shock"):
+        reason = f"SHOCK {sh.get('dir')} str={sh.get('strength')}"
+    elif brk_up.get("ok"):
+        reason = f"BREAKOUT_OK {brk_up.get('why')}"
+    elif brk_dn.get("ok"):
+        reason = f"BREAKDOWN_OK {brk_dn.get('why')}"
+    else:
+        reason = "need shock OR breakout_confirmed"
+
+    # Print as Gate trace
+    try:
+        log_i(
+            f"{'✅' if allow else '⛔'} MOMENTUM_GATE | allow={allow} | {reason} | "
+            f"phase={ms.get('phase')} bias={ms.get('bias')} "
+            f"adx={_tf(getattr(ms,'adx', None),0.0) if False else ''}"
+            f" atr%={reg.get('atr_pct',0)*100:.2f}% reg={reg.get('regime')} "
+            f"liq(up/dn)={liq.get('fakeout_up')}/{liq.get('fakeout_dn')}"
+        )
+    except:
+        pass
+
 # =================== HUNTER PATCH UTILITIES ===================
 def get_tick_size(exchange, symbol):
     try:
@@ -337,7 +550,7 @@ def accumulation_launch_signal(ind, state):
     }
 
 # =================== DYNAMIC ATR REGIME ===================
-def atr_regime(ind: dict):
+def atr_regime_ind(ind: dict):
     """
     Determines ATR regime to adjust buffers dynamically.
     Returns: ("quiet" | "normal" | "expansion", buffer_mult)
@@ -388,7 +601,7 @@ def smart_entry_gate(sig, df, ind, gz=None):
         return True, "no_sr_context"
 
     # === Dynamic ATR buffer ===
-    regime, buf_mult = atr_regime(ind)
+    regime, buf_mult = atr_regime_ind(ind)
     buf = atr * buf_mult
 
     # === Golden Zone Validation ===
@@ -758,6 +971,7 @@ def verify_execution_environment():
     print(f"🛡️ RISK GUARDS: Hard Stop Loss (-{abs(MAX_LOSS_PCT)*100}%) | Post-Big-Win Guard (+{BIG_WIN_PCT*100}%)", flush=True)
     print(f"📦 CHART PRIME: High-Volume Boxes + Liquidity Cycle Monitor", flush=True)
     print(f"🎯 HUNTER PATCH: Unified Entry | ADX/ATR Smart Monitor | 8-Tick Iron SL", flush=True)
+    print(f"🚀 MARKET STATE ENGINE: Accumulation / Liquidity / Breakout / Shock Detection", flush=True)
     
     if not EXECUTE_ORDERS:
         print("🟡 WARNING: EXECUTE_ORDERS=False - البوت في وضع التحليل فقط!", flush=True)
@@ -3546,7 +3760,7 @@ def smart_exit_guard(state, df, ind, flow, bm, now_price, pnl_pct, mode, side, e
                 bm_wall_close = (bps <= BM_WALL_PROX_BPS)
 
     # =================== ATR REGIME → TRADE MANAGEMENT ===================
-    regime, buf_mult = atr_regime(ind)   # quiet | normal | expansion
+    regime, buf_mult = atr_regime_ind(ind)   # quiet | normal | expansion
 
     # افتراضات إدارة (قيمك الحالية)
     trail_mult = state["management"].get("atr_trail_mult", 1.6)
@@ -3948,7 +4162,7 @@ def sync_manual_close():
 
 # =================== ENHANCED TRADE LOOP ===================
 def trade_loop_enhanced():
-    """حلقة تداول محسنة مع Golden Zone Pro وSmart Profit AI وVWAP وOTC Detection وEMA Cross + Risk Guards + ChartPrime + HUNTER PATCH"""
+    """حلقة تداول محسنة مع Golden Zone Pro وSmart Profit AI وVWAP وOTC Detection وEMA Cross + Risk Guards + ChartPrime + HUNTER PATCH + Market State Engine"""
     global wait_for_next_signal_side
     loop_i = 0
     
@@ -4008,6 +4222,40 @@ def trade_loop_enhanced():
             cp_boxes = council_data.get("cp_boxes", {})
             liq_cycle = council_data.get("liquidity_cycle", {})
 
+            # ===================== MARKET STATE ENGINE (NEW) =====================
+            ms = market_state_engine(df, council_data["ind"], px)
+            momentum_gate_log(ms)
+
+            # SR/ATR buffer rule (قاعدتك)
+            sr = ms["sr"] if ms.get("ok") else {"ok": False}
+            reg = ms["atr_regime"] if ms.get("ok") else {"buf_atr":0.40, "atr": _tf(ind.get("atr"),0.0)}
+
+            # منطقة "قرب الدعم/المقاومة" الديناميكية
+            buf_px = reg["buf_atr"] * max(1e-12, reg["atr"])
+            near_res = sr.get("ok") and (px >= (sr["resistance"] - buf_px) and px < sr["resistance"])
+            near_sup = sr.get("ok") and (px <= (sr["support"] + buf_px) and px > sr["support"])
+
+            # Breakout/Breaddown confirmed
+            breakout_ok  = ms.get("breakout_up", {}).get("ok", False)
+            breakdown_ok = ms.get("breakout_dn", {}).get("ok", False)
+
+            # تطبيق قاعدتك حرفيًا كـ Gate
+            if near_res and not breakout_ok:
+                gate_block(
+                    "BUY_NEAR_RES_BLOCKED",
+                    gate_value=f"px~res buf={reg['buf_atr']:.2f}ATR",
+                    missing="need Breakout Confirmed (Close فوق المقاومة + Body + ADX/DI)",
+                    extra={"px": px, "res": sr.get("resistance"), "atr": reg.get("atr"), "adx": ind.get("adx"), "pdi": ind.get("plus_di"), "mdi": ind.get("minus_di")}
+                )
+
+            if near_sup and not breakdown_ok:
+                gate_block(
+                    "SELL_NEAR_SUP_BLOCKED",
+                    gate_value=f"px~sup buf={reg['buf_atr']:.2f}ATR",
+                    missing="need Breakdown Confirmed (Close تحت الدعم + Body + ADX/DI)",
+                    extra={"px": px, "sup": sr.get("support"), "atr": reg.get("atr"), "adx": ind.get("adx"), "pdi": ind.get("plus_di"), "mdi": ind.get("minus_di")}
+                )
+
             # ===================== HUNTER PATCH v2 (SMART ENTRY, NOT RANDOM) =====================
 
             # مراقبة ADX/ATR
@@ -4033,14 +4281,10 @@ def trade_loop_enhanced():
                     ob_signal = ("bearish", flow['delta_z'])
 
             # OTC Hidden flow (لو متوفر في council_data أو snap)
-            otc = council_data.get("otc", {}) if isinstance(council_data, dict) else {}
             otc_buy  = bool(otc.get("otc_buy"))
             otc_sell = bool(otc.get("otc_sell"))
 
             # ChartPrime Boxes + Liquidity Cycle (دي كانت خارج zone_ok وبالتالي بتقتل الصفقات)
-            cp_boxes = council_data.get("cp_boxes", {}) if isinstance(council_data, dict) else {}
-            liq_cycle = council_data.get("liquidity_cycle", {}) if isinstance(council_data, dict) else {}
-
             cb_side = cp_boxes.get("side")
             cb_score = float(cp_boxes.get("box_score", 0) or 0)
 
@@ -4055,13 +4299,19 @@ def trade_loop_enhanced():
             bear_accum_ok = (liq_reg == "bear_accumulation")
 
             # ---- SMART zone_ok (مش زون واحدة بس) ----
+            # Include shock, breakout, breakdown, and liquidity grabs
+            shock_ok = bool(ms.get("shock", {}).get("shock"))
+            break_ok = bool(breakout_ok or breakdown_ok)
+            liq_grab_ok = bool(ms.get("liq", {}).get("fakeout_up") or ms.get("liq", {}).get("fakeout_dn"))
+            
             zone_ok = bool(
                 gb or gt or
                 buy_liquidity or sell_liquidity or
                 otc_buy or otc_sell or
                 (ob_signal is not None) or
                 cp_support_ok or cp_resist_ok or
-                bull_accum_ok or bear_accum_ok
+                bull_accum_ok or bear_accum_ok or
+                shock_ok or break_ok or liq_grab_ok
             )
 
             # Debug واضح بدل "price خارج Zone" المبهم
@@ -4069,7 +4319,17 @@ def trade_loop_enhanced():
                 f"ENTRY_CTX | px={px:.6f} zone_ok={zone_ok} "
                 f"GB={gb} GT={gt} LIQ(B/S)={buy_liquidity}/{sell_liquidity} "
                 f"CP(S/R)={cp_support_ok}/{cp_resist_ok} LIQREG={liq_reg} "
-                f"OTC(B/S)={otc_buy}/{otc_sell} FLOW={ob_signal}"
+                f"OTC(B/S)={otc_buy}/{otc_sell} FLOW={ob_signal} "
+                f"SHOCK={shock_ok} BREAK={break_ok} LIQ_GRAB={liq_grab_ok}"
+            )
+            
+            # STATE ENGINE logging
+            log_i(
+                f"STATE_ENGINE | phase={ms.get('phase')} bias={ms.get('bias')} "
+                f"atr%={ms.get('atr_regime',{}).get('atr_pct',0)*100:.2f}% reg={ms.get('atr_regime',{}).get('regime')} "
+                f"SR(sup/res)={ms.get('sr',{}).get('support')}/{ms.get('sr',{}).get('resistance')} "
+                f"BO={breakout_ok} BD={breakdown_ok} SHOCK={ms.get('shock',{}).get('shock')} "
+                f"LIQ(up/dn)={ms.get('liq',{}).get('fakeout_up')}/{ms.get('liq',{}).get('fakeout_dn')}"
             )
 
             # (B) Compression بدون Zone
@@ -4115,6 +4375,24 @@ def trade_loop_enhanced():
                     buy_score += 2; reasons.append(f"Flow_Bull(z={ob_signal[1]:.2f})")
                 if ob_signal and ob_signal[0] == "bearish":
                     sell_score += 2; reasons.append(f"Flow_Bear(z={ob_signal[1]:.2f})")
+                    
+                # Shock detection
+                if shock_ok:
+                    if ms.get("shock", {}).get("dir") == "pump":
+                        buy_score += 3; reasons.append(f"SHOCK_PUMP(str={ms['shock'].get('strength')})")
+                    elif ms.get("shock", {}).get("dir") == "dump":
+                        sell_score += 3; reasons.append(f"SHOCK_DUMP(str={ms['shock'].get('strength')})")
+                
+                # Breakout/Breakdown
+                if breakout_ok: buy_score += 3; reasons.append(f"BREAKOUT({ms['breakout_up'].get('why','')})")
+                if breakdown_ok: sell_score += 3; reasons.append(f"BREAKDOWN({ms['breakout_dn'].get('why','')})")
+                
+                # Liquidity grab
+                if liq_grab_ok:
+                    if ms.get("liq", {}).get("fakeout_up"):
+                        sell_score += 2; reasons.append("LIQ_GRAB_UP")
+                    if ms.get("liq", {}).get("fakeout_dn"):
+                        buy_score += 2; reasons.append("LIQ_GRAB_DN")
 
                 # ADX/DI سياق الترند (Boost فقط — مش فيتو)
                 if watch["regime"] == "TREND":
@@ -4155,7 +4433,7 @@ def trade_loop_enhanced():
 
                 # ---- Launch gate: مطلوب فقط لو السوق تجميع + مفيش Trend واضح ----
                 need_launch = (watch["regime"] == "ACCUMULATION" and watch["side"] == "flat")
-                if need_launch and not cl.get("launch") and not (gb or gt or cp_support_ok or cp_resist_ok):
+                if need_launch and not cl.get("launch") and not (gb or gt or cp_support_ok or cp_resist_ok or shock_ok or break_ok or liq_grab_ok):
                     log_i("NO TRADE: accumulation يحتاج Launch (لا يوجد Trend ولا Zone قوية)")
                     reason = "need_launch_in_pure_accum"
                 else:
@@ -4169,7 +4447,7 @@ def trade_loop_enhanced():
                         tag = "GOLDEN"
 
                     # Confluence قوي (OTC/Flow/CP/LiqReg)
-                    elif (cp_support_ok or cp_resist_ok or otc_buy or otc_sell or (ob_signal is not None) or bull_accum_ok or bear_accum_ok):
+                    elif (cp_support_ok or cp_resist_ok or otc_buy or otc_sell or (ob_signal is not None) or bull_accum_ok or bear_accum_ok or shock_ok or break_ok or liq_grab_ok):
                         # بشرط إن السكور محترم
                         if (buy_score >= 7) or (sell_score >= 7):
                             override = True
@@ -4191,6 +4469,14 @@ def trade_loop_enhanced():
                     # Smart Entry Gate Check
                     ind["price"] = float(px or info["price"])
                     allow_entry, gate_reason = smart_entry_gate(final_signal, df, ind, gz)
+                    
+                    # 🔥 SHOCK FORCE ENTRY 🔥
+                    if ms.get("shock", {}).get("shock"):
+                        shock_dir = ms["shock"]["dir"]
+                        if shock_dir == "dump" and (spread_bps or 0) <= MAX_SPREAD_BPS:
+                            final_signal, allow_entry, gate_reason = "sell", True, "SHOCK_DUMP → FORCE SHORT (guards ok)"
+                        elif shock_dir == "pump" and (spread_bps or 0) <= MAX_SPREAD_BPS:
+                            final_signal, allow_entry, gate_reason = "buy", True, "SHOCK_PUMP → FORCE LONG (guards ok)"
                     
                     if not allow_entry:
                         log_w(f"🚫 ENTRY BLOCKED: {gate_reason}")
@@ -4238,7 +4524,7 @@ def pretty_snapshot(bal, info, ind, spread_bps, reason=None, df=None):
         print("📈 INDICATORS & RF")
         print(f"   💲 Price {fmt(info.get('price'))} | RF filt={fmt(info.get('filter'))}  hi={fmt(info.get('hi'))} lo={fmt(info.get('lo'))}")
         print(f"   🧮 RSI={fmt(ind.get('rsi'))}  +DI={fmt(ind.get('plus_di'))}  -DI={fmt(ind.get('minus_di'))}  ADX={fmt(ind.get('adx'))}  ATR={fmt(ind.get('atr'))}")
-        print(f"   🎯 ENTRY: COUNCIL PRO + GOLDEN ENTRY + VWAP STRATEGY + OTC DETECTION + EMA CROSSOVER ENGINE + CHART PRIME + HUNTER PATCH  |  spread_bps={fmt(spread_bps,2)}")
+        print(f"   🎯 ENTRY: COUNCIL PRO + GOLDEN ENTRY + VWAP STRATEGY + OTC DETECTION + EMA CROSSOVER ENGINE + CHART PRIME + HUNTER PATCH + MARKET STATE ENGINE |  spread_bps={fmt(spread_bps,2)}")
         print(f"   ⏱️ closes_in ≈ {left_s}s")
         
         # عرض معلومات الـ Guards
@@ -4278,7 +4564,7 @@ app = Flask(__name__)
 @app.route("/")
 def home():
     mode='LIVE' if MODE_LIVE else 'PAPER'
-    return f"✅ Council PRO Bot — {SYMBOL} {INTERVAL} — {mode} — Enhanced Candles + Golden Zone Pro + Smart Profit AI + VWAP Strategy + OTC Detection + EMA Crossover Engine + Hard Stop Loss + Post-Big-Win Guard + Auto-Recovery + ChartPrime + HUNTER PATCH"
+    return f"✅ Council PRO Bot — {SYMBOL} {INTERVAL} — {mode} — Enhanced Candles + Golden Zone Pro + Smart Profit AI + VWAP Strategy + OTC Detection + EMA Crossover Engine + Hard Stop Loss + Post-Big-Win Guard + Auto-Recovery + ChartPrime + HUNTER PATCH + Market State Engine"
 
 @app.route("/metrics")
 def metrics():
@@ -4286,7 +4572,7 @@ def metrics():
         "symbol": SYMBOL, "interval": INTERVAL, "mode": "live" if MODE_LIVE else "paper",
         "leverage": LEVERAGE, "risk_alloc": RISK_ALLOC, "price": price_now(),
         "state": STATE, "compound_pnl": compound_pnl,
-        "entry_mode": "COUNCIL_PRO_GOLDEN_ENHANCED_VWAP_OTC_EMA_CHARTPRIME_HUNTER", "wait_for_next_signal": wait_for_next_signal_side,
+        "entry_mode": "COUNCIL_PRO_GOLDEN_ENHANCED_VWAP_OTC_EMA_CHARTPRIME_HUNTER_MARKET_STATE", "wait_for_next_signal": wait_for_next_signal_side,
         "risk_guards": {
             "hard_stop_pct": abs(MAX_LOSS_PCT)*100,
             "big_win_pct": BIG_WIN_PCT*100,
@@ -4328,6 +4614,10 @@ def metrics():
             "adx_exit_weak": ADX_EXIT_WEAK,
             "min_profit_to_exit": MIN_PROFIT_TO_EXIT
         },
+        "market_state_engine": {
+            "enabled": True,
+            "detects": ["accumulation", "breakout", "liquidity_grab", "shock"]
+        },
         "current_guards": {
             "post_big_win_active": STATE.get("post_big_win_mode", False),
             "post_big_win_bars_left": STATE.get("post_big_win_bars_left", 0),
@@ -4343,7 +4633,7 @@ def health():
         "ok": True, "mode": "live" if MODE_LIVE else "paper",
         "open": STATE["open"], "side": STATE["side"], "qty": STATE["qty"],
         "compound_pnl": compound_pnl, "timestamp": datetime.utcnow().isoformat(),
-        "entry_mode": "COUNCIL_PRO_GOLDEN_ENHANCED_VWAP_OTC_EMA_CHARTPRIME_HUNTER", "wait_for_next_signal": wait_for_next_signal_side,
+        "entry_mode": "COUNCIL_PRO_GOLDEN_ENHANCED_VWAP_OTC_EMA_CHARTPRIME_HUNTER_MARKET_STATE", "wait_for_next_signal": wait_for_next_signal_side,
         "risk_guards": {
             "hard_stop_active": STATE.get("max_loss_price") is not None,
             "post_big_win_active": STATE.get("post_big_win_mode", False),
@@ -4391,6 +4681,7 @@ if __name__ == "__main__":
     print(colored(f"📦 CHART PRIME: High-Volume Boxes + Liquidity Cycle Monitor", "green"))
     print(colored(f"🛡️ RISK GUARDS: Hard Stop Loss (-{abs(MAX_LOSS_PCT)*100}%) | Post-Big-Win Guard (+{BIG_WIN_PCT*100}%)", "red"))
     print(colored(f"🎯 HUNTER PATCH: Unified Entry | ADX/ATR Smart Monitor | Iron SL {HARD_SL_TICKS} ticks | Launch Detection", "cyan"))
+    print(colored(f"🚀 MARKET STATE ENGINE: Accumulation / Liquidity / Breakout / Shock Detection", "magenta"))
     print(colored(f"🔄 AUTO RECOVERY: Enhanced position sync on restart", "green"))
     print(colored(f"🔄 MANUAL CLOSE SYNC: Enabled (detects manual close from exchange)", "green"))
     print(colored(f"EXECUTION: {'ACTIVE' if EXECUTE_ORDERS and not DRY_RUN else 'SIMULATION'}", "yellow"))
