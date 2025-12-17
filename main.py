@@ -123,7 +123,7 @@ CLOSE_VERIFY_WAIT_S  = 2.0
 
 # Pacing
 BASE_SLEEP   = 15
-NEAR_CLOSE_S = 1
+NEAR_CLOSE_S = 5
 POSITION_STATUS_LOG_INTERVAL = 15
 
 # ==== Smart Exit Tuning ===
