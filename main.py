@@ -6,6 +6,7 @@ RF Futures Bot — RF-LIVE ONLY (BingX Perp via CCXT)
 • Dynamic TP ladder + Breakeven + ATR-trailing
 • Smart Exit Management + Wait-for-next-signal
 • Professional Logging & Dashboard
+• ONE-WAY MODE ONLY
 """
 
 import os, time, math, random, signal, sys, traceback, logging, json
@@ -40,7 +41,7 @@ SHADOW_MODE_DASHBOARD = False
 DRY_RUN = False
 
 # ==== Addon: Logging + Recovery Settings ====
-BOT_VERSION = "DOGE Council PRO v4.0 — Candles + Golden System"
+BOT_VERSION = "DOGE Council PRO v4.0 — Candles + Golden System — ONE-WAY MODE"
 print("🔁 Booting:", BOT_VERSION, flush=True)
 
 STATE_PATH = "./bot_state.json"
@@ -61,7 +62,7 @@ SYMBOL     = os.getenv("SYMBOL", "DOGE/USDT:USDT")
 INTERVAL   = os.getenv("INTERVAL", "15m")
 LEVERAGE   = int(os.getenv("LEVERAGE", 10))
 RISK_ALLOC = float(os.getenv("RISK_ALLOC", 0.60))
-POSITION_MODE = os.getenv("BINGX_POSITION_MODE", "oneway")
+POSITION_MODE = "oneway"  # ONE-WAY MODE ONLY
 
 # RF Settings
 RF_SOURCE = "close"
@@ -258,6 +259,7 @@ def verify_execution_environment():
     print(f"🔧 EXECUTE_ORDERS: {EXECUTE_ORDERS} | SHADOW_MODE: {SHADOW_MODE_DASHBOARD} | DRY_RUN: {DRY_RUN}", flush=True)
     print(f"🎯 GOLDEN ENTRY: score={GOLDEN_ENTRY_SCORE} | ADX={GOLDEN_ENTRY_ADX}", flush=True)
     print(f"📈 CANDLES: Full patterns + Wick exhaustion + Golden reversal", flush=True)
+    print(f"🔄 POSITION MODE: ONE-WAY ONLY", flush=True)
     
     if not EXECUTE_ORDERS:
         print("🟡 WARNING: EXECUTE_ORDERS=False - البوت في وضع التحليل فقط!", flush=True)
@@ -608,6 +610,13 @@ def load_market_specs():
 
 def ensure_leverage_mode():
     try:
+        # إجبار وضع المركز إلى One-Way
+        try:
+            ex.set_position_mode(False, SYMBOL)  # False = One-Way
+            log_g("✅ Position mode forced to One-Way")
+        except Exception as e:
+            log_w(f"set_position_mode warn: {e} (may need manual setting in BingX)")
+        
         try:
             ex.set_leverage(LEVERAGE, SYMBOL, params={"side": "BOTH"})
             log_g(f"leverage set: {LEVERAGE}x")
@@ -1238,14 +1247,12 @@ def wait_gate_allow(df, info):
 
 # =================== ORDERS ===================
 def _params_open(side):
-    if POSITION_MODE == "hedge":
-        return {"positionSide": "LONG" if side=="buy" else "SHORT", "reduceOnly": False}
-    return {"positionSide": "BOTH", "reduceOnly": False}
+    # في One-Way لا نحتاج إلى positionSide
+    return {"reduceOnly": False}
 
 def _params_close():
-    if POSITION_MODE == "hedge":
-        return {"positionSide": "LONG" if STATE.get("side")=="long" else "SHORT", "reduceOnly": True}
-    return {"positionSide": "BOTH", "reduceOnly": True}
+    # في One-Way، كل الطلبات تقفل المركز المفتوح تلقائيًا
+    return {"reduceOnly": True}
 
 def _read_position():
     try:
@@ -1712,7 +1719,7 @@ app = Flask(__name__)
 @app.route("/")
 def home():
     mode='LIVE' if MODE_LIVE else 'PAPER'
-    return f"✅ Council PRO Bot — {SYMBOL} {INTERVAL} — {mode} — Candles + Golden Entry + Smart Exit"
+    return f"✅ Council PRO Bot — {SYMBOL} {INTERVAL} — {mode} — Candles + Golden Entry + Smart Exit — ONE-WAY MODE"
 
 @app.route("/metrics")
 def metrics():
@@ -1721,7 +1728,8 @@ def metrics():
         "leverage": LEVERAGE, "risk_alloc": RISK_ALLOC, "price": price_now(),
         "state": STATE, "compound_pnl": compound_pnl,
         "entry_mode": "COUNCIL_PRO_GOLDEN", "wait_for_next_signal": wait_for_next_signal_side,
-        "guards": {"max_spread_bps": MAX_SPREAD_BPS, "final_chunk_qty": FINAL_CHUNK_QTY}
+        "guards": {"max_spread_bps": MAX_SPREAD_BPS, "final_chunk_qty": FINAL_CHUNK_QTY},
+        "position_mode": "oneway"
     })
 
 @app.route("/health")
@@ -1730,7 +1738,8 @@ def health():
         "ok": True, "mode": "live" if MODE_LIVE else "paper",
         "open": STATE["open"], "side": STATE["side"], "qty": STATE["qty"],
         "compound_pnl": compound_pnl, "timestamp": datetime.utcnow().isoformat(),
-        "entry_mode": "COUNCIL_PRO_GOLDEN", "wait_for_next_signal": wait_for_next_signal_side
+        "entry_mode": "COUNCIL_PRO_GOLDEN", "wait_for_next_signal": wait_for_next_signal_side,
+        "position_mode": "oneway"
     }), 200
 
 def keepalive_loop():
@@ -1748,7 +1757,11 @@ def keepalive_loop():
 
 # =================== BOOT ===================
 if __name__ == "__main__":
-    log_banner("INIT")
+    log_banner("INIT - ONE-WAY MODE")
+    print(colored("🔄 CONVERTING TO ONE-WAY MODE", "yellow"))
+    print(colored("⚠️  Make sure BingX account is set to One-Way Mode", "yellow"))
+    print(colored("⚠️  Close ALL open positions before switching", "red"))
+    
     state = load_state() or {}
     state.setdefault("in_position", False)
 
@@ -1765,6 +1778,7 @@ if __name__ == "__main__":
     print(colored(f"GOLDEN ENTRY: score≥{GOLDEN_ENTRY_SCORE} | ADX≥{GOLDEN_ENTRY_ADX}", "yellow"))
     print(colored(f"CANDLES: Full patterns + Wick exhaustion + Golden reversal", "yellow"))
     print(colored(f"EXECUTION: {'ACTIVE' if EXECUTE_ORDERS and not DRY_RUN else 'SIMULATION'}", "yellow"))
+    print(colored(f"POSITION MODE: ONE-WAY ONLY", "yellow"))
     
     logging.info("service starting…")
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
