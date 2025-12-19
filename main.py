@@ -13,11 +13,12 @@ RF Futures Bot — RF-LIVE ONLY (BingX Perp via CCXT)
 • CHART PRIME: High-Volume Boxes + Liquidity Cycle Monitor
 • HUNTER PATCH: Unified Entry, ADX/ATR Smart Monitoring, 8-Tick Iron SL
 • MARKET STATE ENGINE: Accumulation / Liquidity / Breakout / Shock Detection
+• MICRO SCALP GOVERNOR: 3-5 trades/day with cooldown + Institutional Lock
 """
 
 import os, time, math, random, signal, sys, traceback, logging, json
 from logging.handlers import RotatingFileHandler
-from datetime import datetime
+from datetime import datetime, timezone
 import pandas as pd
 import numpy as np
 import ccxt
@@ -47,7 +48,7 @@ SHADOW_MODE_DASHBOARD = False
 DRY_RUN = False
 
 # ==== Addon: Logging + Recovery Settings ====
-BOT_VERSION = "DOGE Council PRO v6.0 — Smart Profit AI + Golden Zone Pro + VWAP Strategy + OTC Detection + EMA Crossover Engine + Hard Stop + Post-Big-Win Guard + Auto-Recovery + ChartPrime Liquidity Monitor + HUNTER PATCH + Market State Engine"
+BOT_VERSION = "DOGE Council PRO v6.0 — Smart Profit AI + Golden Zone Pro + VWAP Strategy + OTC Detection + EMA Crossover Engine + Hard Stop + Post-Big-Win Guard + Auto-Recovery + ChartPrime Liquidity Monitor + HUNTER PATCH + Market State Engine + Micro-Scalp Governor"
 print("🔁 Booting:", BOT_VERSION, flush=True)
 
 STATE_PATH = "./bot_state.json"
@@ -199,6 +200,32 @@ EXIT_WEAKNESS_VOTES = 2  # 2 إشارات ضعف = خروج
 MIN_PROFIT_TO_EXIT = 0.20  # % ربح أدنى قبل الخروج الذكي
 # ===============================================================
 
+# =================== MICRO SCALP GOVERNOR (3-5 trades/day) ===================
+MICRO_SCALP_ENABLED = True
+
+# الهدف اللي انت قلته (0.40%) + ستوب أصغر للسكالب فقط (-0.25%)
+MICRO_SCALP_TP_PCT  = 0.40     # %
+MICRO_SCALP_SL_PCT  = -0.25    # %  (سكالب بس)
+
+# سكالب = لازم يكون Near VWAP غالبًا + ADX مش ترند قوي (عشان ما ندخل ضد موجة مؤسسات)
+MICRO_SCALP_ADX_MAX = 22.0
+
+# 3-5 صفقات في اليوم
+MICRO_SCALP_MAX_TRADES_PER_DAY = 5
+
+# تبريد بعد الإغلاق (2 شمعة) عشان ما يفضلش يضرب يمين شمال
+MICRO_SCALP_COOLDOWN_BARS = 2
+
+# Override للـ WAIT gate للسكالب لكن بشروط صارمة
+MICRO_SCALP_WAIT_OVERRIDE = True
+MICRO_SCALP_MIN_SCORE_TO_OVERRIDE = 7  # لازم سكوره محترم
+# ===================================================================
+
+# ===== LOG THROTTLE (reduce spam) =====
+LOG_UI_EVERY_S = 7        # اطبع Snapshot / حالة السوق كل 7 ثواني
+LOG_NO_TRADE_EVERY_S = 7  # اطبع "NO TRADE / ENTRY BLOCKED" كل 7 ثواني
+# =====================================
+
 # =================== PROFESSIONAL LOGGING ===================
 def log_i(msg): print(f"ℹ️ {msg}", flush=True)
 def log_g(msg): print(f"✅ {msg}", flush=True)
@@ -255,6 +282,107 @@ def gate_block(gate_name: str, gate_value=None, missing: str = "", extra: dict =
         keys = ["px","spread_bps","adx","plus_di","minus_di","atr","rsi","buy_score","sell_score","regime","event","strength"]
         ctx = {k: extra.get(k) for k in keys if k in extra}
         log_w(f"   ↳ ctx: {ctx}")
+
+# =================== LOG RATE LIMITER ===================
+_last_log_bucket = {}
+
+def log_throttled(key: str, every_s: int, fn, msg: str):
+    """
+    يطبع رسائل متكررة كل N ثواني فقط.
+    fn = log_i أو log_w أو logging.info ... إلخ
+    """
+    try:
+        now = time.time()
+        last = float(_last_log_bucket.get(key, 0))
+        if (now - last) >= float(every_s):
+            _last_log_bucket[key] = now
+            fn(msg)
+            return True
+    except Exception:
+        # لو حصل أي مشكلة: اطبع مرة وخلاص
+        try: fn(msg)
+        except Exception: pass
+    return False
+# =========================================================
+
+# =================== MICRO SCALP HELPER FUNCTIONS ===================
+def _interval_seconds(tf: str) -> int:
+    """
+    حساب عدد الثواني في timeframe
+    """
+    try:
+        tf = str(tf).strip().lower()
+        if tf.endswith("m"): return int(tf[:-1]) * 60
+        if tf.endswith("h"): return int(tf[:-1]) * 3600
+        if tf.endswith("d"): return int(tf[:-1]) * 86400
+    except:
+        pass
+    return 60
+
+def micro_scalp_day_key() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+def micro_scalp_reset_if_new_day(state: dict):
+    k = micro_scalp_day_key()
+    if state.get("micro_scalp_day") != k:
+        state["micro_scalp_day"] = k
+        state["micro_scalp_count"] = 0
+
+def micro_scalp_can_trade(state: dict, tf: str) -> (bool, str):
+    micro_scalp_reset_if_new_day(state)
+
+    if not MICRO_SCALP_ENABLED:
+        return False, "micro_scalp_disabled"
+
+    if int(state.get("micro_scalp_count", 0)) >= int(MICRO_SCALP_MAX_TRADES_PER_DAY):
+        return False, f"daily_cap_reached({state.get('micro_scalp_count')}/{MICRO_SCALP_MAX_TRADES_PER_DAY})"
+
+    # cooldown بالشموع بعد آخر إغلاق سكالب
+    last_close_ts = float(state.get("micro_scalp_last_close_ts", 0))
+    cool_sec = int(MICRO_SCALP_COOLDOWN_BARS) * _interval_seconds(tf)
+    if last_close_ts and (time.time() - last_close_ts) < cool_sec:
+        remain = int(cool_sec - (time.time() - last_close_ts))
+        return False, f"cooldown({remain}s)"
+
+    return True, "ok"
+
+def mark_micro_scalp_open(state: dict):
+    micro_scalp_reset_if_new_day(state)
+    state["micro_scalp_count"] = int(state.get("micro_scalp_count", 0)) + 1
+    state["micro_scalp_last_open_ts"] = int(time.time())
+
+def mark_micro_scalp_close(state: dict):
+    state["micro_scalp_last_close_ts"] = int(time.time())
+
+def is_institutional_trend_lock(votes: dict, mode_ctx: dict) -> (bool, str):
+    """
+    لو ظهر ترند مؤسسي: نقفل أي سكالب ونحوّل Trend.
+    إشارات lock:
+      - EMA strong cross
+      - Golden confirmed قوي
+      - Footprint trend نفس اتجاه قوي
+      - Liquidity cycle مش chop
+    """
+    try:
+        ema = (votes or {}).get("ema", {}) or {}
+        gz  = (votes or {}).get("gz",  {}) or (mode_ctx or {}).get("gz", {}) or {}
+        fp  = (votes or {}).get("footprint", {}) or {}
+        liq = (votes or {}).get("liquidity_cycle", {}) or {}
+
+        ema_label = ema.get("label", "none")
+        if ema_label in ("strong_bull", "strong_bear"):
+            return True, f"ema_lock({ema_label})"
+
+        if isinstance(gz, dict) and gz.get("ok") and gz.get("confirmed") and float(gz.get("score", 0)) >= 6.5:
+            return True, f"golden_lock(score={gz.get('score')})"
+
+        if fp.get("ok") and fp.get("delta_trend") in ("bull", "bear") and (liq.get("regime") not in (None, "", "chop")):
+            return True, f"flow_liq_lock({fp.get('delta_trend')}/{liq.get('regime')})"
+
+    except Exception:
+        pass
+
+    return False, "no_lock"
 
 # ===================== MARKET STATE ENGINE (ACCUM / LIQ / BREAK / SHOCK) =====================
 
@@ -972,6 +1100,7 @@ def verify_execution_environment():
     print(f"📦 CHART PRIME: High-Volume Boxes + Liquidity Cycle Monitor", flush=True)
     print(f"🎯 HUNTER PATCH: Unified Entry | ADX/ATR Smart Monitor | 8-Tick Iron SL", flush=True)
     print(f"🚀 MARKET STATE ENGINE: Accumulation / Liquidity / Breakout / Shock Detection", flush=True)
+    print(f"⚡ MICRO SCALP GOVERNOR: {MICRO_SCALP_MAX_TRADES_PER_DAY} trades/day | SL={MICRO_SCALP_SL_PCT}% | TP={MICRO_SCALP_TP_PCT}%", flush=True)
     
     if not EXECUTE_ORDERS:
         print("🟡 WARNING: EXECUTE_ORDERS=False - البوت في وضع التحليل فقط!", flush=True)
@@ -3431,6 +3560,22 @@ def open_market_enhanced(side, qty, price):
             log_w(f"🎯 IRON SL SET @ {STATE['hard_sl']:.6f} (8 ticks)")
         # ================================================================
         
+        # ===================== MICRO SCALP SETTINGS =====================
+        if mode == "scalp":
+            # عدّ الصفقة سكالب
+            mark_micro_scalp_open(STATE)
+
+            # SL خاص للسكالب -0.25%
+            entry = float(current_price)
+            if side_label == "long":
+                STATE["micro_sl_price"] = entry * (1.0 + (MICRO_SCALP_SL_PCT / 100.0))
+            else:
+                STATE["micro_sl_price"] = entry * (1.0 - (MICRO_SCALP_SL_PCT / 100.0))
+            log_w(f"🛡 MICRO SL SET | {STATE['micro_sl_price']:.6f} ({MICRO_SCALP_SL_PCT}%)")
+        else:
+            STATE.pop("micro_sl_price", None)
+        # ================================================================
+        
         save_state({
             "in_position": True,
             "side": "LONG" if side.upper().startswith("B") else "SHORT",
@@ -3452,6 +3597,7 @@ def open_market_enhanced(side, qty, price):
             "trail_tightened": False,
             "last_status_log_ts": 0.0,
             "hard_sl": STATE.get("hard_sl"),
+            "micro_sl_price": STATE.get("micro_sl_price"),
         })
 
         # === لوج افتتاح الصفقة + خطة جني الأرباح ===
@@ -3601,6 +3747,13 @@ STATE = {
     "hard_sl": None,                  # ستوب حديدي 8 نقاط
     "hist_adx": [],                   # تاريخ ADX للمراقبة
     "hist_atr": [],                   # تاريخ ATR للمراقبة
+    
+    # --- MICRO SCALP ---
+    "micro_scalp_day": None,
+    "micro_scalp_count": 0,
+    "micro_scalp_last_open_ts": 0,
+    "micro_scalp_last_close_ts": 0,
+    "micro_sl_price": None,
 }
 compound_pnl = 0.0
 wait_for_next_signal_side = None
@@ -3720,7 +3873,13 @@ def _reset_after_close(reason, prev_side=None):
         "hard_sl": None,  # إعادة تعيين Iron SL
         "hist_adx": [],
         "hist_atr": [],
+        "micro_sl_price": None,  # إعادة تعيين Micro SL
     })
+    
+    # إذا كانت صفقة سكالب، نعدّ الإغلاق
+    if prev_side and STATE.get("mode") == "scalp":
+        mark_micro_scalp_close(STATE)
+    
     save_state({"in_position": False, "position_qty": 0})
     
     # تفعيل انتظار الإشارة التالية
@@ -3949,6 +4108,20 @@ def manage_after_entry_enhanced(df, ind, info):
             risk_on_trade_closed(STATE, pnl_pct)
             return
     
+    # ========= MICRO SCALP SL =========
+    if STATE.get("mode") == "scalp" and STATE.get("micro_sl_price"):
+        msl = STATE["micro_sl_price"]
+        if side == "long" and float(px) <= float(msl):
+            log_w(f"🛑 MICRO SL HIT | px={float(px):.6f} <= msl={float(msl):.6f}")
+            close_market_strict("micro_sl")
+            mark_micro_scalp_close(STATE)
+            return
+        if side == "short" and float(px) >= float(msl):
+            log_w(f"🛑 MICRO SL HIT | px={float(px):.6f} >= msl={float(msl):.6f}")
+            close_market_strict("micro_sl")
+            mark_micro_scalp_close(STATE)
+            return
+    
     # PnL % (كـ نسبة مئوية)
     pnl_pct = (px - entry) / entry * 100.0 * (1 if side == "long" else -1)
     STATE["pnl"] = pnl_pct
@@ -4172,7 +4345,7 @@ def sync_manual_close():
 
 # =================== ENHANCED TRADE LOOP ===================
 def trade_loop_enhanced():
-    """حلقة تداول محسنة مع Golden Zone Pro وSmart Profit AI وVWAP وOTC Detection وEMA Cross + Risk Guards + ChartPrime + HUNTER PATCH + Market State Engine"""
+    """حلقة تداول محسنة مع Golden Zone Pro وSmart Profit AI وVWAP وOTC Detection وEMA Cross + Risk Guards + ChartPrime + HUNTER PATCH + Market State Engine + Micro-Scalp Governor"""
     global wait_for_next_signal_side
     loop_i = 0
     
@@ -4192,10 +4365,14 @@ def trade_loop_enhanced():
             ind = compute_indicators(df)
             spread_bps = orderbook_spread_bps()
             
-            # Enhanced Snapshots
-            snap = emit_snapshots(ex, SYMBOL, df,
-                                balance_fn=lambda: float(bal) if bal else None,
-                                pnl_fn=lambda: float(compound_pnl))
+            # Enhanced Snapshots مع Log Throttle
+            if log_throttled("ui_snapshot", LOG_UI_EVERY_S, log_i, f"📊 SNAPSHOT | px={fmt(px)} | spread={fmt(spread_bps)}bps | adx={fmt(ind.get('adx'))}"):
+                snap = emit_snapshots(ex, SYMBOL, df,
+                                    balance_fn=lambda: float(bal) if bal else None,
+                                    pnl_fn=lambda: float(compound_pnl))
+            else:
+                snap = {"bm": None, "flow": None, "cv": {"b":0,"s":0,"score_b":0.0,"score_s":0.0,"ind":{}},
+                        "mode": {"mode":"n/a"}, "gz": None, "wallet": ""}
             
             # تحديث حالة الربح/الخسارة
             if STATE["open"] and px:
@@ -4447,33 +4624,52 @@ def trade_loop_enhanced():
                     log_i("NO TRADE: accumulation يحتاج Launch (لا يوجد Trend ولا Zone قوية)")
                     reason = "need_launch_in_pure_accum"
                 else:
-                    # Override قوي: Golden أو Confluence عالي
-                    override = False
-                    tag = ""
+                    # =================== MICRO SCALP WAIT OVERRIDE (controlled) ===================
+                    mode_ctx = snap.get("mode") if isinstance(snap, dict) else {}
+                    mode_name = (mode_ctx or {}).get("mode", "n/a")
 
-                    # Golden مباشرة (أقوى override)
-                    if gb or gt:
-                        override = True
-                        tag = "GOLDEN"
+                    # هل السعر Near VWAP؟
+                    near_vwap = False
+                    try:
+                        if VWAP_ENABLED and ind.get("vwap"):
+                            vwap_val = float(ind["vwap"])
+                            vwap_diff_bps = abs(float(px) - vwap_val) / vwap_val * 10000.0
+                            near_vwap = (vwap_diff_bps <= VWAP_SCALP_BAND_BPS)
+                    except Exception:
+                        near_vwap = False
 
-                    # Confluence قوي (OTC/Flow/CP/LiqReg)
-                    elif (cp_support_ok or cp_resist_ok or otc_buy or otc_sell or (ob_signal is not None) or bull_accum_ok or bear_accum_ok or shock_ok or break_ok or liq_grab_ok):
-                        # بشرط إن السكور محترم
-                        if (buy_score >= 7) or (sell_score >= 7):
-                            override = True
-                            tag = "CONFLUENCE>=7"
+                    # Institutional lock؟
+                    lock, lock_reason = is_institutional_trend_lock(snap.get("cv", {}), mode_ctx)
 
-                    allow_wait, wait_reason = wait_gate_allow(df, info, allow_override=override, override_tag=tag)
+                    micro_ok, micro_reason = micro_scalp_can_trade(STATE, INTERVAL)
 
+                    micro_wait_override = (
+                        MICRO_SCALP_WAIT_OVERRIDE and
+                        (mode_name == "scalp") and
+                        (not lock) and
+                        micro_ok and
+                        near_vwap and
+                        (float(ind.get("adx", 0)) <= float(MICRO_SCALP_ADX_MAX)) and
+                        (max(buy_score, sell_score) >= float(MICRO_SCALP_MIN_SCORE_TO_OVERRIDE))
+                    )
+
+                    if micro_wait_override:
+                        log_w(f"⚡ MICRO_SCALP OVERRIDE WAIT_GATE | nearVWAP={near_vwap} "
+                              f"| adx={float(ind.get('adx',0)):.1f} | score={max(buy_score,sell_score):.1f} "
+                              f"| reason={micro_reason}")
+                    # ===================================================================
+
+                    allow_wait, wait_reason = wait_gate_allow(df, info, allow_override=micro_wait_override, override_tag="MICRO_SCALP_OVERRIDE")
+                    
                     # (D) Wait Gate (أكبر قاتل للدخول)
-                    if not allow_wait:
+                    if not allow_wait and not micro_wait_override:
                         gate_block(
                             "WAIT_FOR_NEXT_SIGNAL",
                             gate_value=wait_for_next_signal_side,
                             missing=f"need RF signal: {wait_for_next_signal_side}",
-                            extra={"px": px, "adx": ind.get("adx"), "plus_di": ind.get("plus_di"), "minus_di": ind.get("minus_di")}
+                            extra={"px": px, "adx": ind.get("adx"), "buy_score": buy_score, "sell_score": sell_score}
                         )
-                        reason = wait_reason
+                        log_i(f"NO TRADE | WAIT_GATE blocked | reason={wait_reason}")
                         continue
                     
                     # Smart Entry Gate Check
@@ -4489,7 +4685,12 @@ def trade_loop_enhanced():
                             final_signal, allow_entry, gate_reason = "buy", True, "SHOCK_PUMP → FORCE LONG (guards ok)"
                     
                     if not allow_entry:
-                        log_w(f"🚫 ENTRY BLOCKED: {gate_reason}")
+                        log_throttled(
+                            key="entry_blocked",
+                            every_s=LOG_NO_TRADE_EVERY_S,
+                            fn=log_w,
+                            msg=f"🚫 ENTRY BLOCKED: {gate_reason}"
+                        )
                         continue
                     else:
                         log_i(f"✅ ENTRY ALLOWED: {gate_reason}")
@@ -4534,7 +4735,7 @@ def pretty_snapshot(bal, info, ind, spread_bps, reason=None, df=None):
         print("📈 INDICATORS & RF")
         print(f"   💲 Price {fmt(info.get('price'))} | RF filt={fmt(info.get('filter'))}  hi={fmt(info.get('hi'))} lo={fmt(info.get('lo'))}")
         print(f"   🧮 RSI={fmt(ind.get('rsi'))}  +DI={fmt(ind.get('plus_di'))}  -DI={fmt(ind.get('minus_di'))}  ADX={fmt(ind.get('adx'))}  ATR={fmt(ind.get('atr'))}")
-        print(f"   🎯 ENTRY: COUNCIL PRO + GOLDEN ENTRY + VWAP STRATEGY + OTC DETECTION + EMA CROSSOVER ENGINE + CHART PRIME + HUNTER PATCH + MARKET STATE ENGINE |  spread_bps={fmt(spread_bps,2)}")
+        print(f"   🎯 ENTRY: COUNCIL PRO + GOLDEN ENTRY + VWAP STRATEGY + OTC DETECTION + EMA CROSSOVER ENGINE + CHART PRIME + HUNTER PATCH + MARKET STATE ENGINE + MICRO SCALP |  spread_bps={fmt(spread_bps,2)}")
         print(f"   ⏱️ closes_in ≈ {left_s}s")
         
         # عرض معلومات الـ Guards
@@ -4542,6 +4743,7 @@ def pretty_snapshot(bal, info, ind, spread_bps, reason=None, df=None):
         if STATE["open"]:
             stop_price = STATE.get("max_loss_price")
             hard_sl = STATE.get("hard_sl")
+            micro_sl = STATE.get("micro_sl_price")
             current_price = info.get("price") or 0
             if stop_price:
                 stop_distance_pct = abs(stop_price - current_price) / current_price * 100
@@ -4550,6 +4752,9 @@ def pretty_snapshot(bal, info, ind, spread_bps, reason=None, df=None):
             if hard_sl:
                 sl_distance_pct = abs(hard_sl - current_price) / current_price * 100
                 print(f"   🎯 IRON SL: {fmt(hard_sl)} ({sl_distance_pct:.2f}%)")
+            if micro_sl:
+                sl_distance_pct = abs(micro_sl - current_price) / current_price * 100
+                print(f"   ⚡ MICRO SL: {fmt(micro_sl)} ({sl_distance_pct:.2f}%)")
         
         if STATE.get("post_big_win_mode"):
             print(f"   🛡️ POST-BIG-WIN: ACTIVE ({STATE.get('post_big_win_bars_left', 0)} bars left)")
@@ -4574,7 +4779,7 @@ app = Flask(__name__)
 @app.route("/")
 def home():
     mode='LIVE' if MODE_LIVE else 'PAPER'
-    return f"✅ Council PRO Bot — {SYMBOL} {INTERVAL} — {mode} — Enhanced Candles + Golden Zone Pro + Smart Profit AI + VWAP Strategy + OTC Detection + EMA Crossover Engine + Hard Stop Loss + Post-Big-Win Guard + Auto-Recovery + ChartPrime + HUNTER PATCH + Market State Engine"
+    return f"✅ Council PRO Bot — {SYMBOL} {INTERVAL} — {mode} — Enhanced Candles + Golden Zone Pro + Smart Profit AI + VWAP Strategy + OTC Detection + EMA Crossover Engine + Hard Stop Loss + Post-Big-Win Guard + Auto-Recovery + ChartPrime + HUNTER PATCH + Market State Engine + Micro-Scalp Governor"
 
 @app.route("/metrics")
 def metrics():
@@ -4582,7 +4787,7 @@ def metrics():
         "symbol": SYMBOL, "interval": INTERVAL, "mode": "live" if MODE_LIVE else "paper",
         "leverage": LEVERAGE, "risk_alloc": RISK_ALLOC, "price": price_now(),
         "state": STATE, "compound_pnl": compound_pnl,
-        "entry_mode": "COUNCIL_PRO_GOLDEN_ENHANCED_VWAP_OTC_EMA_CHARTPRIME_HUNTER_MARKET_STATE", "wait_for_next_signal": wait_for_next_signal_side,
+        "entry_mode": "COUNCIL_PRO_GOLDEN_ENHANCED_VWAP_OTC_EMA_CHARTPRIME_HUNTER_MARKET_STATE_MICRO_SCALP", "wait_for_next_signal": wait_for_next_signal_side,
         "risk_guards": {
             "hard_stop_pct": abs(MAX_LOSS_PCT)*100,
             "big_win_pct": BIG_WIN_PCT*100,
@@ -4628,12 +4833,23 @@ def metrics():
             "enabled": True,
             "detects": ["accumulation", "breakout", "liquidity_grab", "shock"]
         },
+        "micro_scalp_governor": {
+            "enabled": MICRO_SCALP_ENABLED,
+            "max_trades_per_day": MICRO_SCALP_MAX_TRADES_PER_DAY,
+            "sl_pct": MICRO_SCALP_SL_PCT,
+            "tp_pct": MICRO_SCALP_TP_PCT,
+            "cooldown_bars": MICRO_SCALP_COOLDOWN_BARS,
+            "wait_override": MICRO_SCALP_WAIT_OVERRIDE
+        },
         "current_guards": {
             "post_big_win_active": STATE.get("post_big_win_mode", False),
             "post_big_win_bars_left": STATE.get("post_big_win_bars_left", 0),
             "hard_stop_price": STATE.get("max_loss_price"),
             "iron_sl_price": STATE.get("hard_sl"),
-            "last_closed_pnl_pct": STATE.get("last_closed_pnl_pct", 0.0)
+            "micro_sl_price": STATE.get("micro_sl_price"),
+            "last_closed_pnl_pct": STATE.get("last_closed_pnl_pct", 0.0),
+            "micro_scalp_count": STATE.get("micro_scalp_count", 0),
+            "micro_scalp_last_close_ts": STATE.get("micro_scalp_last_close_ts", 0)
         }
     })
 
@@ -4643,11 +4859,16 @@ def health():
         "ok": True, "mode": "live" if MODE_LIVE else "paper",
         "open": STATE["open"], "side": STATE["side"], "qty": STATE["qty"],
         "compound_pnl": compound_pnl, "timestamp": datetime.utcnow().isoformat(),
-        "entry_mode": "COUNCIL_PRO_GOLDEN_ENHANCED_VWAP_OTC_EMA_CHARTPRIME_HUNTER_MARKET_STATE", "wait_for_next_signal": wait_for_next_signal_side,
+        "entry_mode": "COUNCIL_PRO_GOLDEN_ENHANCED_VWAP_OTC_EMA_CHARTPRIME_HUNTER_MARKET_STATE_MICRO_SCALP", "wait_for_next_signal": wait_for_next_signal_side,
         "risk_guards": {
             "hard_stop_active": STATE.get("max_loss_price") is not None,
             "post_big_win_active": STATE.get("post_big_win_mode", False),
-            "iron_sl_active": STATE.get("hard_sl") is not None
+            "iron_sl_active": STATE.get("hard_sl") is not None,
+            "micro_sl_active": STATE.get("micro_sl_price") is not None
+        },
+        "micro_scalp": {
+            "count": STATE.get("micro_scalp_count", 0),
+            "last_close_ts": STATE.get("micro_scalp_last_close_ts", 0)
         }
     }), 200
 
@@ -4692,8 +4913,10 @@ if __name__ == "__main__":
     print(colored(f"🛡️ RISK GUARDS: Hard Stop Loss (-{abs(MAX_LOSS_PCT)*100}%) | Post-Big-Win Guard (+{BIG_WIN_PCT*100}%)", "red"))
     print(colored(f"🎯 HUNTER PATCH: Unified Entry | ADX/ATR Smart Monitor | Iron SL {HARD_SL_TICKS} ticks | Launch Detection", "cyan"))
     print(colored(f"🚀 MARKET STATE ENGINE: Accumulation / Liquidity / Breakout / Shock Detection", "magenta"))
+    print(colored(f"⚡ MICRO SCALP GOVERNOR: {MICRO_SCALP_MAX_TRADES_PER_DAY} trades/day | SL={MICRO_SCALP_SL_PCT}% | TP={MICRO_SCALP_TP_PCT}% | Cooldown={MICRO_SCALP_COOLDOWN_BARS} bars", "cyan"))
     print(colored(f"🔄 AUTO RECOVERY: Enhanced position sync on restart", "green"))
     print(colored(f"🔄 MANUAL CLOSE SYNC: Enabled (detects manual close from exchange)", "green"))
+    print(colored(f"📊 LOG THROTTLE: UI every {LOG_UI_EVERY_S}s | No-trade every {LOG_NO_TRADE_EVERY_S}s", "green"))
     print(colored(f"EXECUTION: {'ACTIVE' if EXECUTE_ORDERS and not DRY_RUN else 'SIMULATION'}", "yellow"))
     
     logging.info("enhanced service starting…")
