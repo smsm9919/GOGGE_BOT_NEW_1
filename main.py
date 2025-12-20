@@ -152,6 +152,27 @@ TIME_STOP_MIN_PNL_PCT = 0.05 # لو لسه أقل من +0.05% بعد TIME_STOP_B
 
 REENTRY_COOLDOWN_BARS = 2
 
+# =================== BOX-FIRST ENTRY (Falcon-style) ===================
+BOX_ENTRY_ENABLED = True
+
+BOX_LOOKBACK = 80              # عدد الشموع اللي بنستخرج منها نطاق البوكس
+BOX_BAND_PCT = 0.12            # عرض البوكس كنسبة من الرينج (12%)
+BOX_TOUCH_BPS = 6              # لازم السعر يلمس/يقرب من البوكس (بالـ bps)
+
+CONFIRM_MIN_BODY_ATR = 0.35    # شمعة تأكيد: جسم >= 0.35 * ATR
+CONFIRM_MIN_VOL_MULT = 1.10    # أو حجم >= 1.10 * MA20
+
+# Council Guard: يمنع فقط الحالات "الخطيرة"
+CHOP_ADX_MAX = 15.0            # لو ADX أقل من كده غالبًا Chop
+CHOP_RSI_BAND = 6.0            # RSI قريب من 50 (+/- 6) = تذبذب ممل
+
+DI_STRONG_GAP = 6.0            # فرق DI قوي ضد اتجاهك = منع
+
+# هدفك 3-5 سكالب يوميًا (من غير سبام)
+MAX_SCALP_TRADES_PER_DAY = 5
+MIN_SCALP_TRADES_HINT = 3      # "Hint" فقط (مش إجبار)
+# ======================================================================
+
 # =================== PROFESSIONAL LOGGING ===================
 def log_i(msg): print(f"ℹ️ {msg}", flush=True)
 def log_g(msg): print(f"✅ {msg}", flush=True)
@@ -286,7 +307,7 @@ def detect_simple_boxes(df, lookback=60):
 
     # عرض صندوق صغير كنسبة من الرينج
     rng = max(hi - lo, 1e-9)
-    band = rng * 0.12  # 12% من الرينج (قابل للضبط)
+    band = rng * BOX_BAND_PCT  # 12% من الرينج (قابل للضبط)
 
     demand = {"low": lo, "high": lo + band}
     supply = {"low": hi - band, "high": hi}
@@ -303,6 +324,127 @@ def detect_simple_boxes(df, lookback=60):
         "in_demand": in_demand,
         "in_supply": in_supply,
     }
+
+# =================== BOX-FIRST ENTRY HELPER FUNCTIONS ===================
+def _day_key_utc():
+    return datetime.utcnow().strftime("%Y-%m-%d")
+
+def reset_daily_scalp_counter():
+    k = _day_key_utc()
+    if STATE.get("day_key") != k:
+        STATE["day_key"] = k
+        STATE["scalp_trades_today"] = 0
+
+def _near_bps(px, level):
+    if not level:
+        return 999999
+    return abs(float(px) - float(level)) / float(level) * 10000.0
+
+def candle_confirmation(df, ind, direction: str) -> (bool, str):
+    """
+    Confirmation بسيط وفعال:
+    - جسم شمعة >= نسبة من ATR
+    - أو حجم >= MA20 * multiplier
+    - ومع اتجاه إغلاق مناسب (bull/bear)
+    """
+    if df is None or len(df) < 25:
+        return False, "no_df"
+
+    last = df.iloc[-1]
+    body = abs(float(last["close"]) - float(last["open"]))
+    atr = float(ind.get("atr", 0.0) or 0.0)
+    if atr <= 0:
+        return False, "no_atr"
+
+    vol = float(last.get("volume", 0.0) or 0.0)
+    vma = float(df["volume"].astype(float).rolling(20).mean().iloc[-1] or 0.0)
+
+    bull_close = float(last["close"]) > float(last["open"])
+    bear_close = float(last["close"]) < float(last["open"])
+
+    body_ok = (body >= CONFIRM_MIN_BODY_ATR * atr)
+    vol_ok = (vma > 0 and vol >= CONFIRM_MIN_VOL_MULT * vma)
+
+    if direction == "buy":
+        if (bull_close and (body_ok or vol_ok)):
+            return True, f"bull_confirm(body_ok={body_ok}, vol_ok={vol_ok})"
+        return False, f"no_bull_confirm(body_ok={body_ok}, vol_ok={vol_ok})"
+
+    if direction == "sell":
+        if (bear_close and (body_ok or vol_ok)):
+            return True, f"bear_confirm(body_ok={body_ok}, vol_ok={vol_ok})"
+        return False, f"no_bear_confirm(body_ok={body_ok}, vol_ok={vol_ok})"
+
+    return False, "bad_dir"
+
+def council_guard_for_box_entry(ind: dict, direction: str) -> (bool, str):
+    """
+    Council هنا مش شرط دخول خانق.
+    هو فقط يمنع الحالات اللي بتعمل خسارة:
+    - Chop واضح
+    - DI قوي ضدك (ترند عكسي قوي)
+    """
+    adx = float(ind.get("adx", 0.0) or 0.0)
+    rsi = float(ind.get("rsi", 50.0) or 50.0)
+    di_p = float(ind.get("plus_di", 0.0) or 0.0)
+    di_m = float(ind.get("minus_di", 0.0) or 0.0)
+
+    # Chop filter
+    if adx <= CHOP_ADX_MAX and abs(rsi - 50.0) <= CHOP_RSI_BAND:
+        return False, f"chop(adx={adx:.1f}, rsi={rsi:.1f})"
+
+    # Strong DI against direction
+    if direction == "buy" and (di_m - di_p) >= DI_STRONG_GAP and adx >= 18:
+        return False, f"di_against_buy(di- {di_m:.1f} > di+ {di_p:.1f})"
+    if direction == "sell" and (di_p - di_m) >= DI_STRONG_GAP and adx >= 18:
+        return False, f"di_against_sell(di+ {di_p:.1f} > di- {di_m:.1f})"
+
+    return True, "ok"
+
+def box_first_signal(df, ind, px: float) -> (str, str):
+    """
+    Box-First:
+    - Buy من demand + confirmation
+    - Sell من supply + confirmation
+    """
+    if not BOX_ENTRY_ENABLED:
+        return None, "box_entry_disabled"
+
+    boxes = detect_simple_boxes(df, lookback=BOX_LOOKBACK)
+    if not boxes.get("ok"):
+        return None, "no_boxes"
+
+    demand = boxes.get("demand") or {}
+    supply = boxes.get("supply") or {}
+
+    d_low, d_high = float(demand.get("low", 0)), float(demand.get("high", 0))
+    s_low, s_high = float(supply.get("low", 0)), float(supply.get("high", 0))
+
+    # قرب السعر من حدود البوكس (Touch)
+    near_d = (_near_bps(px, d_high) <= BOX_TOUCH_BPS) or (d_low <= px <= d_high)
+    near_s = (_near_bps(px, s_low)  <= BOX_TOUCH_BPS) or (s_low <= px <= s_high)
+
+    # Buy from demand
+    if near_d:
+        ok, why = candle_confirmation(df, ind, "buy")
+        if not ok:
+            return None, f"demand_touch_no_confirm({why})"
+        allow, guard = council_guard_for_box_entry(ind, "buy")
+        if not allow:
+            return None, f"demand_blocked({guard})"
+        return "buy", "BOX_DEMAND+CONFIRM"
+
+    # Sell from supply
+    if near_s:
+        ok, why = candle_confirmation(df, ind, "sell")
+        if not ok:
+            return None, f"supply_touch_no_confirm({why})"
+        allow, guard = council_guard_for_box_entry(ind, "sell")
+        if not allow:
+            return None, f"supply_blocked({guard})"
+        return "sell", "BOX_SUPPLY+CONFIRM"
+
+    return None, "no_box_touch"
 
 # =================== FALCON: TP PLAN ===================
 def falcon_plan(entry_px: float, side: str, mode: str, atr: float):
@@ -1031,6 +1173,16 @@ def open_market_enhanced(side, qty, price):
             "trail_tightened": False,
         })
         
+        # ===== Scalp count (Box-first entries تعتبر scalp افتراضيًا) =====
+        try:
+            # لو وضعك الحالي بيخزن mode في STATE، استخدمه. لو لا: اعتبرها scalp
+            mode_now = STATE.get("falcon_mode") or STATE.get("mode") or "scalp"
+            if mode_now == "scalp":
+                STATE["scalp_trades_today"] = int(STATE.get("scalp_trades_today", 0)) + 1
+                log_i(f"📌 SCALP COUNT TODAY = {STATE['scalp_trades_today']}/{MAX_SCALP_TRADES_PER_DAY}")
+        except Exception:
+            pass
+        
         log_g(f"✅ POSITION OPENED: {side.upper()} | mode={mode}")
         return True
     
@@ -1114,6 +1266,8 @@ STATE = {
     "tp1_done": False, "highest_profit_pct": 0.0,
     "profit_targets_achieved": 0,
     "cooldown_until_ts": 0,
+    "day_key": "",
+    "scalp_trades_today": 0,
 }
 compound_pnl = 0.0
 wait_for_next_signal_side = None
@@ -1252,6 +1406,29 @@ def manage_after_entry_enhanced(df, ind, info):
 
     snap = emit_snapshots(ex, SYMBOL, df)
     gz = snap["gz"]
+    
+    # ===== Box invalidation (super cut) =====
+    try:
+        boxes = detect_simple_boxes(df, lookback=BOX_LOOKBACK)
+        if boxes.get("ok"):
+            d = boxes.get("demand") or {}
+            s = boxes.get("supply") or {}
+            d_low = float(d.get("low", 0))
+            s_high = float(s.get("high", 0))
+
+            # لو LONG وكسر قاع الديماند بشكل واضح → خروج فوري
+            if side == "long" and d_low and px < d_low:
+                log_w("🧱 INVALIDATION | broke DEMAND low → EXIT BUY")
+                close_market_strict("box_invalidation_long")
+                return
+
+            # لو SHORT وكسر سقف السابلای → خروج فوري
+            if side == "short" and s_high and px > s_high:
+                log_w("🧱 INVALIDATION | broke SUPPLY high → EXIT SELL")
+                close_market_strict("box_invalidation_short")
+                return
+    except Exception:
+        pass
     
     # =================== FALCON BOXES (for EXIT like images) ===================
     boxes = detect_simple_boxes(df, lookback=60)
@@ -1537,6 +1714,21 @@ def trade_loop_enhanced():
             council_data = council_votes_pro_enhanced(df)
             gz = council_data.get("gz")
             sig = None
+
+            # ===== Daily reset for scalp count =====
+            reset_daily_scalp_counter()
+
+            # ===== Box-First signal =====
+            sig_box, why_box = box_first_signal(df, ind, float(px or info.get("price") or 0))
+            if sig_box:
+                # منع سبام السكالب: cap يومي
+                if STATE.get("scalp_trades_today", 0) >= MAX_SCALP_TRADES_PER_DAY:
+                    sig = None
+                    reason = f"daily_scalp_cap({STATE['scalp_trades_today']}/{MAX_SCALP_TRADES_PER_DAY})"
+                else:
+                    sig = sig_box
+                    reason = None
+                    log_i(f"📦 BOX-FIRST {sig.upper()} | {why_box} | scalp_count={STATE.get('scalp_trades_today',0)}/{MAX_SCALP_TRADES_PER_DAY}")
 
             # --- Golden Entry Override ---
             if (gz and gz.get("ok") and ind.get("adx",0) >= GOLDEN_ENTRY_ADX):
