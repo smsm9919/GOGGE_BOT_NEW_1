@@ -7,6 +7,7 @@ RF Futures Bot — RF-LIVE ONLY (BingX Perp via CCXT)
 • Smart Exit Management + Wait-for-next-signal
 • Professional Logging & Dashboard
 • FALCON STYLE ADDON: TP1/TP2/TP3 + Early Exit + Box Detector
+• TREND BIRTH ENGINE: Liquidity Sweep → BOS/CHoCH → Momentum Flip → Displacement → OB/FVG → Retest → Entry
 """
 
 import os, time, math, random, signal, sys, traceback, logging, json
@@ -41,7 +42,7 @@ SHADOW_MODE_DASHBOARD = False
 DRY_RUN = False
 
 # ==== Addon: Logging + Recovery Settings ====
-BOT_VERSION = "DOGE Council PRO v4.0 — Candles + Golden System + FALCON STYLE"
+BOT_VERSION = "DOGE Council PRO v5.0 — Trend Birth Engine + Box-First + FALCON STYLE"
 print("🔁 Booting:", BOT_VERSION, flush=True)
 
 STATE_PATH = "./bot_state.json"
@@ -152,6 +153,11 @@ TIME_STOP_MIN_PNL_PCT = 0.05 # لو لسه أقل من +0.05% بعد TIME_STOP_B
 
 REENTRY_COOLDOWN_BARS = 2
 
+# ===== SCALP TARGET BOOST (higher TP for scalps) =====
+SCALP_TP1_BOOST_PCT = 0.65   # بدل 0.40 مثلاً
+SCALP_TP2_BOOST_PCT = 1.10
+SCALP_TP3_BOOST_PCT = 1.80
+
 # =================== BOX-FIRST ENTRY (Falcon-style) ===================
 BOX_ENTRY_ENABLED = True
 
@@ -171,7 +177,50 @@ DI_STRONG_GAP = 6.0            # فرق DI قوي ضد اتجاهك = منع
 # هدفك 3-5 سكالب يوميًا (من غير سبام)
 MAX_SCALP_TRADES_PER_DAY = 5
 MIN_SCALP_TRADES_HINT = 3      # "Hint" فقط (مش إجبار)
-# ======================================================================
+
+# =================== TREND BIRTH ENGINE v1 (FINAL WITH DISPLACEMENT) ===================
+TBE_ENABLED = True
+TBE_SWEEP_LOOKBACK = 25
+TBE_SWEEP_WICK_MIN = 0.50
+TBE_SHIFT_SWING_W = 3
+TBE_ADX_MIN = 18.0
+TBE_DI_GAP_MIN = 4.0
+TBE_RSI_MID = 50.0
+TBE_RSI_FLIP_MARGIN = 2.0
+TBE_OB_DISPLACE_ATR = 1.2
+TBE_RETEST_PAD_PCT = 0.15
+TBE_DISPLACE_ATR_MULT = 1.6      # ✅ بوابة الاندفاع
+TBE_DISPLACE_LOOKBACK = 6        # ✅ نبحث عن شمعة اندفاع خلال آخر 6 شموع
+# =====================================================================================
+
+# =================== FLOW PRESSURE MODULE (CCXT) ===================
+FLOW_ENABLED = True
+FLOW_TRADES_LIMIT = 200          # عدد الصفقات الأخيرة
+FLOW_ORDERBOOK_DEPTH = 20        # عمق الأوامر
+FLOW_WALL_MULT = 3.0             # wall = أكبر من متوسط * 3
+FLOW_DELTA_MIN = 0.12            # حد أدنى delta_ratio
+FLOW_OBI_MIN = 0.10              # حد أدنى imbalance
+FLOW_CACHE_S = 2                 # كاش ثانيتين لتخفيف ضغط API
+
+# =================== SCALP PRO (HUNT ENTRY) ===================
+SCALP_PRO_ENABLED = True
+
+SCALP_BOX_LOOKBACK = 90
+SCALP_TOUCH_BPS = 10
+
+SCALP_REQUIRE_SWEEP = True
+SCALP_SWEEP_LOOKBACK = 20
+SCALP_SWEEP_WICK_MIN = 0.45
+
+SCALP_DISPLACE_ATR_MULT = 1.2   # أصغر من Trend Birth (1.6)
+SCALP_DISPLACE_LOOKBACK = 6
+
+SCALP_RETEST_PAD_PCT = 0.20
+SCALP_MIN_ROOM_BPS = 45         # لازم مساحة للربح لحد البوكس المعاكس
+
+SCALP_CHOP_ADX_MAX = 15.0
+SCALP_CHOP_RSI_BAND = 5.0
+# ==============================================================
 
 # =================== PROFESSIONAL LOGGING ===================
 def log_i(msg): print(f"ℹ️ {msg}", flush=True)
@@ -446,6 +495,273 @@ def box_first_signal(df, ind, px: float) -> (str, str):
 
     return None, "no_box_touch"
 
+# =================== TREND BIRTH ENGINE v1 FUNCTIONS ===================
+def tbe_wick_ratios(o,h,l,c):
+    rng  = max(h-l, 1e-9)
+    upper = h - max(o,c)
+    lower = min(o,c) - l
+    body  = abs(c-o)
+    return upper/rng, lower/rng, body/rng
+
+def tbe_find_swings(df, w=3):
+    highs = df["high"].astype(float).values
+    lows  = df["low"].astype(float).values
+    sh, sl = [], []
+    for i in range(w, len(df)-w):
+        if highs[i] == max(highs[i-w:i+w+1]):
+            sh.append((i, highs[i]))
+        if lows[i] == min(lows[i-w:i+w+1]):
+            sl.append((i, lows[i]))
+    return sh, sl
+
+def tbe_in_zone(px, zone, pad_pct=0.15):
+    if not zone:
+        return False
+    lo, hi = float(zone["low"]), float(zone["high"])
+    pad = (hi - lo) * pad_pct
+    return (lo - pad) <= float(px) <= (hi + pad)
+
+def tbe_detect_sweep_low(df, lookback=25, wick_min=0.50):
+    if len(df) < lookback + 2:
+        return False, {}
+    last = df.iloc[-1]
+    prev_low = float(df["low"].astype(float).iloc[-lookback-1:-1].min())
+    o,h,l,c = map(float, (last.open, last.high, last.low, last.close))
+    uw,lw,br = tbe_wick_ratios(o,h,l,c)
+    ok = (l < prev_low) and (c > prev_low) and (lw >= wick_min)
+    return ok, {"prev_low": prev_low, "lw": lw}
+
+def tbe_detect_sweep_high(df, lookback=25, wick_min=0.50):
+    if len(df) < lookback + 2:
+        return False, {}
+    last = df.iloc[-1]
+    prev_high = float(df["high"].astype(float).iloc[-lookback-1:-1].max())
+    o,h,l,c = map(float, (last.open, last.high, last.low, last.close))
+    uw,lw,br = tbe_wick_ratios(o,h,l,c)
+    ok = (h > prev_high) and (c < prev_high) and (uw >= wick_min)
+    return ok, {"prev_high": prev_high, "uw": uw}
+
+def tbe_detect_shift_up(df, w=3):
+    sh, sl = tbe_find_swings(df, w=w)
+    if not sh:
+        return False, {}
+    last_swing_high = float(sh[-1][1])
+    c = float(df["close"].astype(float).iloc[-1])
+    return (c > last_swing_high), {"swing_high": last_swing_high}
+
+def tbe_detect_shift_down(df, w=3):
+    sh, sl = tbe_find_swings(df, w=w)
+    if not sl:
+        return False, {}
+    last_swing_low = float(sl[-1][1])
+    c = float(df["close"].astype(float).iloc[-1])
+    return (c < last_swing_low), {"swing_low": last_swing_low}
+
+def tbe_momentum_flip_buy(ind, flow=None):
+    adx  = float(ind.get("adx",0) or 0)
+    di_p = float(ind.get("plus_di",0) or 0)
+    di_m = float(ind.get("minus_di",0) or 0)
+    rsi  = float(ind.get("rsi",50) or 50)
+    if adx < TBE_ADX_MIN: return False, f"adx<{TBE_ADX_MIN}"
+    if (di_p - di_m) < TBE_DI_GAP_MIN: return False, f"di_gap<{TBE_DI_GAP_MIN}"
+    if rsi < (TBE_RSI_MID + TBE_RSI_FLIP_MARGIN): return False, "rsi_not_bullish_flip"
+    
+    # ✅ FLOW PRESSURE CHECK
+    if flow and flow.get("ok"):
+        dr = float(flow["delta"]["delta_ratio"])
+        obi = float(flow["obi"]["obi"])
+        if dr < FLOW_DELTA_MIN or obi < FLOW_OBI_MIN:
+            return False, f"flow_weak(delta_ratio={dr:.2f}, obi={obi:.2f})"
+    return True, "mom_flip_ok"
+
+def tbe_momentum_flip_sell(ind, flow=None):
+    adx  = float(ind.get("adx",0) or 0)
+    di_p = float(ind.get("plus_di",0) or 0)
+    di_m = float(ind.get("minus_di",0) or 0)
+    rsi  = float(ind.get("rsi",50) or 50)
+    if adx < TBE_ADX_MIN: return False, f"adx<{TBE_ADX_MIN}"
+    if (di_m - di_p) < TBE_DI_GAP_MIN: return False, f"di_gap<{TBE_DI_GAP_MIN}"
+    if rsi > (TBE_RSI_MID - TBE_RSI_FLIP_MARGIN): return False, "rsi_not_bearish_flip"
+    
+    # ✅ FLOW PRESSURE CHECK
+    if flow and flow.get("ok"):
+        dr = float(flow["delta"]["delta_ratio"])
+        obi = float(flow["obi"]["obi"])
+        # للـ sell نريد delta سلبي و OBI سلبي
+        if dr > -FLOW_DELTA_MIN or obi > -FLOW_OBI_MIN:
+            return False, f"flow_weak(delta_ratio={dr:.2f}, obi={obi:.2f})"
+    return True, "mom_flip_ok"
+
+def tbe_detect_bullish_fvg(df):
+    if len(df) < 4: return False, {}
+    a = df.iloc[-3]
+    c = df.iloc[-1]
+    a_low  = float(a.low)
+    c_high = float(c.high)
+    ok = a_low > c_high
+    if not ok: return False, {}
+    return True, {"low": c_high, "high": a_low}
+
+def tbe_detect_bearish_fvg(df):
+    if len(df) < 4: return False, {}
+    a = df.iloc[-3]
+    c = df.iloc[-1]
+    a_high = float(a.high)
+    c_low  = float(c.low)
+    ok = a_high < c_low
+    if not ok: return False, {}
+    return True, {"low": a_high, "high": c_low}
+
+def tbe_detect_bullish_ob(df, ind):
+    if len(df) < 10: return False, {}
+    atr = float(ind.get("atr",0) or 0)
+    if atr <= 0: return False, {}
+    # آخر شمعة حمراء قبل اندفاع صاعد قوي
+    for k in range(2, 8):
+        b   = df.iloc[-k]
+        nxt = df.iloc[-k+1]
+        if float(b.close) < float(b.open):  # bearish candle
+            body = abs(float(nxt.close) - float(nxt.open))
+            if float(nxt.close) > float(nxt.open) and body >= (TBE_OB_DISPLACE_ATR * atr):
+                lo = min(float(b.open), float(b.close))
+                hi = max(float(b.open), float(b.close))
+                return True, {"low": lo, "high": hi, "k": k}
+    return False, {}
+
+def tbe_detect_bearish_ob(df, ind):
+    if len(df) < 10: return False, {}
+    atr = float(ind.get("atr",0) or 0)
+    if atr <= 0: return False, {}
+    # آخر شمعة خضراء قبل اندفاع هابط قوي
+    for k in range(2, 8):
+        b   = df.iloc[-k]
+        nxt = df.iloc[-k+1]
+        if float(b.close) > float(b.open):  # bullish candle
+            body = abs(float(nxt.close) - float(nxt.open))
+            if float(nxt.close) < float(nxt.open) and body >= (TBE_OB_DISPLACE_ATR * atr):
+                lo = min(float(b.open), float(b.close))
+                hi = max(float(b.open), float(b.close))
+                return True, {"low": lo, "high": hi, "k": k}
+    return False, {}
+
+def tbe_displacement_ok(df, ind, side, lookback=6, mult=1.6):
+    """
+    Displacement Gate: شمعة اندفاع قوية (جسم كبير مقارنة بالـ ATR)
+    - للـ BUY: شمعة صاعدة قوية (جسم >= mult * ATR)
+    - للـ SELL: شمعة هابطة قوية (جسم >= mult * ATR)
+    """
+    atr = float(ind.get("atr", 0) or 0)
+    if atr <= 0 or len(df) < lookback + 2:
+        return False, {"why": "no_atr_or_not_enough_bars"}
+
+    tail = df.tail(lookback).copy()
+    for idx, row in tail.iterrows():
+        o = float(row.open); c = float(row.close)
+        body = abs(c - o)
+        if body < (mult * atr):
+            continue
+
+        # اتجاه الاندفاع
+        if side == "buy" and c > o:
+            return True, {"body": body, "atr": atr, "mult": mult, "dir": "bull", "idx": idx}
+        if side == "sell" and c < o:
+            return True, {"body": body, "atr": atr, "mult": mult, "dir": "bear", "idx": idx}
+
+    return False, {"why": "no_displacement", "atr": atr, "mult": mult}
+
+def trend_birth_buy_signal(df, ind, px, flow=None):
+    """✅ الترتيب العلمي: Sweep → Shift → Momentum → Displacement → OB/FVG → Retest → Entry"""
+    if not TBE_ENABLED: 
+        return None, "tbe_disabled"
+    
+    # 1) Liquidity Sweep (Low)
+    ok_sweep, sweep_data = tbe_detect_sweep_low(df, TBE_SWEEP_LOOKBACK, TBE_SWEEP_WICK_MIN)
+    if not ok_sweep: 
+        return None, "no_sweep_low"
+    
+    # 2) Structure Shift (BOS/CHoCH)
+    ok_shift, shift_data = tbe_detect_shift_up(df, TBE_SHIFT_SWING_W)
+    if not ok_shift: 
+        return None, "no_structure_shift_up"
+    
+    # 3) Momentum Flip
+    ok_mom, why_mom = tbe_momentum_flip_buy(ind, flow)
+    if not ok_mom: 
+        return None, f"no_momentum_flip({why_mom})"
+    
+    # ✅ 4) DISPLACEMENT GATE (شمعة اندفاع مؤسسي) — هنا بالضبط
+    ok_disp, disp_data = tbe_displacement_ok(df, ind, "buy", 
+                                           lookback=TBE_DISPLACE_LOOKBACK, 
+                                           mult=TBE_DISPLACE_ATR_MULT)
+    if not ok_disp:
+        return None, f"no_displacement({disp_data.get('why','')})"
+    
+    # 5) OB/FVG (Order Block / Fair Value Gap)
+    ok_ob, ob = tbe_detect_bullish_ob(df, ind)
+    ok_fvg, fvg = tbe_detect_bullish_fvg(df)
+    
+    zone, ztag = (ob, "OB") if ok_ob else ((fvg, "FVG") if ok_fvg else (None, None))
+    if not zone: 
+        return None, "no_ob_or_fvg"
+    
+    # 6) Retest (مع مساحة صغيرة)
+    if not tbe_in_zone(px, zone, TBE_RETEST_PAD_PCT): 
+        return None, f"waiting_retest_{ztag}"
+    
+    # 7) Confirmation Candle
+    ok_conf, cwhy = candle_confirmation(df, ind, "buy")
+    if not ok_conf: 
+        return None, f"retest_no_confirm({cwhy})"
+    
+    # ✅ الإشارة جاهزة
+    return "buy", f"TBE_BUY sweep→shift↑→mom→DISP({disp_data.get('dir')}@{disp_data.get('body'):.3f})→retest_{ztag}→confirm"
+
+def trend_birth_sell_signal(df, ind, px, flow=None):
+    """✅ نفس الترتيب للـ SELL"""
+    if not TBE_ENABLED: 
+        return None, "tbe_disabled"
+    
+    # 1) Liquidity Sweep (High)
+    ok_sweep, sweep_data = tbe_detect_sweep_high(df, TBE_SWEEP_LOOKBACK, TBE_SWEEP_WICK_MIN)
+    if not ok_sweep: 
+        return None, "no_sweep_high"
+    
+    # 2) Structure Shift Down
+    ok_shift, shift_data = tbe_detect_shift_down(df, TBE_SHIFT_SWING_W)
+    if not ok_shift: 
+        return None, "no_structure_shift_down"
+    
+    # 3) Momentum Flip
+    ok_mom, why_mom = tbe_momentum_flip_sell(ind, flow)
+    if not ok_mom: 
+        return None, f"no_momentum_flip({why_mom})"
+    
+    # ✅ 4) DISPLACEMENT GATE
+    ok_disp, disp_data = tbe_displacement_ok(df, ind, "sell", 
+                                           lookback=TBE_DISPLACE_LOOKBACK, 
+                                           mult=TBE_DISPLACE_ATR_MULT)
+    if not ok_disp:
+        return None, f"no_displacement({disp_data.get('why','')})"
+    
+    # 5) OB/FVG
+    ok_ob, ob = tbe_detect_bearish_ob(df, ind)
+    ok_fvg, fvg = tbe_detect_bearish_fvg(df)
+    
+    zone, ztag = (ob, "OB") if ok_ob else ((fvg, "FVG") if ok_fvg else (None, None))
+    if not zone: 
+        return None, "no_ob_or_fvg"
+    
+    # 6) Retest
+    if not tbe_in_zone(px, zone, TBE_RETEST_PAD_PCT): 
+        return None, f"waiting_retest_{ztag}"
+    
+    # 7) Confirmation
+    ok_conf, cwhy = candle_confirmation(df, ind, "sell")
+    if not ok_conf: 
+        return None, f"retest_no_confirm({cwhy})"
+    
+    return "sell", f"TBE_SELL sweep→shift↓→mom→DISP({disp_data.get('dir')}@{disp_data.get('body'):.3f})→retest_{ztag}→confirm"
+
 # =================== FALCON: TP PLAN ===================
 def falcon_plan(entry_px: float, side: str, mode: str, atr: float):
     atr = float(atr or 0.0)
@@ -453,8 +769,16 @@ def falcon_plan(entry_px: float, side: str, mode: str, atr: float):
         atr = entry_px * 0.002  # fallback 0.2%
 
     if mode == "scalp":
-        tp1 = entry_px * (1 + SCALP_TP1/100.0) if side == "long" else entry_px * (1 - SCALP_TP1/100.0)
-        return {"tp1": tp1, "tp2": None, "tp3": None}
+        # ✅ استخدام أهداف أعلى للسكالب
+        if side == "long":
+            tp1 = entry_px * (1 + SCALP_TP1_BOOST_PCT/100.0)
+            tp2 = entry_px * (1 + SCALP_TP2_BOOST_PCT/100.0)
+            tp3 = entry_px * (1 + SCALP_TP3_BOOST_PCT/100.0)
+        else:
+            tp1 = entry_px * (1 - SCALP_TP1_BOOST_PCT/100.0)
+            tp2 = entry_px * (1 - SCALP_TP2_BOOST_PCT/100.0)
+            tp3 = entry_px * (1 - SCALP_TP3_BOOST_PCT/100.0)
+        return {"tp1": tp1, "tp2": tp2, "tp3": tp3}
 
     # trend
     tp1 = entry_px * (1 + TREND_TP1/100.0) if side == "long" else entry_px * (1 - TREND_TP1/100.0)
@@ -470,6 +794,7 @@ def verify_execution_environment():
     print(f"🎯 GOLDEN ENTRY: score={GOLDEN_ENTRY_SCORE} | ADX={GOLDEN_ENTRY_ADX}", flush=True)
     print(f"📈 CANDLES: Full patterns + Wick exhaustion + Golden reversal", flush=True)
     print(f"🦅 FALCON STYLE: TP1/2/3 + Box Exit + Early Fail", flush=True)
+    print(f"🚀 TREND BIRTH ENGINE: Liquidity Sweep → BOS/CHoCH → Momentum → Displacement → OB/FVG → Retest", flush=True)
     
     if not EXECUTE_ORDERS:
         print("🟡 WARNING: EXECUTE_ORDERS=False - البوت في وضع التحليل فقط!", flush=True)
@@ -967,6 +1292,234 @@ def compute_flow_metrics(df):
     except Exception as e:
         return {"ok": False, "why": str(e)}
 
+# =================== FLOW PRESSURE MODULE ===================
+_FLOW_CACHE = {"ts": 0, "data": None}
+
+def _now():
+    return time.time()
+
+def safe_fetch_trades(symbol, limit=200):
+    try:
+        return ex.fetch_trades(symbol, limit=limit)
+    except Exception as e:
+        logging.warning(f"fetch_trades failed: {e}")
+        return []
+
+def safe_fetch_order_book(symbol, limit=20):
+    try:
+        return ex.fetch_order_book(symbol, limit=limit)
+    except Exception as e:
+        logging.warning(f"fetch_order_book failed: {e}")
+        return {"bids": [], "asks": []}
+
+def compute_delta_from_trades(trades):
+    """
+    delta = buy_qty - sell_qty
+    delta_ratio = delta / total_qty
+    """
+    buy_qty = 0.0
+    sell_qty = 0.0
+    for t in trades or []:
+        amt = float(t.get("amount") or 0.0)
+        side = (t.get("side") or "").lower()
+        if side == "buy":
+            buy_qty += amt
+        elif side == "sell":
+            sell_qty += amt
+    total = buy_qty + sell_qty
+    delta = buy_qty - sell_qty
+    delta_ratio = (delta / total) if total > 0 else 0.0
+    return {
+        "buy_qty": buy_qty,
+        "sell_qty": sell_qty,
+        "delta": delta,
+        "delta_ratio": delta_ratio,
+        "total_qty": total
+    }
+
+def compute_obi_and_walls(ob, depth=20):
+    bids = (ob.get("bids") or [])[:depth]
+    asks = (ob.get("asks") or [])[:depth]
+
+    bid_qty = sum(float(x[1]) for x in bids) if bids else 0.0
+    ask_qty = sum(float(x[1]) for x in asks) if asks else 0.0
+    denom = (bid_qty + ask_qty)
+    obi = ((bid_qty - ask_qty) / denom) if denom > 0 else 0.0
+
+    # Walls: أكبر مستوى حجم مقارنة بالمتوسط
+    bid_sizes = [float(x[1]) for x in bids] or [0.0]
+    ask_sizes = [float(x[1]) for x in asks] or [0.0]
+    bid_avg = (sum(bid_sizes) / len(bid_sizes)) if bid_sizes else 0.0
+    ask_avg = (sum(ask_sizes) / len(ask_sizes)) if ask_sizes else 0.0
+    bid_max = max(bid_sizes) if bid_sizes else 0.0
+    ask_max = max(ask_sizes) if ask_sizes else 0.0
+
+    bid_wall = (bid_avg > 0 and bid_max >= FLOW_WALL_MULT * bid_avg)
+    ask_wall = (ask_avg > 0 and ask_max >= FLOW_WALL_MULT * ask_avg)
+
+    return {
+        "bid_qty": bid_qty,
+        "ask_qty": ask_qty,
+        "obi": obi,
+        "bid_wall": bid_wall,
+        "ask_wall": ask_wall,
+        "bid_max": bid_max,
+        "ask_max": ask_max,
+        "bid_avg": bid_avg,
+        "ask_avg": ask_avg,
+    }
+
+def flow_pressure_snapshot(symbol):
+    if not FLOW_ENABLED:
+        return {"ok": False, "why": "disabled"}
+
+    # cache لتقليل ضربات API
+    if _FLOW_CACHE["data"] and (_now() - _FLOW_CACHE["ts"] < FLOW_CACHE_S):
+        return _FLOW_CACHE["data"]
+
+    trades = safe_fetch_trades(symbol, limit=FLOW_TRADES_LIMIT)
+    ob = safe_fetch_order_book(symbol, limit=FLOW_ORDERBOOK_DEPTH)
+
+    delta = compute_delta_from_trades(trades)
+    obi = compute_obi_and_walls(ob, depth=FLOW_ORDERBOOK_DEPTH)
+
+    data = {
+        "ok": True,
+        "delta": delta,
+        "obi": obi
+    }
+    _FLOW_CACHE["ts"] = _now()
+    _FLOW_CACHE["data"] = data
+    return data
+
+# =================== SCALP PRO ENGINE FUNCTIONS ===================
+def scalp_detect_micro_sweep(df, direction, lookback=20, wick_min=0.45):
+    if len(df) < lookback + 2:
+        return False, "insufficient_data"
+    
+    if direction == "buy":
+        prev_low = float(df["low"].astype(float).iloc[-lookback-1:-1].min())
+        last = df.iloc[-1]
+        o,h,l,c = map(float, (last.open, last.high, last.low, last.close))
+        uw,lw,br = tbe_wick_ratios(o,h,l,c)
+        ok = (l < prev_low) and (c > prev_low) and (lw >= wick_min)
+        return ok, f"micro_sweep_low(prev_low={prev_low}, lw={lw:.2f})"
+    else:  # sell
+        prev_high = float(df["high"].astype(float).iloc[-lookback-1:-1].max())
+        last = df.iloc[-1]
+        o,h,l,c = map(float, (last.open, last.high, last.low, last.close))
+        uw,lw,br = tbe_wick_ratios(o,h,l,c)
+        ok = (h > prev_high) and (c < prev_high) and (uw >= wick_min)
+        return ok, f"micro_sweep_high(prev_high={prev_high}, uw={uw:.2f})"
+
+def scalp_displacement_ok(df, ind, direction, lookback=6, mult=1.2):
+    atr = float(ind.get("atr", 0) or 0)
+    if atr <= 0 or len(df) < lookback + 2:
+        return False, "no_atr"
+
+    tail = df.tail(lookback)
+    for _, row in tail.iterrows():
+        o = float(row.open); c = float(row.close)
+        body = abs(c - o)
+        if body < mult * atr:
+            continue
+        if direction == "buy" and c > o:
+            return True, f"disp_ok(body={body:.6f} atr={atr:.6f})"
+        if direction == "sell" and c < o:
+            return True, f"disp_ok(body={body:.6f} atr={atr:.6f})"
+    return False, "no_displacement"
+
+def scalp_room_ok(px, boxes, direction, min_room_bps=45):
+    if not boxes.get("ok"):
+        return False, "no_boxes"
+    
+    px_f = float(px)
+    if direction == "buy":
+        supply_high = float(boxes.get("supply", {}).get("high", 0))
+        if supply_high <= 0: return True, "no_supply_defined"
+        room_bps = ((supply_high - px_f) / px_f) * 10000.0
+        if room_bps >= min_room_bps:
+            return True, f"room_to_supply={room_bps:.0f}bps"
+        return False, f"room_to_supply={room_bps:.0f}bps"
+    else:  # sell
+        demand_low = float(boxes.get("demand", {}).get("low", 0))
+        if demand_low <= 0: return True, "no_demand_defined"
+        room_bps = ((px_f - demand_low) / px_f) * 10000.0
+        if room_bps >= min_room_bps:
+            return True, f"room_to_demand={room_bps:.0f}bps"
+        return False, f"room_to_demand={room_bps:.0f}bps"
+
+def scalp_chop_guard(ind):
+    adx = float(ind.get("adx", 0.0) or 0.0)
+    rsi = float(ind.get("rsi", 50.0) or 50.0)
+    
+    if adx <= SCALP_CHOP_ADX_MAX and abs(rsi - 50.0) <= SCALP_CHOP_RSI_BAND:
+        return False, f"chop(adx={adx:.1f}, rsi={rsi:.1f})"
+    return True, "ok"
+
+def scalp_pro_signal(df, ind, px):
+    if not SCALP_PRO_ENABLED:
+        return None, "disabled"
+
+    boxes = detect_simple_boxes(df, lookback=SCALP_BOX_LOOKBACK)
+    if not boxes.get("ok"):
+        return None, "no_boxes"
+
+    # 1) chop guard
+    ok_chop, why_chop = scalp_chop_guard(ind)
+    if not ok_chop:
+        return None, f"chop_block({why_chop})"
+
+    # 2) تحديد اتجاه السكالب حسب لمس البوكس
+    side = None
+    if boxes.get("in_demand"):
+        side = "buy"
+    elif boxes.get("in_supply"):
+        side = "sell"
+    else:
+        return None, "no_touch_box"
+
+    # 3) لازم room كفاية للبوكس المعاكس
+    ok_room, why_room = scalp_room_ok(float(px), boxes, side, SCALP_MIN_ROOM_BPS)
+    if not ok_room:
+        return None, f"no_room({why_room})"
+
+    # 4) micro sweep (إلزامي هنا)
+    if SCALP_REQUIRE_SWEEP:
+        ok_sw, why_sw = scalp_detect_micro_sweep(df, side, SCALP_SWEEP_LOOKBACK, SCALP_SWEEP_WICK_MIN)
+        if not ok_sw:
+            return None, f"no_sweep({why_sw})"
+
+    # 5) displacement صغير (إلزامي)
+    ok_disp, why_disp = scalp_displacement_ok(df, ind, side, SCALP_DISPLACE_LOOKBACK, SCALP_DISPLACE_ATR_MULT)
+    if not ok_disp:
+        return None, f"no_displacement({why_disp})"
+
+    # 6) retest zone (OB/FVG)
+    zone = None; ztag = None
+    if side == "buy":
+        ok_ob, ob = tbe_detect_bullish_ob(df, ind)
+        ok_fvg, fvg = tbe_detect_bullish_fvg(df)
+        if ok_ob: zone, ztag = ob, "OB"
+        elif ok_fvg: zone, ztag = fvg, "FVG"
+    else:
+        ok_ob, ob = tbe_detect_bearish_ob(df, ind)
+        ok_fvg, fvg = tbe_detect_bearish_fvg(df)
+        if ok_ob: zone, ztag = ob, "OB"
+        elif ok_fvg: zone, ztag = fvg, "FVG"
+    
+    if zone:
+        if not tbe_in_zone(float(px), zone, pad_pct=SCALP_RETEST_PAD_PCT):
+            return None, f"waiting_retest_{ztag}"
+    # لو مفيش OB/FVG نكتفي ببوكس نفسه (لأنه touch already)
+
+    # 7) confirmation candle (إلزامي)
+    ok_conf, why_conf = candle_confirmation(df, ind, side)
+    if not ok_conf:
+        return None, f"no_confirm({why_conf})"
+
+    return side, f"SCALP_PRO {side} | room={why_room} | {why_disp} | retest={ztag or 'BOX'} | conf={why_conf}"
+
 # ========= Unified snapshot emitter =========
 def emit_snapshots(exchange, symbol, df, balance_fn=None, pnl_fn=None):
     """
@@ -978,6 +1531,9 @@ def emit_snapshots(exchange, symbol, df, balance_fn=None, pnl_fn=None):
         cv = council_votes_pro(df)
         mode = decide_strategy_mode(df)
         gz = golden_zone_check(df, {"adx": cv["ind"]["adx"]}, "buy" if cv["b"]>=cv["s"] else "sell")
+        
+        # ✅ FLOW PRESSURE ADDON
+        pressure = flow_pressure_snapshot(symbol)
 
         bal = None; cpnl = None
         if callable(balance_fn):
@@ -999,6 +1555,15 @@ def emit_snapshots(exchange, symbol, df, balance_fn=None, pnl_fn=None):
             fl_note = f"Flow: {dtag} Δ={flow['delta_last']:.0f} z={flow['delta_z']:.2f}{spk} | CVD {'↗️' if flow['cvd_trend']=='up' else '↘️'} {flow['cvd_last']:.0f}"
         else:
             fl_note = f"Flow: N/A ({flow.get('why')})"
+            
+        # ✅ FLOW PRESSURE LOGGING
+        pressure_note = ""
+        if pressure and pressure.get("ok"):
+            dr = pressure["delta"]["delta_ratio"]
+            obi = pressure["obi"]["obi"]
+            ask_wall = pressure["obi"]["ask_wall"]
+            bid_wall = pressure["obi"]["bid_wall"]
+            pressure_note = f" | 🎯 DeltaR={dr:.2f} OBI={obi:.2f} {'🔴AskWall' if ask_wall else ''}{'🟢BidWall' if bid_wall else ''}"
 
         side_hint = "BUY" if cv["b"]>=cv["s"] else "SELL"
         dash = (f"DASH → hint-{side_hint} | Council BUY({cv['b']},{cv['score_b']:.1f}) "
@@ -1020,7 +1585,7 @@ def emit_snapshots(exchange, symbol, df, balance_fn=None, pnl_fn=None):
         if LOG_ADDONS:
             print(f"🧱 {bm_note}", flush=True)
             print(f"📦 {fl_note}", flush=True)
-            print(f"📊 {dash}{gz_note}", flush=True)
+            print(f"📊 {dash}{gz_note}{pressure_note}", flush=True)
             print(f"{strat}{(' | ' + wallet) if wallet else ''}", flush=True)
             
             gz_snap_note = ""
@@ -1039,11 +1604,11 @@ def emit_snapshots(exchange, symbol, df, balance_fn=None, pnl_fn=None):
             
             print("✅ ADDONS LIVE", flush=True)
 
-        return {"bm": bm, "flow": flow, "cv": cv, "mode": mode, "gz": gz, "wallet": wallet}
+        return {"bm": bm, "flow": flow, "cv": cv, "mode": mode, "gz": gz, "wallet": wallet, "pressure": pressure}
     except Exception as e:
         print(f"🟨 AddonLog error: {e}", flush=True)
         return {"bm": None, "flow": None, "cv": {"b":0,"s":0,"score_b":0.0,"score_s":0.0,"ind":{}},
-                "mode": {"mode":"n/a"}, "gz": None, "wallet": ""}
+                "mode": {"mode":"n/a"}, "gz": None, "wallet": "", "pressure": None}
 
 # =================== EXECUTION MANAGER ===================
 def execute_trade_decision(side, price, qty, mode, council_data, gz_data):
@@ -1096,7 +1661,8 @@ def setup_trade_management(mode):
         }
 
 # =================== ENHANCED TRADE EXECUTION ===================
-def open_market_enhanced(side, qty, price):
+def open_market_enhanced(side, qty, price, mode_override=None, reason_override=None, engine_tag=None):
+    """✅ PATCH A - تعديل open_market_enhanced لدعم Mode Override + Reason"""
     if qty <= 0: 
         log_e("skip open (qty<=0)")
         return False
@@ -1111,7 +1677,17 @@ def open_market_enhanced(side, qty, price):
                                    di_minus=votes["ind"].get("minus_di"),
                                    rsi_ctx=rsi_ma_context(df))
     
+    # ===== MODE OVERRIDE (Trend Birth / Box Scalper) =====
     mode = mode_data["mode"]
+    if mode_override in ("trend", "mid", "scalp"):
+        mode = mode_override
+
+    # ===== ENTRY META (for logs / management rules) =====
+    if reason_override:
+        STATE["entry_reason"] = str(reason_override)
+    if engine_tag:
+        STATE["entry_engine"] = str(engine_tag)
+    
     gz = snap["gz"]
     
     management_config = setup_trade_management(mode)
@@ -1132,7 +1708,9 @@ def open_market_enhanced(side, qty, price):
             "highest_profit_pct": 0.0, 
             "profit_targets_achieved": 0,
             "mode": mode,
-            "management": management_config
+            "management": management_config,
+            "entry_reason": STATE.get("entry_reason"),
+            "entry_engine": STATE.get("entry_engine")
         })
         
         # ===== FALCON PLAN SNAPSHOT =====
@@ -1268,6 +1846,8 @@ STATE = {
     "cooldown_until_ts": 0,
     "day_key": "",
     "scalp_trades_today": 0,
+    "entry_reason": None,
+    "entry_engine": None
 }
 compound_pnl = 0.0
 wait_for_next_signal_side = None
@@ -1378,6 +1958,8 @@ def _reset_after_close(reason, prev_side=None):
         "trail_tightened": False, "partial_taken": False,
         "falcon_tp1": None, "falcon_tp2": None, "falcon_tp3": None,
         "falcon_tp2_done": False, "falcon_tp3_done": False,
+        "entry_reason": None,
+        "entry_engine": None
     })
     save_state({"in_position": False, "position_qty": 0})
     
@@ -1441,6 +2023,14 @@ def manage_after_entry_enhanced(df, ind, info):
         if side == "short" and boxes.get("in_demand") and pnl_pct > 0.10:
             log_w("🟩 EXIT SELL | hit DEMAND box")
             close_market_strict("exit_sell_demand_box")
+            return
+
+    # =================== TBE Fast Fail (avoid big loss) =====
+    # ✅ PATCH E — إدارة خسارة أقل لصفقات TBE (خروج سريع لو غلط)
+    if STATE.get("entry_engine") == "TBE":
+        if STATE.get("bars", 0) <= 3 and pnl_pct <= -0.20:
+            log_w("🧯 TBE FAIL FAST → EXIT")
+            close_market_strict("tbe_fail_fast")
             return
 
     # =================== EARLY FAIL (cut loss fast) ===================
@@ -1666,7 +2256,7 @@ def smart_exit_guard(state, df, ind, flow, bm, now_price, pnl_pct, mode, side, e
 
 # =================== ENHANCED TRADE LOOP ===================
 def trade_loop_enhanced():
-    """حلقة تداول محسنة مع Golden Entry ومجلس الإدارة + FALCON STYLE"""
+    """حلقة تداول محسنة مع Golden Entry ومجلس الإدارة + FALCON STYLE + Trend Birth Engine"""
     global wait_for_next_signal_side
     loop_i = 0
     
@@ -1706,7 +2296,7 @@ def trade_loop_enhanced():
                     **info
                 })
             
-            # قرار الدخول باستخدام مجلس الإدارة المحسن + Golden Entry
+            # قرار الدخول
             reason = None
             if spread_bps is not None and spread_bps > MAX_SPREAD_BPS:
                 reason = f"spread too high ({fmt(spread_bps,2)}bps > {MAX_SPREAD_BPS})"
@@ -1718,17 +2308,40 @@ def trade_loop_enhanced():
             # ===== Daily reset for scalp count =====
             reset_daily_scalp_counter()
 
-            # ===== Box-First signal =====
-            sig_box, why_box = box_first_signal(df, ind, float(px or info.get("price") or 0))
-            if sig_box:
-                # منع سبام السكالب: cap يومي
-                if STATE.get("scalp_trades_today", 0) >= MAX_SCALP_TRADES_PER_DAY:
-                    sig = None
-                    reason = f"daily_scalp_cap({STATE['scalp_trades_today']}/{MAX_SCALP_TRADES_PER_DAY})"
-                else:
-                    sig = sig_box
-                    reason = None
-                    log_i(f"📦 BOX-FIRST {sig.upper()} | {why_box} | scalp_count={STATE.get('scalp_trades_today',0)}/{MAX_SCALP_TRADES_PER_DAY}")
+            # ===== TREND BIRTH ENGINE (Priority #1) =====
+            # ✅ PATCH D — ربط TBE + Box-First في trade_loop_enhanced()
+            if TBE_ENABLED and not STATE["open"]:
+                pressure = snap.get("pressure")
+                sig_b, why_b = trend_birth_buy_signal(df, ind, float(px), pressure)
+                sig_s, why_s = trend_birth_sell_signal(df, ind, float(px), pressure)
+                
+                if sig_b == "buy":
+                    qty = compute_size(bal, float(px))
+                    if qty > 0:
+                        log_g(f"🚀 TBE BUY: {why_b}")
+                        if open_market("buy", qty, float(px), mode_override="trend", 
+                                      reason_override=why_b, engine_tag="TBE"):
+                            continue
+                
+                if sig_s == "sell":
+                    qty = compute_size(bal, float(px))
+                    if qty > 0:
+                        log_g(f"🚀 TBE SELL: {why_s}")
+                        if open_market("sell", qty, float(px), mode_override="trend",
+                                      reason_override=why_s, engine_tag="TBE"):
+                            continue
+
+            # ===== SCALP PRO ENTRY (studied) =====
+            if not STATE.get("open", False):
+                reset_daily_scalp_counter()
+                if int(STATE.get("scalp_trades_today", 0)) < int(MAX_SCALP_TRADES_PER_DAY):
+                    sig_scalp, why_scalp = scalp_pro_signal(df, ind, float(px))
+                    if sig_scalp in ("buy", "sell"):
+                        qty = compute_size(bal, float(px))
+                        log_g(f"🎯 SCALP PRO {sig_scalp.upper()}: {why_scalp}")
+                        if open_market(sig_scalp, qty, float(px), mode_override="scalp", 
+                                      reason_override=why_scalp, engine_tag="SCALP_PRO"):
+                            continue
 
             # --- Golden Entry Override ---
             if (gz and gz.get("ok") and ind.get("adx",0) >= GOLDEN_ENTRY_ADX):
@@ -1792,7 +2405,7 @@ def pretty_snapshot(bal, info, ind, spread_bps, reason=None, df=None):
         print("📈 INDICATORS & RF")
         print(f"   💲 Price {fmt(info.get('price'))} | RF filt={fmt(info.get('filter'))}  hi={fmt(info.get('hi'))} lo={fmt(info.get('lo'))}")
         print(f"   🧮 RSI={fmt(ind.get('rsi'))}  +DI={fmt(ind.get('plus_di'))}  -DI={fmt(ind.get('minus_di'))}  ADX={fmt(ind.get('adx'))}  ATR={fmt(ind.get('atr'))}")
-        print(f"   🎯 ENTRY: COUNCIL PRO + GOLDEN ENTRY + FALCON  |  spread_bps={fmt(spread_bps,2)}")
+        print(f"   🎯 ENTRY: TREND BIRTH ENGINE + SCALP PRO + GOLDEN ENTRY + FALCON  |  spread_bps={fmt(spread_bps,2)}")
         print(f"   ⏱️ closes_in ≈ {left_s}s")
         print("\n🧭 POSITION")
         bal_line = f"Balance={fmt(bal,2)}  Risk={int(RISK_ALLOC*100)}%×{LEVERAGE}x  CompoundPnL={fmt(compound_pnl)}  Eq~{fmt((bal or 0)+compound_pnl,2)}"
@@ -1807,6 +2420,8 @@ def pretty_snapshot(bal, info, ind, spread_bps, reason=None, df=None):
                 print(f"   🦅 FALCON TP2={fmt(STATE['falcon_tp2'])} {'✓' if STATE.get('falcon_tp2_done') else ''}")
             if STATE.get("falcon_tp3"):
                 print(f"   🦅 FALCON TP3={fmt(STATE['falcon_tp3'])} {'✓' if STATE.get('falcon_tp3_done') else ''}")
+            if STATE.get("entry_engine"):
+                print(f"   🔧 Engine: {STATE['entry_engine']} | Reason: {STATE.get('entry_reason', 'N/A')}")
         else:
             print("   ⚪ FLAT")
             if wait_for_next_signal_side:
@@ -1822,7 +2437,7 @@ app = Flask(__name__)
 @app.route("/")
 def home():
     mode='LIVE' if MODE_LIVE else 'PAPER'
-    return f"✅ Council PRO Bot — {SYMBOL} {INTERVAL} — {mode} — Candles + Golden Entry + Smart Exit + FALCON STYLE"
+    return f"✅ Council PRO Bot v5.0 — {SYMBOL} {INTERVAL} — {mode} — Trend Birth Engine + Scalp Pro + FALCON STYLE"
 
 @app.route("/metrics")
 def metrics():
@@ -1830,9 +2445,10 @@ def metrics():
         "symbol": SYMBOL, "interval": INTERVAL, "mode": "live" if MODE_LIVE else "paper",
         "leverage": LEVERAGE, "risk_alloc": RISK_ALLOC, "price": price_now(),
         "state": STATE, "compound_pnl": compound_pnl,
-        "entry_mode": "COUNCIL_PRO_GOLDEN", "wait_for_next_signal": wait_for_next_signal_side,
+        "entry_mode": "TREND_BIRTH_ENGINE+SCALP_PRO+GOLDEN", "wait_for_next_signal": wait_for_next_signal_side,
         "guards": {"max_spread_bps": MAX_SPREAD_BPS, "final_chunk_qty": FINAL_CHUNK_QTY},
-        "falcon": {"tp1": STATE.get("falcon_tp1"), "tp2": STATE.get("falcon_tp2"), "tp3": STATE.get("falcon_tp3")}
+        "falcon": {"tp1": STATE.get("falcon_tp1"), "tp2": STATE.get("falcon_tp2"), "tp3": STATE.get("falcon_tp3")},
+        "engines": {"tbe_enabled": TBE_ENABLED, "scalp_pro_enabled": SCALP_PRO_ENABLED}
     })
 
 @app.route("/health")
@@ -1841,8 +2457,9 @@ def health():
         "ok": True, "mode": "live" if MODE_LIVE else "paper",
         "open": STATE["open"], "side": STATE["side"], "qty": STATE["qty"],
         "compound_pnl": compound_pnl, "timestamp": datetime.utcnow().isoformat(),
-        "entry_mode": "COUNCIL_PRO_GOLDEN", "wait_for_next_signal": wait_for_next_signal_side,
-        "cooldown_active": STATE.get("cooldown_until_ts", 0) > time.time()
+        "entry_mode": "TREND_BIRTH_ENGINE+SCALP_PRO+GOLDEN", "wait_for_next_signal": wait_for_next_signal_side,
+        "cooldown_active": STATE.get("cooldown_until_ts", 0) > time.time(),
+        "entry_engine": STATE.get("entry_engine")
     }), 200
 
 def keepalive_loop():
@@ -1873,9 +2490,12 @@ if __name__ == "__main__":
     verify_execution_environment()
 
     print(colored(f"MODE: {'LIVE' if MODE_LIVE else 'PAPER'}  •  {SYMBOL}  •  {INTERVAL}", "yellow"))
-    print(colored(f"RISK: {int(RISK_ALLOC*100)}% × {LEVERAGE}x  •  COUNCIL_PRO=ENABLED", "yellow"))
+    print(colored(f"RISK: {int(RISK_ALLOC*100)}% × {LEVERAGE}x  •  TREND BIRTH ENGINE=ENABLED", "yellow"))
+    print(colored(f"SCALP PRO: {MAX_SCALP_TRADES_PER_DAY} scalps/day • TP Boost: {SCALP_TP1_BOOST_PCT}/{SCALP_TP2_BOOST_PCT}/{SCALP_TP3_BOOST_PCT}%", "yellow"))
+    print(colored(f"TBE: Sweep→Shift→Momentum→Displacement({TBE_DISPLACE_ATR_MULT}×ATR)→OB/FVG→Retest→Confirm", "yellow"))
+    print(colored(f"SCALP PRO: Box→Sweep→Displacement→Retest→Confirm", "yellow"))
+    print(colored(f"FLOW PRESSURE: Delta+OBI+Walls detection", "yellow"))
     print(colored(f"GOLDEN ENTRY: score≥{GOLDEN_ENTRY_SCORE} | ADX≥{GOLDEN_ENTRY_ADX}", "yellow"))
-    print(colored(f"CANDLES: Full patterns + Wick exhaustion + Golden reversal", "yellow"))
     print(colored(f"FALCON STYLE: TP1/2/3 + Box Exit + Early Fail + Cooldown", "yellow"))
     print(colored(f"EXECUTION: {'ACTIVE' if EXECUTE_ORDERS and not DRY_RUN else 'SIMULATION'}", "yellow"))
     
