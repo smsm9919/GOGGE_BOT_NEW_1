@@ -222,6 +222,47 @@ SCALP_CHOP_ADX_MAX = 15.0
 SCALP_CHOP_RSI_BAND = 5.0
 # ==============================================================
 
+# =================== SMART SCALP SYSTEM v2 ===================
+DOGE_TICK = 0.0001
+
+# معايير الدخول
+SCALP_MIN_POINTS = 6
+SCALP_MIN_MOVE_PCT_FIXED = 0.50
+SCALP_ATR_EXPECT_MULT = 0.8
+
+# Zone-First
+ZONE_FIRST_ENABLED = True
+ZONE_BOX_LOOKBACK = 90
+ZONE_TOUCH_BPS = 10
+
+# ترقية سكالب -> ترند
+UPGRADE_ENABLE = True
+UPGRADE_MIN_MOVE_PCT_FIXED = 0.50
+UPGRADE_ATR_MULT = 0.9
+UPGRADE_ADX_MIN = 20.0
+UPGRADE_DI_DOM_MIN = 5.0
+UPGRADE_IMB_LONG = 1.12
+UPGRADE_IMB_SHORT = 0.90
+
+# إدارة المخاطر
+BE_BUFFER_PCT = 0.05
+TRAIL_ATR_MULT = 1.0
+TRAIL_RATCHET = True
+MIN_BOX_EXIT_SCALP = 0.35
+MIN_BOX_EXIT_TREND = 0.90
+
+# فلتر الجدوى
+SCALP_FEASIBILITY_ENABLED = True
+SCALP_MIN_EXPECTED_POINTS = 6
+SCALP_MIN_ROOM_TO_BOX = 8
+SCALP_REQUIRED_DISPLACEMENT = True
+SCALP_MAX_SLIPPAGE_POINTS = 2
+
+# TP ديناميكي
+SCALP_TP_DYNAMIC = True
+SCALP_TP_MIN_PCT = 0.50
+SCALP_TP_MAX_PCT = 1.20
+
 # =================== PROFESSIONAL LOGGING ===================
 def log_i(msg): print(f"ℹ️ {msg}", flush=True)
 def log_g(msg): print(f"✅ {msg}", flush=True)
@@ -1160,6 +1201,90 @@ try:
 except Exception as e:
     log_w(f"exchange init: {e}")
 
+# =================== BINGX POSITION PATCH ===================
+_bingx_pos_debug_printed = False
+
+def _try_float(x, default=0.0):
+    try:
+        return float(x)
+    except Exception:
+        return default
+
+def _extract_positions_from_balance(bal):
+    info = (bal or {}).get("info") or {}
+    candidates = []
+    if isinstance(info, dict):
+        candidates.append(info)
+        if isinstance(info.get("data"), dict):
+            candidates.append(info["data"])
+        if isinstance(info.get("result"), dict):
+            candidates.append(info["result"])
+        if isinstance(info.get("data"), list):
+            candidates.append({"positions": info["data"]})
+
+    for node in candidates:
+        if not isinstance(node, dict):
+            continue
+        for k in ("positions", "position", "openPositions", "openPosition", "pos", "data"):
+            v = node.get(k)
+            if isinstance(v, list) and v:
+                return v
+    return []
+
+def _read_position_bingx():
+    global _bingx_pos_debug_printed
+
+    # 1) حاول fetch_positions
+    try:
+        poss = ex.fetch_positions(params={"type": "swap"})
+        if isinstance(poss, list) and poss:
+            for p in poss:
+                sym = (p.get("symbol") or p.get("info", {}).get("symbol") or "")
+                if SYMBOL.split(":")[0] not in sym:
+                    continue
+                qty = abs(_try_float(p.get("contracts") or p.get("info", {}).get("positionAmt") or 0))
+                if qty <= 0:
+                    continue
+                entry = _try_float(p.get("entryPrice") or p.get("info", {}).get("avgEntryPrice") or 0)
+                side_raw = (p.get("side") or p.get("info", {}).get("positionSide") or p.get("info", {}).get("side") or "").lower()
+                side = "long" if (side_raw in ("long","buy") or "long" in side_raw) else "short"
+                return qty, side, entry
+    except Exception as e:
+        log_w(f"bingx fetch_positions not available: {e}")
+
+    # 2) fallback: fetch_balance(type=swap)
+    try:
+        bal = ex.fetch_balance(params={"type": "swap"})
+        if not _bingx_pos_debug_printed:
+            _bingx_pos_debug_printed = True
+            info = (bal or {}).get("info")
+            if isinstance(info, dict):
+                log_i(f"[BINGX DEBUG] balance.info keys: {list(info.keys())[:25]}")
+                if isinstance(info.get("data"), dict):
+                    log_i(f"[BINGX DEBUG] balance.info.data keys: {list(info['data'].keys())[:25]}")
+
+        poss = _extract_positions_from_balance(bal)
+        for p in poss:
+            if not isinstance(p, dict):
+                continue
+            sym = str(p.get("symbol") or p.get("s") or p.get("instrumentId") or "")
+            if SYMBOL.split(":")[0] not in sym:
+                continue
+            qty = abs(_try_float(p.get("positionAmt") or p.get("qty") or p.get("position") or p.get("size") or 0))
+            if qty <= 0:
+                continue
+            entry = _try_float(p.get("avgEntryPrice") or p.get("entryPrice") or p.get("avgPrice") or 0)
+            side_raw = str(p.get("side") or p.get("positionSide") or p.get("direction") or "").lower()
+            side = "long" if (side_raw in ("long","buy") or "long" in side_raw) else "short"
+            return qty, side, entry
+    except Exception as e:
+        log_w(f"bingx fetch_balance positions fallback failed: {e}")
+
+    return 0.0, None, None
+
+def _read_position():
+    return _read_position_bingx()
+
 # =================== HELPERS ===================
 _consec_err = 0
 last_loop_ts = time.time()
@@ -1871,6 +1996,15 @@ def wait_gate_allow(df, info):
         return True, ""
     return False, f"wait-for-next-RF({wait_for_next_signal_side})"
 
+def wait_gate_allow_side(desired_side: str):
+    """بوابة الانتظار المعدلة للسماح بالدخول بالاتجاه"""
+    global wait_for_next_signal_side
+    if wait_for_next_signal_side is None:
+        return True, ""
+    if desired_side == wait_for_next_signal_side:
+        return True, ""
+    return False, f"wait-for-next-RF({wait_for_next_signal_side})"
+
 # =================== ORDERS ===================
 def _params_open(side):
     if POSITION_MODE == "hedge":
@@ -1881,22 +2015,6 @@ def _params_close():
     if POSITION_MODE == "hedge":
         return {"positionSide": "LONG" if STATE.get("side")=="long" else "SHORT", "reduceOnly": True}
     return {"positionSide": "BOTH", "reduceOnly": True}
-
-def _read_position():
-    try:
-        poss = ex.fetch_positions(params={"type":"swap"})
-        for p in poss:
-            sym = (p.get("symbol") or p.get("info",{}).get("symbol") or "")
-            if SYMBOL.split(":")[0] not in sym: continue
-            qty = abs(float(p.get("contracts") or p.get("info",{}).get("positionAmt") or 0))
-            if qty <= 0: return 0.0, None, None
-            entry = float(p.get("entryPrice") or p.get("info",{}).get("avgEntryPrice") or 0)
-            side_raw = (p.get("side") or p.get("info",{}).get("positionSide") or "").lower()
-            side = "long" if ("long" in side_raw or float(p.get("cost",0))>0) else "short"
-            return qty, side, entry
-    except Exception as e:
-        logging.error(f"_read_position error: {e}")
-    return 0.0, None, None
 
 def compute_size(balance, price):
     effective = balance or 0.0
@@ -1959,13 +2077,216 @@ def _reset_after_close(reason, prev_side=None):
         "falcon_tp1": None, "falcon_tp2": None, "falcon_tp3": None,
         "falcon_tp2_done": False, "falcon_tp3_done": False,
         "entry_reason": None,
-        "entry_engine": None
+        "entry_engine": None,
+        "be_armed": False,
+        "trend_upgraded": False,
+        "scalp_tp_data": {},
+        "scalp_bars_in_trade": 0,
     })
     save_state({"in_position": False, "position_qty": 0})
     
     # تفعيل انتظار الإشارة التالية
     _arm_wait_after_close(prev_side)
     logging.info(f"AFTER_CLOSE waiting_for={wait_for_next_signal_side} reason={reason}")
+
+# =================== SMART SCALP HELPER FUNCTIONS ===================
+def min_expected_move_pct(ind, px):
+    """أقل حركة متوقعة للسكالب"""
+    atr = float(ind.get("atr", 0) or 0)
+    if atr <= 0 or px <= 0:
+        return SCALP_MIN_MOVE_PCT_FIXED
+    atr_pct = (atr / px) * 100.0
+    return max(SCALP_MIN_MOVE_PCT_FIXED, atr_pct * SCALP_ATR_EXPECT_MULT)
+
+def expected_room_pct_for_boxes(px, boxes, sig):
+    """حساب المساحة المتوقعة للبوكس المعاكس"""
+    if not boxes or not boxes.get("ok") or px <= 0:
+        return 0.0, "no_boxes"
+    d = boxes.get("demand") or {}
+    s = boxes.get("supply") or {}
+    d_high = float(d.get("high", 0) or 0)
+    s_low  = float(s.get("low", 0) or 0)
+
+    if sig == "buy":
+        if s_low <= 0: 
+            return 0.0, "no_supply"
+        return ((s_low - px) / px) * 100.0, "to_supply"
+    else:
+        if d_high <= 0:
+            return 0.0, "no_demand"
+        return ((px - d_high) / px) * 100.0, "to_demand"
+
+def zone_touch_ok(px, box, sig):
+    """التحقق من لمس المنطقة"""
+    if not box:
+        return False
+    low = float(box.get("low", 0) or 0)
+    high = float(box.get("high", 0) or 0)
+    if low <= 0 or high <= 0:
+        return False
+    if low <= px <= high:
+        return True
+    ref = high if sig == "buy" else low
+    if ref <= 0: 
+        return False
+    bps = abs(px - ref) / ref * 10000.0
+    return bps <= ZONE_TOUCH_BPS
+
+def zone_first_signal(df, ind, px):
+    """إشارة Zone-First"""
+    boxes = detect_simple_boxes(df, lookback=ZONE_BOX_LOOKBACK)
+    if not boxes.get("ok"):
+        return None, "no_boxes"
+
+    if boxes.get("in_demand") or zone_touch_ok(px, boxes.get("demand"), "buy"):
+        ok, why = candle_confirmation(df, ind, "buy")
+        if ok:
+            return "buy", f"ZONE_FIRST demand+confirm({why})"
+        return None, f"wait_confirm_buy({why})"
+
+    if boxes.get("in_supply") or zone_touch_ok(px, boxes.get("supply"), "sell"):
+        ok, why = candle_confirmation(df, ind, "sell")
+        if ok:
+            return "sell", f"ZONE_FIRST supply+confirm({why})"
+        return None, f"wait_confirm_sell({why})"
+
+    return None, "no_touch"
+
+def calculate_scalp_feasibility(df, ind, entry_price, direction, boxes_data):
+    """حساب جدوى صفقة السكالب"""
+    if not SCALP_FEASIBILITY_ENABLED:
+        return {"feasible": True, "score": 10, "reason": "feasibility_disabled"}
+    
+    score = 10
+    reasons = []
+    warnings = []
+    
+    atr = float(ind.get("atr", 0.0) or 0.0)
+    current_price = float(df["close"].iloc[-1]) if len(df) > 0 else entry_price
+    
+    # حساب النقاط المتوقعة
+    if direction == "buy":
+        supply_high = float(boxes_data.get("supply", {}).get("high", 0))
+        if supply_high > 0:
+            expected_points = ((supply_high - entry_price) / DOGE_TICK)
+        else:
+            expected_points = (atr / DOGE_TICK) * 0.8
+    else:
+        demand_low = float(boxes_data.get("demand", {}).get("low", 0))
+        if demand_low > 0:
+            expected_points = ((entry_price - demand_low) / DOGE_TICK)
+        else:
+            expected_points = (atr / DOGE_TICK) * 0.8
+    
+    # التحقق من الحد الأدنى للنقاط
+    if expected_points < SCALP_MIN_EXPECTED_POINTS:
+        score -= 4
+        reasons.append(f"نقاط متوقعة منخفضة: {expected_points:.1f} < {SCALP_MIN_EXPECTED_POINTS}")
+    
+    # Displacement شرط
+    if SCALP_REQUIRED_DISPLACEMENT:
+        displacement_ok, disp_reason = scalp_displacement_ok(df, ind, direction)
+        if not displacement_ok:
+            score -= 3
+            reasons.append(f"لا يوجد اندفاع: {disp_reason}")
+    
+    # نسبة المخاطرة/العائد
+    if atr > 0:
+        sl_points = (atr * 0.5) / DOGE_TICK
+        if expected_points > 0:
+            rr_ratio = expected_points / sl_points
+            if rr_ratio < 1.5:
+                score -= 2
+                warnings.append(f"نسبة R:R ضعيفة: {rr_ratio:.1f}:1")
+    
+    # حالة الترند المصغر
+    micro_trend = analyze_micro_trend(df, 5)
+    if direction == "buy" and micro_trend != "up":
+        score -= 1
+        warnings.append("الاتجاه المصغر ليس صاعد")
+    elif direction == "sell" and micro_trend != "down":
+        score -= 1
+        warnings.append("الاتجاه المصغر ليس هابط")
+    
+    feasible = score >= 7
+    
+    return {
+        "feasible": feasible,
+        "score": score,
+        "expected_points": expected_points,
+        "reasons": reasons,
+        "warnings": warnings,
+        "atr_points": atr / DOGE_TICK if atr > 0 else 0
+    }
+
+def analyze_micro_trend(df, period=5):
+    """تحليل الاتجاه المصغر"""
+    if len(df) < period:
+        return "neutral"
+    
+    closes = df["close"].astype(float).tail(period).values
+    
+    # حساب الانحدار
+    x = np.arange(len(closes))
+    try:
+        slope, intercept = np.polyfit(x, closes, 1)
+    except:
+        return "neutral"
+    
+    if slope > 0.0005:
+        return "up"
+    elif slope < -0.0005:
+        return "down"
+    else:
+        return "neutral"
+
+def calculate_dynamic_scalp_tp(entry_price, direction, feasibility_data, ind):
+    """حساب TP ديناميكي للسكالب"""
+    expected_points = feasibility_data.get("expected_points", 6)
+    atr_points = feasibility_data.get("atr_points", 10)
+    
+    base_points = max(SCALP_MIN_EXPECTED_POINTS, min(expected_points, SCALP_TP_MAX_PCT * 100))
+    
+    # تعديل بناءً على الزخم
+    momentum = check_momentum_strength(ind, direction)
+    momentum_boost = 1.0 + (momentum - 0.5) * 0.4
+    
+    final_points = base_points * momentum_boost
+    
+    if direction == "buy":
+        tp_price = entry_price + (final_points * DOGE_TICK)
+    else:
+        tp_price = entry_price - (final_points * DOGE_TICK)
+    
+    return {
+        "tp_price": tp_price,
+        "points": final_points,
+        "base_points": base_points,
+        "momentum_boost": momentum_boost
+    }
+
+def check_momentum_strength(ind, direction):
+    """فحص قوة الزخم"""
+    rsi = float(ind.get("rsi", 50))
+    adx = float(ind.get("adx", 0))
+    
+    momentum_score = 0.0
+    
+    if direction == "buy":
+        if rsi > 40 and rsi < 70:
+            momentum_score += 0.4
+        elif rsi <= 40:
+            momentum_score += 0.6
+    else:
+        if rsi > 30 and rsi < 60:
+            momentum_score += 0.4
+        elif rsi >= 60:
+            momentum_score += 0.6
+    
+    if adx > 20:
+        momentum_score += 0.3
+    
+    return min(momentum_score, 1.0)
 
 # =================== ENHANCED TRADE MANAGEMENT ===================
 def manage_after_entry_enhanced(df, ind, info):
@@ -1988,6 +2309,93 @@ def manage_after_entry_enhanced(df, ind, info):
 
     snap = emit_snapshots(ex, SYMBOL, df)
     gz = snap["gz"]
+    
+    # ===== DYNAMIC BE / UPGRADE / TRAIL =====
+    try:
+        side = STATE.get("side")
+        px_now = float(px)
+        entry = float(STATE.get("entry", px_now))
+        
+        # 1) عتبة التحويل ديناميكيًا
+        atr = float(ind.get("atr", 0) or 0)
+        px_ref = max(entry, 1e-9)
+        atr_pct = (atr / px_ref) * 100.0 if atr > 0 else 0.0
+        upgrade_thr = max(UPGRADE_MIN_MOVE_PCT_FIXED, atr_pct * UPGRADE_ATR_MULT)
+        
+        # 2) ARM breakeven عند الوصول للحد الأدنى
+        if pnl_pct >= upgrade_thr and not STATE.get("be_armed", False):
+            be = entry * (1.0 + (BE_BUFFER_PCT/100.0) * (1 if side=="long" else -1))
+            STATE["breakeven"] = be
+            STATE["be_armed"] = True
+            log_g(f"🔒 BE ARMED @ {be:.6f} | pnl={pnl_pct:.2f}% thr={upgrade_thr:.2f}%")
+        
+        # 3) تقييم قوة للترقية
+        if UPGRADE_ENABLE and STATE.get("mode") == "scalp" and not STATE.get("trend_upgraded", False):
+            adx = float(ind.get("adx", 0) or 0)
+            di_p = float(ind.get("plus_di", 0) or 0)
+            di_m = float(ind.get("minus_di", 0) or 0)
+            
+            # imbalance
+            imb = 1.0
+            try:
+                bm = snap.get("bm") or {}
+                imb = float(bm.get("imb", bm.get("imbalance", 1.0)) or 1.0)
+            except Exception:
+                pass
+            
+            if side == "long":
+                di_dom_ok = (di_p - di_m) >= UPGRADE_DI_DOM_MIN
+                flow_ok = imb >= UPGRADE_IMB_LONG
+            else:
+                di_dom_ok = (di_m - di_p) >= UPGRADE_DI_DOM_MIN
+                flow_ok = imb <= UPGRADE_IMB_SHORT
+            
+            if pnl_pct >= upgrade_thr and adx >= UPGRADE_ADX_MIN and di_dom_ok and flow_ok:
+                STATE["trend_upgraded"] = True
+                STATE["mode"] = "trend"
+                log_g(f"🧠 UPGRADE → TREND | pnl={pnl_pct:.2f}% adx={adx:.1f} imb={imb:.2f}")
+        
+        # 4) Trailing Stop ديناميكي بعد الترقية
+        if STATE.get("trend_upgraded", False):
+            if atr > 0:
+                dist = atr * TRAIL_ATR_MULT
+            else:
+                dist = entry * 0.003
+            
+            trail = (px_now - dist) if side=="long" else (px_now + dist)
+            
+            # ratchet (لا يرجع للخلف)
+            if TRAIL_RATCHET and STATE.get("trail") is not None:
+                prev = float(STATE.get("trail") or 0)
+                if side=="long":
+                    trail = max(prev, trail)
+                else:
+                    trail = min(prev, trail)
+            
+            STATE["trail"] = trail
+    except Exception as e:
+        log_w(f"Dynamic management error: {e}")
+
+    # ===== SCALP MANAGEMENT ENHANCEMENT =====
+    if STATE.get("mode") == "scalp" and not STATE.get("trend_upgraded", False):
+        # 1) استخدام TP الديناميكي
+        tp_data = STATE.get("scalp_tp_data", {})
+        if tp_data and not STATE.get("tp1_done", False):
+            tp_price = tp_data.get("tp_price")
+            if tp_price:
+                if (side == "long" and px >= tp_price) or (side == "short" and px <= tp_price):
+                    log_g(f"✅ SCALP TP HIT | {tp_data.get('points', 0):.1f} نقاط")
+                    close_market_strict("scalp_tp_hit")
+                    return
+        
+        # 2) Early Exit محسن
+        STATE["scalp_bars_in_trade"] = STATE.get("scalp_bars_in_trade", 0) + 1
+        
+        # خروج إذا لم يتحقق الربح بعد 5 شمعات
+        if STATE["scalp_bars_in_trade"] >= 5 and abs(pnl_pct) < 0.2:
+            log_w(f"⏱️ SCALP TIME EXIT | {STATE['scalp_bars_in_trade']} شمعات بدون حركة")
+            close_market_strict("scalp_time_exit")
+            return
     
     # ===== Box invalidation (super cut) =====
     try:
@@ -2026,7 +2434,6 @@ def manage_after_entry_enhanced(df, ind, info):
             return
 
     # =================== TBE Fast Fail (avoid big loss) =====
-    # ✅ PATCH E — إدارة خسارة أقل لصفقات TBE (خروج سريع لو غلط)
     if STATE.get("entry_engine") == "TBE":
         if STATE.get("bars", 0) <= 3 and pnl_pct <= -0.20:
             log_w("🧯 TBE FAIL FAST → EXIT")
@@ -2255,9 +2662,12 @@ def smart_exit_guard(state, df, ind, flow, bm, now_price, pnl_pct, mode, side, e
     }
 
 # =================== ENHANCED TRADE LOOP ===================
+LOG_THROTTLE_S = 7
+_last_pretty_ts = 0
+
 def trade_loop_enhanced():
     """حلقة تداول محسنة مع Golden Entry ومجلس الإدارة + FALCON STYLE + Trend Birth Engine"""
-    global wait_for_next_signal_side
+    global wait_for_next_signal_side, _last_pretty_ts
     loop_i = 0
     
     while True:
@@ -2309,7 +2719,6 @@ def trade_loop_enhanced():
             reset_daily_scalp_counter()
 
             # ===== TREND BIRTH ENGINE (Priority #1) =====
-            # ✅ PATCH D — ربط TBE + Box-First في trade_loop_enhanced()
             if TBE_ENABLED and not STATE["open"]:
                 pressure = snap.get("pressure")
                 sig_b, why_b = trend_birth_buy_signal(df, ind, float(px), pressure)
@@ -2331,57 +2740,133 @@ def trade_loop_enhanced():
                                       reason_override=why_s, engine_tag="TBE"):
                             continue
 
-            # ===== SCALP PRO ENTRY (studied) =====
-            if not STATE.get("open", False):
-                reset_daily_scalp_counter()
-                if int(STATE.get("scalp_trades_today", 0)) < int(MAX_SCALP_TRADES_PER_DAY):
-                    sig_scalp, why_scalp = scalp_pro_signal(df, ind, float(px))
-                    if sig_scalp in ("buy", "sell"):
-                        qty = compute_size(bal, float(px))
-                        log_g(f"🎯 SCALP PRO {sig_scalp.upper()}: {why_scalp}")
-                        if open_market(sig_scalp, qty, float(px), mode_override="scalp", 
-                                      reason_override=why_scalp, engine_tag="SCALP_PRO"):
-                            continue
+            # ===== ENTRY PRIORITY v2 =====
+            sig = None
+            reason = None
 
-            # --- Golden Entry Override ---
+            # 1) Zone-First أولوية أعلى
+            if ZONE_FIRST_ENABLED and not STATE["open"]:
+                zs, zw = zone_first_signal(df, ind, float(px))
+                if zs:
+                    if STATE.get("scalp_trades_today", 0) < MAX_SCALP_TRADES_PER_DAY:
+                        sig = zs
+                        reason = zw
+
+            # 2) Box-First
+            sig_box, why_box = box_first_signal(df, ind, float(px or info.get("price") or 0))
+            if sig_box and not sig:
+                if STATE.get("scalp_trades_today", 0) >= MAX_SCALP_TRADES_PER_DAY:
+                    reason = f"daily_scalp_cap({STATE['scalp_trades_today']}/{MAX_SCALP_TRADES_PER_DAY})"
+                else:
+                    sig = sig_box
+                    reason = f"BOX_FIRST:{why_box}"
+
+            # 3) Golden override
             if (gz and gz.get("ok") and ind.get("adx",0) >= GOLDEN_ENTRY_ADX):
                 if gz["zone"]["type"]=="golden_bottom" and gz["score"]>=GOLDEN_ENTRY_SCORE:
                     sig = "buy"
-                    log_i(f"🎯 GOLDEN ENTRY: BUY | score={gz['score']:.1f} | منطقة ذهبية قوية")
+                    reason = f"GOLDEN_BUY score={gz['score']:.1f}"
                 elif gz["zone"]["type"]=="golden_top" and gz["score"]>=GOLDEN_ENTRY_SCORE:
                     sig = "sell" 
-                    log_i(f"🎯 GOLDEN ENTRY: SELL | score={gz['score']:.1f} | منطقة ذهبية قوية")
+                    reason = f"GOLDEN_SELL score={gz['score']:.1f}"
 
-            # لو مفيش Golden، استخدم السكور المعتاد
+            # 4) Council strong
             if sig is None:
                 if council_data["score_b"] > council_data["score_s"] and council_data["score_b"] >= 8.0:
                     sig = "buy"
+                    reason = "COUNCIL_STRONG_BUY"
                 elif council_data["score_s"] > council_data["score_b"] and council_data["score_s"] >= 8.0:
                     sig = "sell"
-            
-            if not STATE["open"] and sig and reason is None:
-                # التحقق من سياسة الانتظار
-                allow_wait, wait_reason = wait_gate_allow(df, info)
+                    reason = "COUNCIL_STRONG_SELL"
+
+            # ===== SCALP PRO ENTRY (مع فلتر الجدوى) =====
+            if not STATE.get("open", False):
+                reset_daily_scalp_counter()
+                
+                # الحصول على إشارة السكالب
+                sig_scalp, why_scalp = scalp_pro_signal(df, ind, float(px))
+                
+                if sig_scalp in ("buy", "sell"):
+                    # فحص الجدوى قبل الدخول
+                    boxes = detect_simple_boxes(df, lookback=SCALP_BOX_LOOKBACK)
+                    feasibility = calculate_scalp_feasibility(df, ind, float(px), sig_scalp, boxes)
+                    
+                    if feasibility["feasible"]:
+                        # حساب حجم المركز
+                        qty = compute_size(bal, float(px))
+                        
+                        # حساب TP ديناميكي
+                        tp_data = calculate_dynamic_scalp_tp(float(px), sig_scalp, feasibility, ind)
+                        
+                        log_g(f"🎯 SCALP PRO {sig_scalp.upper()} | نقاط متوقعة: {tp_data['points']:.1f} | "
+                              f"جدوى: {feasibility['score']}/10 | {why_scalp}")
+                        
+                        # تخزين بيانات TP
+                        STATE["scalp_tp_data"] = tp_data
+                        
+                        # فتح الصفقة
+                        if open_market(sig_scalp, qty, float(px), mode_override="scalp", 
+                                      reason_override=why_scalp, engine_tag="SCALP_PRO"):
+                            # تحديث عداد السكالب اليومي
+                            STATE["scalp_trades_today"] = int(STATE.get("scalp_trades_today", 0)) + 1
+                            log_i(f"📊 SCALP COUNT: {STATE['scalp_trades_today']}/{MAX_SCALP_TRADES_PER_DAY}")
+                            continue
+                    else:
+                        log_w(f"⛔ SCALP REJECTED | جدوى: {feasibility['score']}/10 | "
+                              f"أسباب: {', '.join(feasibility['reasons'])}")
+                        if feasibility.get("warnings"):
+                            log_w(f"تحذيرات: {', '.join(feasibility['warnings'])}")
+
+            # منطق الدخول النهائي المعدل:
+            if not STATE["open"] and sig:
+                allow_wait, wait_reason = wait_gate_allow_side(sig)
                 if not allow_wait:
                     reason = wait_reason
                 else:
-                    qty = compute_size(bal, px or info["price"])
-                    if qty > 0:
-                        ok = open_market(sig, qty, px or info["price"])
-                        if ok:
-                            wait_for_next_signal_side = None
-                            # تسجيل قرار المجلس
-                            log_i(f"🎯 COUNCIL DECISION: {sig.upper()} | "
-                                  f"Score B/S: {council_data['score_b']:.1f}/{council_data['score_s']:.1f} | "
-                                  f"Votes B/S: {council_data['b']}/{council_data['s']}")
-                            for log_msg in council_data.get("logs", []):
-                                log_i(f"   - {log_msg}")
+                    px_now = float(px or info["price"])
+                    boxes = detect_simple_boxes(df, lookback=ZONE_BOX_LOOKBACK)
+                    
+                    # فلتر الجدوى للسكالب
+                    is_scalp_entry = (reason or "").startswith(("BOX_FIRST", "ZONE_FIRST"))
+                    
+                    if is_scalp_entry:
+                        # حساب الجدوى
+                        feasibility = calculate_scalp_feasibility(df, ind, px_now, sig, boxes)
+                        
+                        if feasibility["feasible"]:
+                            qty = compute_size(bal, px_now)
+                            if qty > 0:
+                                # حساب TP ديناميكي
+                                tp_data = calculate_dynamic_scalp_tp(px_now, sig, feasibility, ind)
+                                STATE["scalp_tp_data"] = tp_data
+                                
+                                ok = open_market(sig, qty, px_now)
+                                if ok:
+                                    wait_for_next_signal_side = None
+                                    # تحديث عداد السكالب
+                                    STATE["scalp_trades_today"] = int(STATE.get("scalp_trades_today", 0)) + 1
+                                    log_i(f"📊 SCALP COUNT: {STATE['scalp_trades_today']}/{MAX_SCALP_TRADES_PER_DAY}")
+                            else:
+                                reason = "qty<=0"
+                        else:
+                            reason = f"scalp_not_feasible(score={feasibility['score']}/10)"
+                            log_w(f"⛔ SCALP REJECTED | {reason}")
                     else:
-                        reason = "qty<=0"
+                        # دخول ترند (Council/Golden)
+                        qty = compute_size(bal, px_now)
+                        if qty > 0:
+                            ok = open_market(sig, qty, px_now)
+                            if ok:
+                                wait_for_next_signal_side = None
+                        else:
+                            reason = "qty<=0"
             
             # اللوج الاحترافي
             if LOG_LEGACY:
-                pretty_snapshot(bal, {"price": px or info["price"], **info}, ind, spread_bps, reason, df)
+                now = time.time()
+                if now - _last_pretty_ts >= LOG_THROTTLE_S:
+                    _last_pretty_ts = now
+                    pretty_snapshot(bal, {"price": px or info["price"], **info}, ind, spread_bps, reason, df)
             
             loop_i += 1
             sleep_s = NEAR_CLOSE_S if time_to_candle_close(df) <= 10 else BASE_SLEEP
