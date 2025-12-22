@@ -7,6 +7,7 @@ RF Futures Bot — RF-LIVE ONLY (BingX Perp via CCXT)
 • Professional Risk Management + Market Phase Detection
 • FALCON STYLE ADDON: TP1/TP2/TP3 + Early Exit + Box Detector
 • SCENARIO ENGINE: Market State Detection + Smart Entry Points
+• PROFESSIONAL UPGRADE: Food Print Detection + Smart Trade Council
 """
 
 import os, time, math, random, signal, sys, traceback, logging, json
@@ -44,7 +45,7 @@ SHADOW_MODE_DASHBOARD = False
 DRY_RUN = False
 
 # ==== Addon: Logging + Recovery Settings ====
-BOT_VERSION = "DOGE Scenario Engine PRO v6.0 — Advanced Market Detection + Dynamic Management"
+BOT_VERSION = "DOGE Scenario Engine PRO v7.0 — Professional Food Print + Smart Council"
 print("🔁 Booting:", BOT_VERSION, flush=True)
 
 STATE_PATH = "./bot_state.json"
@@ -186,6 +187,11 @@ SCALP_TP_ATR_MULT = 1.0
 SCALP_SL_ATR_MULT = 0.8
 TREND_TRAIL_ATR_MULT = 1.6
 
+# =================== PROFESSIONAL FOOD PRINT ===================
+FOOD_PRINT_LOOKBACK = 100
+MIN_ZONE_STRENGTH = 0.6
+STRONG_ZONE_THRESHOLD = 0.8
+
 # =================== DATA STRUCTURES ===================
 class Action(str, Enum):
     BUY = "BUY"
@@ -233,6 +239,7 @@ class ScenarioDecision:
     tp_price: Optional[float] = None
     sl_price: Optional[float] = None
     is_golden_trade: bool = False
+    zone_strength: float = 0.5  # قوة منطقة الدخول
     meta: Optional[Dict[str, Any]] = None
 
 # =================== PROFESSIONAL LOGGING ===================
@@ -306,10 +313,10 @@ def calc_adx_di(df: pd.DataFrame, length: int = ADX_LEN) -> Tuple[pd.Series, pd.
 
 def calc_vwap(df: pd.DataFrame, length: int = VWAP_LEN) -> pd.Series:
     tp = (df["high"].astype(float) + df["low"].astype(float) + df["close"].astype(float)) / 3.0
-    v = df["volume"].astype(float).replace(0, np.nan).fillna(method="ffill").fillna(1.0)
+    v = df["volume"].astype(float).replace(0, np.nan).ffill().fillna(1.0)
     pv = tp * v
     vwap = pv.rolling(length).sum() / (v.rolling(length).sum() + 1e-12)
-    return vwap.fillna(method="ffill")
+    return vwap.ffill()
 
 def zscore(s: pd.Series, length: int = 50) -> pd.Series:
     m = s.rolling(length).mean()
@@ -457,10 +464,13 @@ def detect_phase(df: pd.DataFrame, i: int, atr: float, adx: float, vol_z: float,
 def bps_from_prices(a: float, b: float) -> float:
     return abs(a - b) / (a + 1e-12) * 10000
 
-def scalp_tp_sl(px: float, atr: float, side: str) -> Tuple[float, float]:
-    """حساب TP/SL للسكالب"""
-    min_tp_abs = px * (MIN_SCALP_BPS / 10000.0)
-    tp_abs = max(atr * SCALP_TP_ATR_MULT, min_tp_abs)
+def scalp_tp_sl(px: float, atr: float, side: str, zone_strength: float = 0.5) -> Tuple[float, float]:
+    """حساب TP/SL للسكالب بناءً على قوة المنطقة"""
+    # تعديل TP/SL حسب قوة المنطقة
+    strength_multiplier = 1.0 + (zone_strength - 0.5)  # 0.5-1.5
+    
+    min_tp_abs = px * (MIN_SCALP_BPS / 10000.0) * strength_multiplier
+    tp_abs = max(atr * SCALP_TP_ATR_MULT * strength_multiplier, min_tp_abs)
     sl_abs = max(atr * SCALP_SL_ATR_MULT, px * (0.7 * MIN_SCALP_BPS / 10000.0))
 
     if side == "buy":
@@ -516,23 +526,131 @@ def build_context(df: pd.DataFrame) -> SignalContext:
         notes=notes, market_strength=market_strength
     )
 
-def is_golden_trade_setup(ctx: SignalContext, fvg: Dict, ob: Dict, sweep: Dict) -> bool:
-    """كشف إعدادات الصفقات الذهبية الصاروخية"""
-    # شروط الصفقات الذهبية:
-    # 1. ADX قوي
-    # 2. Displacement واضح
-    # 3. حجم مرتفع
-    # 4. منطقة دخول واضحة (FVG/OB)
-    # 5. RSI في المنطقة المناسبة
+# =================== PROFESSIONAL FOOD PRINT DETECTION ===================
+def detect_food_print_advanced(df: pd.DataFrame, lookback: int = FOOD_PRINT_LOOKBACK) -> Dict[str, Any]:
+    """
+    كشف فود برنت متقدم: مناطق السيولة والتراكم والتوزيع
+    """
+    n = len(df)
+    if n < lookback + 10:
+        return {"ok": False}
     
+    results = {
+        "liquidity_pools": [],
+        "accumulation_zones": [],
+        "distribution_zones": [],
+        "fair_value_gaps": [],
+        "zone_strength": 0.5
+    }
+    
+    # 1. اكتشاف مناطق السيولة (سلسلة من الشموع الصغيرة)
+    for i in range(n - lookback, n - 5):
+        window = df.iloc[i:i+5]
+        max_range = float(window["high"].max() - window["low"].min())
+        avg_body = float(abs(window["close"] - window["open"]).mean())
+        
+        if avg_body < max_range * 0.3 and max_range < max_range * 0.5:
+            results["liquidity_pools"].append({
+                "start": i,
+                "end": i + 5,
+                "range_low": float(window["low"].min()),
+                "range_high": float(window["high"].max())
+            })
+    
+    # 2. مناطق التراكم (تجميع قبل الصعود)
+    for i in range(n - lookback, n - 20):
+        window = df.iloc[i:i+20]
+        first_half = window.iloc[:10]
+        second_half = window.iloc[10:]
+        
+        if (float(first_half["close"].mean()) < float(second_half["close"].mean()) and
+            float(first_half["volume"].mean()) > float(second_half["volume"].mean())):
+            results["accumulation_zones"].append({
+                "start": i,
+                "end": i + 20,
+                "avg_price": float(window["close"].mean())
+            })
+    
+    # 3. مناطق التوزيع (توزيع قبل الهبوط)
+    for i in range(n - lookback, n - 20):
+        window = df.iloc[i:i+20]
+        first_half = window.iloc[:10]
+        second_half = window.iloc[10:]
+        
+        if (float(first_half["close"].mean()) > float(second_half["close"].mean()) and
+            float(first_half["volume"].mean()) > float(second_half["volume"].mean())):
+            results["distribution_zones"].append({
+                "start": i,
+                "end": i + 20,
+                "avg_price": float(window["close"].mean())
+            })
+    
+    # 4. حساب قوة المنطقة بناءً على عدة عوامل
+    zone_strength = 0.5
+    recent_price = float(df["close"].iloc[-1])
+    
+    # عامل 1: قرب السعر من مناطق التراكم/التوزيع
+    for zone in results["accumulation_zones"]:
+        zone_center = zone["avg_price"]
+        distance_pct = abs(recent_price - zone_center) / zone_center
+        if distance_pct < 0.02:  # 2%
+            zone_strength += 0.2
+            break
+    
+    # عامل 2: وجود مناطق سيولة قريبة
+    if results["liquidity_pools"]:
+        zone_strength += 0.1
+    
+    # عامل 3: عدد المناطق المكتشفة
+    total_zones = len(results["accumulation_zones"]) + len(results["distribution_zones"])
+    if total_zones > 2:
+        zone_strength += min(0.1 * total_zones, 0.3)
+    
+    results["zone_strength"] = min(max(zone_strength, 0.1), 0.9)
+    
+    return {"ok": True, **results}
+
+def is_golden_trade_setup_enhanced(ctx: SignalContext, fvg: Dict, ob: Dict, 
+                                  sweep: Dict, food_print: Dict) -> Tuple[bool, float]:
+    """كشف إعدادات الصفقات الذهبية مع فود برنت"""
+    
+    # الشروط الأساسية
     if ctx.adx < 25:
-        return False
+        return False, 0.0
     
     if not ctx.displacement:
-        return False
+        return False, 0.0
     
     if ctx.vol_z < 0.5:
-        return False
+        return False, 0.0
+    
+    # شروط فود برنت
+    zone_strength = food_print.get("zone_strength", 0.5) if food_print.get("ok") else 0.5
+    
+    if food_print.get("ok"):
+        # تحقق من مناطق التراكم للتداول الطويل
+        if ctx.bias == "bull":
+            accumulation_nearby = any(
+                zone["avg_price"] * 1.02 >= ctx.px >= zone["avg_price"] * 0.98
+                for zone in food_print.get("accumulation_zones", [])
+            )
+            if not accumulation_nearby:
+                zone_strength *= 0.7  # تقليل قوة المنطقة
+        
+        # تحقق من مناطق التوزيع للتداول القصير
+        if ctx.bias == "bear":
+            distribution_nearby = any(
+                zone["avg_price"] * 1.02 >= ctx.px >= zone["avg_price"] * 0.98
+                for zone in food_print.get("distribution_zones", [])
+            )
+            if not distribution_nearby:
+                zone_strength *= 0.7  # تقليل قوة المنطقة
+    
+    # RSI مناسب
+    if ctx.bias == "bull" and ctx.rsi > 70:
+        zone_strength *= 0.6
+    if ctx.bias == "bear" and ctx.rsi < 30:
+        zone_strength *= 0.6
     
     # منطقة دخول واضحة
     has_entry_zone = False
@@ -551,18 +669,18 @@ def is_golden_trade_setup(ctx: SignalContext, fvg: Dict, ob: Dict, sweep: Dict) 
             has_entry_zone = True
     
     if not has_entry_zone:
-        return False
+        zone_strength *= 0.5
     
-    # RSI مناسب
-    if ctx.bias == "bull" and ctx.rsi > 65:
-        return False
-    if ctx.bias == "bear" and ctx.rsi < 35:
-        return False
+    # الشروط النهائية للصفقات الذهبية
+    is_golden = (zone_strength >= MIN_ZONE_STRENGTH and 
+                 has_entry_zone and 
+                 ctx.displacement and 
+                 ctx.adx >= 25)
     
-    return True
+    return is_golden, zone_strength
 
-def scenario_decide(df: pd.DataFrame) -> ScenarioDecision:
-    """اتخاذ القرار بناءً على سيناريو السوق"""
+def scenario_decide_enhanced(df: pd.DataFrame) -> ScenarioDecision:
+    """اتخاذ القرار مع فود برنت محسن"""
     if not SCENARIO_ENGINE_ENABLED:
         return ScenarioDecision(Action.NO_TRADE, Mode.NONE, "Scenario Engine Disabled", 0.0)
     
@@ -570,17 +688,18 @@ def scenario_decide(df: pd.DataFrame) -> ScenarioDecision:
     fvg = detect_fvg(df, FVG_LOOKBACK)
     ob = detect_simple_ob(df, OB_LOOKBACK)
     sweep = detect_liquidity_sweep(df, 30)
+    food_print = detect_food_print_advanced(df, FOOD_PRINT_LOOKBACK)  # إضافة فود برنت
     
     px = ctx.px
     notes = list(ctx.notes)
     
     # ====================
-    # 1. كشف الصفقات الذهبية أولاً
+    # 1. كشف الصفقات الذهبية أولاً مع فود برنت
     # ====================
-    golden_trade = is_golden_trade_setup(ctx, fvg, ob, sweep)
+    golden_trade, zone_strength = is_golden_trade_setup_enhanced(ctx, fvg, ob, sweep, food_print)
     
-    if golden_trade:
-        notes.append("GOLDEN_TRADE_SETUP")
+    if golden_trade and zone_strength >= MIN_ZONE_STRENGTH:
+        notes.append(f"GOLDEN_TRADE_SETUP_STR:{zone_strength:.2f}")
         
         if ctx.bias == "bull":
             # حساب TP على 3 مستويات للصفقات الذهبية
@@ -592,16 +711,18 @@ def scenario_decide(df: pd.DataFrame) -> ScenarioDecision:
             return ScenarioDecision(
                 action=Action.BUY,
                 mode=Mode.GOLDEN,
-                reason=f"GOLDEN BUY: Strong trend + Displacement + Clear zone (ADX:{ctx.adx:.1f}, VolZ:{ctx.vol_z:.2f})",
+                reason=f"GOLDEN BUY: Strong trend + Displacement + Clear zone (ADX:{ctx.adx:.1f}, VolZ:{ctx.vol_z:.2f}, ZoneStr:{zone_strength:.2f})",
                 confidence=0.88,
                 tp_price=tp1,  # أول مستوى TP
                 sl_price=sl,
                 is_golden_trade=True,
+                zone_strength=zone_strength,
                 meta={
                     "ctx": ctx.__dict__,
                     "ob": ob,
                     "fvg": fvg,
                     "sweep": sweep,
+                    "food_print": food_print,
                     "notes": notes,
                     "golden_tp_levels": [tp1, tp2, tp3],
                     "golden_close_fractions": GOLDEN_TP_CLOSE_FRACTIONS
@@ -617,16 +738,18 @@ def scenario_decide(df: pd.DataFrame) -> ScenarioDecision:
             return ScenarioDecision(
                 action=Action.SELL,
                 mode=Mode.GOLDEN,
-                reason=f"GOLDEN SELL: Strong trend + Displacement + Clear zone (ADX:{ctx.adx:.1f}, VolZ:{ctx.vol_z:.2f})",
+                reason=f"GOLDEN SELL: Strong trend + Displacement + Clear zone (ADX:{ctx.adx:.1f}, VolZ:{ctx.vol_z:.2f}, ZoneStr:{zone_strength:.2f})",
                 confidence=0.88,
                 tp_price=tp1,
                 sl_price=sl,
                 is_golden_trade=True,
+                zone_strength=zone_strength,
                 meta={
                     "ctx": ctx.__dict__,
                     "ob": ob,
                     "fvg": fvg,
                     "sweep": sweep,
+                    "food_print": food_print,
                     "notes": notes,
                     "golden_tp_levels": [tp1, tp2, tp3],
                     "golden_close_fractions": GOLDEN_TP_CLOSE_FRACTIONS
@@ -645,7 +768,8 @@ def scenario_decide(df: pd.DataFrame) -> ScenarioDecision:
                 Mode.NONE, 
                 f"CHOP: Low ADX ({ctx.adx:.1f}), no clear setup", 
                 0.35,
-                meta={"ctx": ctx.__dict__, "notes": notes}
+                zone_strength=zone_strength,
+                meta={"ctx": ctx.__dict__, "notes": notes, "food_print": food_print}
             )
     
     # ====================
@@ -683,19 +807,19 @@ def scenario_decide(df: pd.DataFrame) -> ScenarioDecision:
     confirm_sell = candle_rejection(df, len(df)-1, "sell") or ctx.displacement
     
     # ====================
-    # 6. إعدادات السكالب
+    # 6. إعدادات السكالب (مع مراعاة قوة المنطقة)
     # ====================
     scalp_buy_setup = (sweep.get("sweep_low") or near_bull_ob or near_bull_fvg) and confirm_buy
     scalp_sell_setup = (sweep.get("sweep_high") or near_bear_ob or near_bear_fvg) and confirm_sell
     
-    # منع السكالب عكس الترند
+    # منع السكالب عكس الترند إلا في مناطق قوية
     if strong_bull and scalp_sell_setup:
-        if not (candle_rejection(df, len(df)-1, "sell") and sweep.get("sweep_high")):
+        if not (candle_rejection(df, len(df)-1, "sell") and sweep.get("sweep_high") and zone_strength > 0.8):
             scalp_sell_setup = False
             notes.append("blocked_scalp_sell_vs_bull_trend")
     
     if strong_bear and scalp_buy_setup:
-        if not (candle_rejection(df, len(df)-1, "buy") and sweep.get("sweep_low")):
+        if not (candle_rejection(df, len(df)-1, "buy") and sweep.get("sweep_low") and zone_strength > 0.8):
             scalp_buy_setup = False
             notes.append("blocked_scalp_buy_vs_bear_trend")
     
@@ -715,11 +839,12 @@ def scenario_decide(df: pd.DataFrame) -> ScenarioDecision:
         return ScenarioDecision(
             Action.BUY, 
             Mode.TREND, 
-            f"TREND BUY: {ctx.phase.value} phase + displacement + bullish bias", 
+            f"TREND BUY: {ctx.phase.value} phase + displacement + bullish bias (ZoneStr:{zone_strength:.2f})", 
             0.82,
             tp_price=None,  # الترند بدون TP ثابت
             sl_price=sl,
-            meta={"ctx": ctx.__dict__, "ob": ob, "fvg": fvg, "sweep": sweep, "notes": notes}
+            zone_strength=zone_strength,
+            meta={"ctx": ctx.__dict__, "ob": ob, "fvg": fvg, "sweep": sweep, "food_print": food_print, "notes": notes}
         )
     
     if trend_sell_setup:
@@ -727,43 +852,47 @@ def scenario_decide(df: pd.DataFrame) -> ScenarioDecision:
         return ScenarioDecision(
             Action.SELL, 
             Mode.TREND, 
-            f"TREND SELL: {ctx.phase.value} phase + displacement + bearish bias", 
+            f"TREND SELL: {ctx.phase.value} phase + displacement + bearish bias (ZoneStr:{zone_strength:.2f})", 
             0.82,
             tp_price=None,
             sl_price=sl,
-            meta={"ctx": ctx.__dict__, "ob": ob, "fvg": fvg, "sweep": sweep, "notes": notes}
+            zone_strength=zone_strength,
+            meta={"ctx": ctx.__dict__, "ob": ob, "fvg": fvg, "sweep": sweep, "food_print": food_print, "notes": notes}
         )
     
-    if scalp_buy_setup:
-        tp, sl = scalp_tp_sl(px, ctx.atr, "buy")
+    if scalp_buy_setup and zone_strength >= MIN_ZONE_STRENGTH:
+        tp, sl = scalp_tp_sl(px, ctx.atr, "buy", zone_strength)
         return ScenarioDecision(
             Action.BUY, 
             Mode.SCALP, 
-            f"SCALP BUY: zone touch + confirm (min {MIN_SCALP_POINTS} points)", 
+            f"SCALP BUY: zone touch + confirm (min {MIN_SCALP_POINTS} points, ZoneStr:{zone_strength:.2f})", 
             0.68,
             tp_price=tp,
             sl_price=sl,
-            meta={"ctx": ctx.__dict__, "ob": ob, "fvg": fvg, "sweep": sweep, "notes": notes}
+            zone_strength=zone_strength,
+            meta={"ctx": ctx.__dict__, "ob": ob, "fvg": fvg, "sweep": sweep, "food_print": food_print, "notes": notes}
         )
     
-    if scalp_sell_setup:
-        tp, sl = scalp_tp_sl(px, ctx.atr, "sell")
+    if scalp_sell_setup and zone_strength >= MIN_ZONE_STRENGTH:
+        tp, sl = scalp_tp_sl(px, ctx.atr, "sell", zone_strength)
         return ScenarioDecision(
             Action.SELL, 
             Mode.SCALP, 
-            f"SCALP SELL: zone touch + confirm (min {MIN_SCALP_POINTS} points)", 
+            f"SCALP SELL: zone touch + confirm (min {MIN_SCALP_POINTS} points, ZoneStr:{zone_strength:.2f})", 
             0.68,
             tp_price=tp,
             sl_price=sl,
-            meta={"ctx": ctx.__dict__, "ob": ob, "fvg": fvg, "sweep": sweep, "notes": notes}
+            zone_strength=zone_strength,
+            meta={"ctx": ctx.__dict__, "ob": ob, "fvg": fvg, "sweep": sweep, "food_print": food_print, "notes": notes}
         )
     
     return ScenarioDecision(
         Action.HOLD, 
         Mode.NONE, 
-        f"Waiting for better setup (Phase: {ctx.phase.value}, Bias: {ctx.bias})", 
+        f"Waiting for better setup (Phase: {ctx.phase.value}, Bias: {ctx.bias}, ZoneStr:{zone_strength:.2f})", 
         0.45,
-        meta={"ctx": ctx.__dict__, "ob": ob, "fvg": fvg, "sweep": sweep, "notes": notes}
+        zone_strength=zone_strength,
+        meta={"ctx": ctx.__dict__, "ob": ob, "fvg": fvg, "sweep": sweep, "food_print": food_print, "notes": notes}
     )
 
 def should_promote_scalp_to_trend(entry_px: float, px: float, side: str, ctx: SignalContext) -> bool:
@@ -789,6 +918,166 @@ def should_promote_scalp_to_trend(entry_px: float, px: float, side: str, ctx: Si
         return False
 
     return True
+
+def should_take_scalp_profit(entry_px: float, current_px: float, 
+                            side: str, ctx: SignalContext, 
+                            zone_strength: float) -> Tuple[bool, float]:
+    """
+    تحديد جني الأرباح للسكالب بناءً على قوة المنطقة
+    
+    Args:
+        zone_strength: قوة منطقة الدخول (0-1)
+                      > 0.7: منطقة قوية
+                      < 0.4: منطقة ضعيفة
+    """
+    profit_bps = abs(current_px - entry_px) / entry_px * 10000
+    
+    # للمناطق القوية: نصبر أكثر
+    if zone_strength > 0.7:
+        min_profit_bps = MIN_SCALP_BPS * 1.5  # زيادة الهدف للمناطق القوية
+        max_profit_bps = MIN_SCALP_BPS * 3.0
+    else:
+        min_profit_bps = MIN_SCALP_BPS  # الهدف الأساسي
+        max_profit_bps = MIN_SCALP_BPS * 1.5
+    
+    # للمناطق الضعيفة: نخرج مبكراً
+    if zone_strength < 0.4:
+        min_profit_bps = MIN_SCALP_BPS * 0.5
+        max_profit_bps = MIN_SCALP_BPS
+    
+    # تحقق من تحقيق الهدف
+    if profit_bps >= max_profit_bps:
+        return True, 1.0  # إغلاق كامل
+    
+    if profit_bps >= min_profit_bps:
+        # خروج جزئي للمناطق متوسطة القوة
+        if 0.4 <= zone_strength <= 0.7:
+            close_pct = 0.5  # إغلاق نصف المركز
+            return True, close_pct
+    
+    return False, 0.0
+
+# =================== SMART TRADE COUNCIL ===================
+class SmartTradeCouncil:
+    """مجلس إدارة ذكي لاتخاذ قرارات إدارة الصفقات"""
+    
+    def __init__(self):
+        self.members = [
+            self._risk_manager,
+            self._trend_analyst,
+            self._volume_analyst,
+            self._price_action_analyst
+        ]
+        self.weights = [0.3, 0.25, 0.25, 0.2]  # أوزان القرارات
+    
+    def evaluate_trade(self, trade_data: Dict, market_ctx: SignalContext) -> Dict:
+        """تقييم الصفقة من قبل جميع أعضاء المجلس"""
+        decisions = []
+        
+        for member in self.members:
+            decision = member(trade_data, market_ctx)
+            decisions.append(decision)
+        
+        # دمج القرارات المرجحة
+        final_decision = self._weighted_decision(decisions)
+        return final_decision
+    
+    def _risk_manager(self, trade_data: Dict, ctx: SignalContext) -> Dict:
+        """مدير المخاطر"""
+        entry = trade_data.get("entry", 0)
+        current = ctx.px
+        side = trade_data.get("side", "long")
+        
+        if side == "long":
+            profit_pct = (current - entry) / entry * 100
+            stop_distance = abs(entry - trade_data.get("sl_price", 0)) / entry * 100
+        else:
+            profit_pct = (entry - current) / entry * 100
+            stop_distance = abs(entry - trade_data.get("sl_price", 0)) / entry * 100
+        
+        risk_reward = profit_pct / stop_distance if stop_distance > 0 else 0
+        
+        if risk_reward < 0.5:
+            return {"action": "close", "reason": "نسبة المخاطرة/العائد سيئة", "confidence": 0.8}
+        elif risk_reward > 2:
+            return {"action": "hold", "reason": "نسبة المخاطرة/العائد ممتازة", "confidence": 0.9}
+        
+        return {"action": "hold", "reason": "نسبة المخاطرة/العائد متوسطة", "confidence": 0.6}
+    
+    def _trend_analyst(self, trade_data: Dict, ctx: SignalContext) -> Dict:
+        """محلل الترند"""
+        entry_bias = trade_data.get("entry_context", {}).get("bias", "neutral")
+        current_bias = ctx.bias
+        
+        if entry_bias != current_bias and ctx.adx > 25:
+            return {"action": "close", "reason": "انعكاس الترند", "confidence": 0.85}
+        
+        if ctx.adx < 15:
+            return {"action": "close", "reason": "ضعف الترند", "confidence": 0.7}
+        
+        return {"action": "hold", "reason": "الترند سليم", "confidence": 0.75}
+    
+    def _volume_analyst(self, trade_data: Dict, ctx: SignalContext) -> Dict:
+        """محلل الحجم"""
+        if ctx.vol_z < -1.0:
+            return {"action": "close", "reason": "حجم ضعيف", "confidence": 0.7}
+        
+        if ctx.vol_z > 2.0 and ctx.displacement:
+            return {"action": "hold", "reason": "حجم قوي مع إزاحة", "confidence": 0.9}
+        
+        return {"action": "hold", "reason": "حجم طبيعي", "confidence": 0.6}
+    
+    def _price_action_analyst(self, trade_data: Dict, ctx: SignalContext) -> Dict:
+        """محلل حركة السعر"""
+        # تحليل الشمعة الحالية
+        df = trade_data.get("current_candles", None)
+        if df is not None and len(df) > 1:
+            last_candle = df.iloc[-1]
+            o = float(last_candle["open"])
+            c = float(last_candle["close"])
+            h = float(last_candle["high"])
+            l = float(last_candle["low"])
+            
+            body = abs(c - o)
+            upper_wick = h - max(o, c)
+            lower_wick = min(o, c) - l
+            
+            side = trade_data.get("side", "long")
+            
+            # شمعة انعكاسية
+            if side == "long" and upper_wick > body * 2:
+                return {"action": "close", "reason": "شمعة انعكاسية", "confidence": 0.75}
+            if side == "short" and lower_wick > body * 2:
+                return {"action": "close", "reason": "شمعة انعكاسية", "confidence": 0.75}
+        
+        return {"action": "hold", "reason": "حركة سعر طبيعية", "confidence": 0.65}
+    
+    def _weighted_decision(self, decisions: List[Dict]) -> Dict:
+        """دمج القرارات المرجحة"""
+        if not decisions:
+            return {"action": "hold", "reason": "لا توجد قرارات", "confidence": 0.5}
+        
+        # حساب متوسط الثقة لكل إجراء
+        action_scores = {}
+        for i, decision in enumerate(decisions):
+            action = decision["action"]
+            confidence = decision["confidence"] * self.weights[i]
+            
+            if action not in action_scores:
+                action_scores[action] = {"score": 0, "reasons": []}
+            
+            action_scores[action]["score"] += confidence
+            action_scores[action]["reasons"].append(decision["reason"])
+        
+        # اختيار الإجراء بأعلى درجة
+        best_action = max(action_scores.items(), key=lambda x: x[1]["score"])
+        
+        return {
+            "action": best_action[0],
+            "reason": " | ".join(best_action[1]["reasons"][:2]),
+            "confidence": best_action[1]["score"],
+            "all_decisions": decisions
+        }
 
 # =================== CANDLES MODULE ===================
 def _body(o,c): return abs(c-o)
@@ -854,6 +1143,9 @@ class TradeManager:
         self.promoted_to_trend = False
         self.entry_context = None
         self.danger_zone_detected = False
+        self.smart_council = SmartTradeCouncil()
+        self.prev_adx = None
+        self.prev_vwap_bias = None
         
     def update_context(self, ctx: SignalContext):
         """تحديث سياق السوق للإدارة الذكية"""
@@ -869,20 +1161,20 @@ class TradeManager:
             return True
             
         # 2. تغيير حاد في ADX (انعكاس)
-        if hasattr(self, 'prev_adx') and self.prev_adx is not None:
-            adx_change = abs(ctx.adx - self.prev_adx) / self.prev_adx
+        if self.prev_adx is not None:
+            adx_change = abs(ctx.adx - self.prev_adx) / (self.prev_adx + 1e-12)
             if adx_change > 0.3 and ctx.adx < 20:
                 return True
         
         # 3. اختراق VWAP عكسي مع حجم ضعيف
-        if hasattr(self, 'prev_vwap_bias'):
-            current_bias = "above" if ctx.px > ctx.vwap else "below"
+        current_bias = "above" if ctx.px > ctx.vwap else "below"
+        if self.prev_vwap_bias is not None:
             if current_bias != self.prev_vwap_bias and ctx.vol_z < 0.3:
                 return True
         
         # تحديث القيم السابقة
         self.prev_adx = ctx.adx
-        self.prev_vwap_bias = "above" if ctx.px > ctx.vwap else "below"
+        self.prev_vwap_bias = current_bias
         
         return False
     
@@ -931,8 +1223,23 @@ class TradeManager:
         return {"action": "hold", "close_pct": 0.0}
     
     def should_close_trade(self, px: float, entry_px: float, side: str, 
-                          ctx: SignalContext) -> tuple:
-        """تحديد إذا كان يجب إغلاق الصفقة"""
+                          ctx: SignalContext, df: pd.DataFrame) -> tuple:
+        """تحديد إذا كان يجب إغلاق الصفقة باستخدام مجلس الإدارة"""
+        # استشارة مجلس الإدارة
+        trade_data = {
+            "entry": entry_px,
+            "current_price": px,
+            "side": "long" if side == "buy" else "short",
+            "sl_price": getattr(self, 'initial_sl', None),
+            "entry_context": self.entry_context.__dict__ if self.entry_context else {},
+            "current_candles": df
+        }
+        
+        council_decision = self.smart_council.evaluate_trade(trade_data, ctx)
+        
+        if council_decision["action"] == "close" and council_decision["confidence"] > 0.7:
+            return True, f"COUNCIL: {council_decision['reason']}"
+        
         # 1. كسر SL
         if hasattr(self, 'initial_sl'):
             sl_hit = (px <= self.initial_sl) if side == "long" else (px >= self.initial_sl)
@@ -1096,6 +1403,7 @@ def open_market_enhanced(decision: ScenarioDecision, balance: float, current_pri
     log_g(f"🎯 DECISION: {decision.action.value} | MODE: {decision.mode.value}")
     log_g(f"📈 REASON: {decision.reason}")
     log_g(f"💪 CONFIDENCE: {decision.confidence:.2f}")
+    log_g(f"🏆 ZONE STRENGTH: {decision.zone_strength:.2f}")
     
     if decision.is_golden_trade:
         log_g("🏆 GOLDEN TRADE DETECTED - 3 Level TP Activated")
@@ -1116,6 +1424,7 @@ def open_market_enhanced(decision: ScenarioDecision, balance: float, current_pri
                 "mode": decision.mode.value.lower(),
                 "decision_reason": decision.reason,
                 "is_golden": decision.is_golden_trade,
+                "zone_strength": decision.zone_strength,
                 "tp_price": decision.tp_price,
                 "sl_price": decision.sl_price,
                 "entry_time": int(time.time()),
@@ -1132,6 +1441,12 @@ def open_market_enhanced(decision: ScenarioDecision, balance: float, current_pri
             # تخزين سياق الدخول
             if decision.meta and 'ctx' in decision.meta:
                 STATE["entry_context"] = decision.meta['ctx']
+            
+            # إعداد مدير الصفقة
+            trade_manager.initial_sl = decision.sl_price
+            trade_manager.trade_start_time = time.time()
+            trade_manager.golden_tp_levels = decision.meta.get("golden_tp_levels", []) if decision.is_golden_trade else []
+            trade_manager.golden_close_fractions = decision.meta.get("golden_close_fractions", []) if decision.is_golden_trade else []
             
             save_state(STATE)
             return True
@@ -1198,13 +1513,17 @@ def close_market_strict(reason="MANUAL"):
             "mode": None,
             "decision_reason": None,
             "is_golden": False,
+            "zone_strength": 0.5,
             "tp_price": None,
             "sl_price": None,
             "entry_time": None,
             "bars_in_trade": 0,
             "max_profit_pct": 0.0,
             "trade_manager": {},
-            "entry_context": None
+            "entry_context": None,
+            "trail_price": None,
+            "breakeven_armed": False,
+            "breakeven_price": None
         })
         
         save_state(STATE)
@@ -1213,8 +1532,8 @@ def close_market_strict(reason="MANUAL"):
         log_e(f"❌ CLOSE FAILED: {e}")
 
 # =================== DYNAMIC TRADE MANAGEMENT ===================
-def manage_open_position(df: pd.DataFrame, current_price: float):
-    """إدارة الصفقة المفتوحة ديناميكياً"""
+def manage_open_position_enhanced(df: pd.DataFrame, current_price: float):
+    """إدارة الصفقة المفتوحة ديناميكياً مع مجلس الإدارة"""
     if not STATE.get("open"):
         return
     
@@ -1279,7 +1598,16 @@ def manage_open_position(df: pd.DataFrame, current_price: float):
             STATE["tp_price"] = None  # إلغاء TP الثابت
     
     # ====================
-    # 3. كشف المناطق الخطرة والخروج الفوري
+    # 3. مجلس الإدارة الذكي
+    # ====================
+    should_close, close_reason = trade_manager.should_close_trade(current_price, entry, side, ctx, df)
+    if should_close:
+        log_w(f"🏛️ SMART COUNCIL DECISION: {close_reason}")
+        close_market_strict(close_reason)
+        return
+    
+    # ====================
+    # 4. كشف المناطق الخطرة والخروج الفوري
     # ====================
     if trade_manager.danger_zone_detected:
         log_w("⚠️ DANGER ZONE DETECTED - Emergency exit!")
@@ -1287,7 +1615,7 @@ def manage_open_position(df: pd.DataFrame, current_price: float):
         return
     
     # ====================
-    # 4. إدارة SL الديناميكي
+    # 5. إدارة SL الديناميكي
     # ====================
     initial_sl = STATE.get("sl_price")
     if initial_sl:
@@ -1298,19 +1626,25 @@ def manage_open_position(df: pd.DataFrame, current_price: float):
             return
     
     # ====================
-    # 5. إدارة TP للسكالب
+    # 6. إدارة TP للسكالب مع مراعاة قوة المنطقة
     # ====================
     if STATE.get("mode") == "scalp":
-        tp_price = STATE.get("tp_price")
-        if tp_price:
-            tp_hit = (current_price >= tp_price) if side == "long" else (current_price <= tp_price)
-            if tp_hit:
-                log_g(f"🎯 TP HIT: {current_price:.6f} vs TP {tp_price:.6f}")
+        zone_strength = STATE.get("zone_strength", 0.5)
+        should_take_profit, close_pct = should_take_scalp_profit(entry, current_price, side, ctx, zone_strength)
+        
+        if should_take_profit:
+            if close_pct >= 1.0:
+                log_g(f"🎯 TP HIT (ZoneStr:{zone_strength:.2f}): {current_price:.6f}")
                 close_market_strict("TP_HIT")
+                return
+            elif close_pct > 0:
+                log_g(f"🎯 PARTIAL TP ({close_pct*100:.0f}%) HIT (ZoneStr:{zone_strength:.2f})")
+                # هنا يمكن إضافة منطق الإغلاق الجزئي
+                close_market_strict("PARTIAL_TP_HIT")
                 return
     
     # ====================
-    # 6. Trailing Stop للترند
+    # 7. Trailing Stop للترند
     # ====================
     if STATE.get("mode") == "trend":
         atr = ctx.atr
@@ -1336,7 +1670,7 @@ def manage_open_position(df: pd.DataFrame, current_price: float):
             return
     
     # ====================
-    # 7. Early Fail Protection
+    # 8. Early Fail Protection
     # ====================
     if STATE["bars_in_trade"] <= EARLY_FAIL_BARS and profit_pct <= EARLY_FAIL_PNL_PCT:
         log_w(f"🧨 EARLY FAIL: PnL {profit_pct:.2f}% <= {EARLY_FAIL_PNL_PCT}%")
@@ -1344,7 +1678,7 @@ def manage_open_position(df: pd.DataFrame, current_price: float):
         return
     
     # ====================
-    # 8. Time Stop Protection
+    # 9. Time Stop Protection
     # ====================
     if STATE["bars_in_trade"] >= TIME_STOP_BARS and profit_pct < TIME_STOP_MIN_PNL_PCT:
         log_w(f"⏱️ TIME STOP: Bars {STATE['bars_in_trade']}, PnL {profit_pct:.2f}%")
@@ -1352,7 +1686,7 @@ def manage_open_position(df: pd.DataFrame, current_price: float):
         return
     
     # ====================
-    # 9. Breakeven Protection
+    # 10. Breakeven Protection
     # ====================
     if not STATE.get("breakeven_armed") and profit_pct >= BREAKEVEN_AFTER:
         STATE["breakeven_armed"] = True
@@ -1367,9 +1701,8 @@ def manage_open_position(df: pd.DataFrame, current_price: float):
             return
 
 # =================== MAIN TRADING LOOP ===================
-def trade_loop_enhanced():
-    """الحلقة الرئيسية للتداول مع Scenario Engine"""
-    global wait_for_next_signal_side
+def trade_loop_professional():
+    """الحلقة الرئيسية المحترفة مع جميع التحسينات"""
     loop_i = 0
     
     while True:
@@ -1383,9 +1716,9 @@ def trade_loop_enhanced():
                 time.sleep(BASE_SLEEP)
                 continue
             
-            # إدارة الصفقة المفتوحة
+            # إدارة الصفقة المفتوحة بالمحسنة
             if STATE.get("open"):
-                manage_open_position(df, px)
+                manage_open_position_enhanced(df, px)
             
             # اتخاذ قرار جديد فقط إذا لم تكن هناك صفقة مفتوحة
             if not STATE.get("open"):
@@ -1396,14 +1729,18 @@ def trade_loop_enhanced():
                     time.sleep(BASE_SLEEP)
                     continue
                 
-                # اتخاذ القرار بواسطة Scenario Engine
-                decision = scenario_decide(df)
+                # اتخاذ القرار بواسطة Scenario Engine المحسن
+                decision = scenario_decide_enhanced(df)
                 
-                # طباعة معلومات القرار
-                log_banner("SCENARIO ANALYSIS")
+                # طباعة تقرير مفصل
+                log_banner("PROFESSIONAL SCENARIO ANALYSIS")
                 log_i(f"📊 MARKET PHASE: {decision.meta.get('ctx', {}).get('phase', 'UNKNOWN')}")
                 log_i(f"🧭 MARKET BIAS: {decision.meta.get('ctx', {}).get('bias', 'neutral')}")
                 log_i(f"💪 MARKET STRENGTH: {decision.meta.get('ctx', {}).get('market_strength', 0):.2f}")
+                log_i(f"📈 ADX: {decision.meta.get('ctx', {}).get('adx', 0):.1f}")
+                log_i(f"📉 RSI: {decision.meta.get('ctx', {}).get('rsi', 0):.1f}")
+                log_i(f"💰 VOLUME Z: {decision.meta.get('ctx', {}).get('vol_z', 0):.2f}")
+                log_i(f"🏆 ZONE STRENGTH: {decision.zone_strength:.2f}")
                 
                 if decision.action in [Action.BUY, Action.SELL]:
                     log_g(f"🎯 SIGNAL: {decision.action.value} | MODE: {decision.mode.value}")
@@ -1412,6 +1749,7 @@ def trade_loop_enhanced():
                     
                     if decision.is_golden_trade:
                         log_g("🏆 GOLDEN TRADE DETECTED - High probability setup!")
+                        log_g(f"🎯 TP Levels: {decision.meta.get('golden_tp_levels', [])}")
                     
                     # تنفيذ الصفقة
                     open_market_enhanced(decision, bal, px)
@@ -1456,6 +1794,7 @@ STATE = {
     "mode": None,
     "decision_reason": None,
     "is_golden": False,
+    "zone_strength": 0.5,
     "tp_price": None,
     "sl_price": None,
     "entry_time": None,
@@ -1477,7 +1816,7 @@ app = Flask(__name__)
 @app.route("/")
 def home():
     mode = 'LIVE' if MODE_LIVE else 'PAPER'
-    return f"✅ Scenario Engine Bot v6.0 — {SYMBOL} {INTERVAL} — {mode}"
+    return f"✅ Professional Scenario Engine Bot v7.0 — {SYMBOL} {INTERVAL} — {mode}"
 
 @app.route("/metrics")
 def metrics():
@@ -1490,8 +1829,9 @@ def metrics():
         "price": price_now(),
         "state": STATE,
         "compound_pnl": compound_pnl,
-        "engine": "SCENARIO_ENGINE_v2",
-        "trade_manager": trade_manager.__dict__ if hasattr(trade_manager, '__dict__') else {}
+        "engine": "PROFESSIONAL_SCENARIO_ENGINE_v3",
+        "trade_manager": trade_manager.__dict__ if hasattr(trade_manager, '__dict__') else {},
+        "council": trade_manager.smart_council.__dict__ if hasattr(trade_manager, 'smart_council') else {}
     })
 
 @app.route("/health")
@@ -1504,12 +1844,12 @@ def health():
         "qty": STATE["qty"],
         "compound_pnl": compound_pnl,
         "timestamp": datetime.utcnow().isoformat(),
-        "engine": "SCENARIO_ENGINE"
+        "engine": "PROFESSIONAL_SCENARIO_ENGINE"
     }), 200
 
 # =================== MAIN EXECUTION ===================
 if __name__ == "__main__":
-    log_banner("SCENARIO ENGINE BOT v6.0")
+    log_banner("PROFESSIONAL SCENARIO ENGINE BOT v7.0")
     
     # تحميل الحالة السابقة
     state = load_state() or {}
@@ -1525,15 +1865,17 @@ if __name__ == "__main__":
     # عرض إعدادات البوت
     print(colored(f"🔥 MODE: {'LIVE' if MODE_LIVE else 'PAPER'} • {SYMBOL} • {INTERVAL}", "yellow"))
     print(colored(f"💰 RISK: {int(RISK_ALLOC*100)}% × {LEVERAGE}x", "yellow"))
-    print(colored(f"🧠 ENGINE: Scenario Engine v2 (Market Phase Detection)", "yellow"))
+    print(colored(f"🧠 ENGINE: Professional Scenario Engine v3", "yellow"))
+    print(colored(f"🏛️ SMART COUNCIL: 4-Member Decision Making", "yellow"))
     print(colored(f"🏆 GOLDEN TRADES: 3-Level TP ({GOLDEN_TP_LEVELS}%)", "yellow"))
-    print(colored(f"⚡ SCALP BOOST: {SCALP_TP1_BOOST_PCT}/{SCALP_TP2_BOOST_PCT}/{SCALP_TP3_BOOST_PCT}%", "yellow"))
-    print(colored(f"🛡️ PROTECTION: Early Fail + Time Stop + Danger Zone Detection", "yellow"))
+    print(colored(f"🗺️ FOOD PRINT: Advanced Zone Detection", "yellow"))
+    print(colored(f"⚡ SCALP MANAGEMENT: Dynamic TP based on Zone Strength", "yellow"))
+    print(colored(f"🛡️ PROTECTION: Early Fail + Time Stop + Danger Zone + Smart Council", "yellow"))
     print(colored(f"🚀 EXECUTION: {'ACTIVE' if EXECUTE_ORDERS and not DRY_RUN else 'SIMULATION'}", "yellow"))
     
     # بدء الخيوط
     import threading
-    threading.Thread(target=trade_loop_enhanced, daemon=True).start()
+    threading.Thread(target=trade_loop_professional, daemon=True).start()
     
     # تشغيل الخادم
     app.run(host="0.0.0.0", port=PORT, debug=False, use_reloader=False)
