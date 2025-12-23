@@ -1,2205 +1,2355 @@
 # -*- coding: utf-8 -*-
 """
-RF Futures Bot — RF-LIVE ONLY (BingX Perp via CCXT)
-• Advanced Scenario Engine + Dynamic Trade Management
-• Golden Entry + Smart Exit + Profit Protection
-• 3-Level TP for Golden Trades + Scalp Boost
-• Professional Risk Management + Market Phase Detection
-• FALCON STYLE ADDON: TP1/TP2/TP3 + Early Exit + Box Detector
-• SCENARIO ENGINE: Market State Detection + Smart Entry Points
-• PROFESSIONAL UPGRADE: Food Print Detection + Smart Trade Council
-• ADVANCED FEATURES: Danger Zone Detection + Professional Exit Management
+ULTIMATE DOGE PRO TRADER BOT v10.0 — Supreme Edition
+• الذكاء الاصطناعي المتكامل + مجلس إدارة عالي الدقة
+• كاشف المناطق الذهبية الذكي + إدارة ديناميكية محترفة
+• منظومة SMC كاملة (OB/FVG/BOS/CHoCH/ITC/LIQ)
+• نظام فود برنت متقدم + كاشف التلاعب والتذبذب
+• إغلاق صارم دائمًا على الربح + وقف خسارة ذكي
+• 3 مستويات TP للصفقات الذهبية + ترقية السكالب للترند
+• مجلس إدارة 7 أعضاء بمؤشرات متطورة
 """
 
-import os, time, math, random, signal, sys, traceback, logging, json
-from logging.handlers import RotatingFileHandler
-from datetime import datetime
+import os, time, math, random, sys, traceback, json
+from datetime import datetime, timedelta
 import pandas as pd
 import numpy as np
 import ccxt
 from flask import Flask, jsonify
-from decimal import Decimal, ROUND_DOWN, InvalidOperation
-from dataclasses import dataclass
+from decimal import Decimal, ROUND_DOWN
+from dataclasses import dataclass, field
 from enum import Enum
-from typing import Optional, Dict, Any, Tuple, List
+from typing import Optional, Dict, Any, Tuple, List, Set
+from collections import deque
 
 try:
     from termcolor import colored
-except Exception:
-    def colored(t,*a,**k): return t
+except:
+    def colored(text, color=None, on_color=None, attrs=None):
+        return text
 
-# =================== ENV / MODE ===================
+# =================== CONFIGURATION ===================
 API_KEY = os.getenv("BINGX_API_KEY", "")
 API_SECRET = os.getenv("BINGX_API_SECRET", "")
 MODE_LIVE = bool(API_KEY and API_SECRET)
 
-SELF_URL = os.getenv("SELF_URL", "") or os.getenv("RENDER_EXTERNAL_URL", "")
+SELF_URL = os.getenv("SELF_URL", "")
 PORT = int(os.getenv("PORT", 5000))
 
-# ==== Run mode / Logging toggles ====
-LOG_LEGACY = False
-LOG_ADDONS = True
-
-# ==== Execution Switches ====
-EXECUTE_ORDERS = True
-SHADOW_MODE_DASHBOARD = False
-DRY_RUN = False
-
-# ==== Addon: Logging + Recovery Settings ====
-BOT_VERSION = "DOGE Scenario Engine PRO v8.0 — Professional Food Print + Smart Council + Danger Zone Detection"
-print("🔁 Booting:", BOT_VERSION, flush=True)
-
-STATE_PATH = "./bot_state.json"
-RESUME_ON_RESTART = True
-RESUME_LOOKBACK_SECS = 60 * 60
-
-# === Addons config ===
-BOOKMAP_DEPTH = 50
-BOOKMAP_TOPWALLS = 3
-IMBALANCE_ALERT = 1.30
-
-FLOW_WINDOW = 20
-FLOW_SPIKE_Z = 1.60
-CVD_SMOOTH = 8
-
-# =================== SETTINGS ===================
-SYMBOL     = os.getenv("SYMBOL", "DOGE/USDT:USDT")
-INTERVAL   = os.getenv("INTERVAL", "15m")
-LEVERAGE   = int(os.getenv("LEVERAGE", 10))
+# === Core Settings ===
+SYMBOL = os.getenv("SYMBOL", "DOGE/USDT:USDT")
+INTERVAL = os.getenv("INTERVAL", "15m")
+LEVERAGE = int(os.getenv("LEVERAGE", 10))
 RISK_ALLOC = float(os.getenv("RISK_ALLOC", 0.60))
-POSITION_MODE = os.getenv("BINGX_POSITION_MODE", "oneway")
+POSITION_MODE = "oneway"
 
-# RF Settings
-RF_SOURCE = "close"
-RF_PERIOD = int(os.getenv("RF_PERIOD", 20))
-RF_MULT   = float(os.getenv("RF_MULT", 3.5))
-RF_LIVE_ONLY = True
-RF_HYST_BPS  = 6.0
+# === Execution Control ===
+EXECUTE_ORDERS = True
+DRY_RUN = False
+LOG_DETAILED = True
+STATE_PATH = "./bot_state.json"
+BOT_VERSION = "ULTIMATE DOGE PRO TRADER v10.0 — Supreme Edition"
 
-# Indicators
+print(f"\n{'='*60}")
+print(colored(f"🚀 {BOT_VERSION}", "cyan", attrs=["bold"]))
+print(colored(f"📊 SYMBOL: {SYMBOL} | INTERVAL: {INTERVAL}", "yellow"))
+print(colored(f"⚡ LEVERAGE: {LEVERAGE}x | RISK: {RISK_ALLOC*100}%", "yellow"))
+print(colored(f"🔐 MODE: {'LIVE' if MODE_LIVE else 'PAPER'}", "green" if MODE_LIVE else "red"))
+print(f"{'='*60}\n")
+
+# === Technical Indicators Settings ===
 RSI_LEN = 14
 ADX_LEN = 14
 ATR_LEN = 14
+MA_FAST = 9
+MA_SLOW = 21
+MA_TREND = 50
+VWAP_LEN = 20
+VOLUME_MA = 20
+MACD_FAST = 12
+MACD_SLOW = 26
+MACD_SIGNAL = 9
 
-MAX_SPREAD_BPS = float(os.getenv("MAX_SPREAD_BPS", 6.0))
+# === Market Structure Settings ===
+SWING_LOOKBACK = 100
+FVG_LOOKBACK = 50
+OB_LOOKBACK = 60
+LIQUIDITY_LOOKBACK = 30
+BREAKOUT_CONFIRM_BARS = 3
+CHoCH_CONFIRMATION = 2
+BOS_REQUIREMENT = 1.5  # 1.5x ATR for Break of Structure
 
-# Dynamic TP / trail
-TP1_PCT_BASE       = 0.40
-TP1_CLOSE_FRAC     = 0.50
-BREAKEVEN_AFTER    = 0.30
-TRAIL_ACTIVATE_PCT = 1.20
-ATR_TRAIL_MULT     = 1.6
+# === Golden Zone Detection ===
+GOLDEN_ZONE_MIN_STRENGTH = 7.0  # من 10
+GOLDEN_ZONE_REQUIREMENTS = {
+    "min_adx": 22,
+    "min_volume_z": 1.2,
+    "max_spread_bps": 8,
+    "min_rsi_divergence": 2.0,
+    "require_ob_or_fvg": True,
+    "require_liquidity_sweep": True,
+    "require_macd_confirmation": True
+}
 
-TREND_TPS       = [0.50, 1.00, 1.80]
-TREND_TP_FRACS  = [0.30, 0.30, 0.20]
+# === Trading Parameters ===
+MAX_TRADES_PER_DAY = 8
+COOLDOWN_AFTER_LOSS = 300  # 5 دقائق بعد خسارة
+COOLDOWN_AFTER_WIN = 60    # دقيقة بعد ربح
+MAX_SPREAD_BPS = 6.0
+MIN_VOLUME_RATIO = 1.3
 
-# Dust guard
-FINAL_CHUNK_QTY = float(os.getenv("FINAL_CHUNK_QTY", 40.0))
-RESIDUAL_MIN_QTY = float(os.getenv("RESIDUAL_MIN_QTY", 9.0))
-
-# Strict close
-CLOSE_RETRY_ATTEMPTS = 6
-CLOSE_VERIFY_WAIT_S  = 2.0
-
-# Pacing
-BASE_SLEEP   = 5
-NEAR_CLOSE_S = 1
-
-# ==== Smart Exit Tuning ===
-TP1_SCALP_PCT      = 0.35/100
-TP1_TREND_PCT      = 0.60/100
-HARD_CLOSE_PNL_PCT = 1.10/100
-WICK_ATR_MULT      = 1.5
-EVX_SPIKE          = 1.8
-BM_WALL_PROX_BPS   = 5
-TIME_IN_TRADE_MIN  = 8
-TRAIL_TIGHT_MULT   = 1.20
-
-# ==== Golden Entry Settings ====
-GOLDEN_ENTRY_SCORE = 6.0
-GOLDEN_ENTRY_ADX   = 20.0
-GOLDEN_REVERSAL_SCORE = 6.5
-
-# ==== Execution & Strategy Thresholds ====
-ADX_TREND_MIN = 20
-DI_SPREAD_TREND = 6
-RSI_MA_LEN = 9
-RSI_NEUTRAL_BAND = (45, 55)
-RSI_TREND_PERSIST = 3
-
-GZ_MIN_SCORE = 6.0
-GZ_REQ_ADX = 20
-GZ_REQ_VOL_MA = 20
-ALLOW_GZ_ENTRY = True
-
-SCALP_TP1 = 0.40
-SCALP_BE_AFTER = 0.30
-SCALP_ATR_MULT = 1.6
-TREND_TP1 = 1.20
-TREND_BE_AFTER = 0.80
-TREND_ATR_MULT = 1.8
-
-MAX_TRADES_PER_HOUR = 6
-COOLDOWN_SECS_AFTER_CLOSE = 60
-ADX_GATE = 17
-
-# ===== FALCON STYLE (TP1/TP2/TP3 + Early Exit) =====
-FALCON_TP2_ATR_MULT = 1.6
-FALCON_TP3_ATR_MULT = 2.4
-FALCON_TP2_CLOSE_FRAC = 0.30
-FALCON_TP3_CLOSE_FRAC = 0.40
-
-EARLY_FAIL_BARS = 3
-EARLY_FAIL_PNL_PCT = -0.15
-TIME_STOP_BARS = 10
-TIME_STOP_MIN_PNL_PCT = 0.05
-
-REENTRY_COOLDOWN_BARS = 2
-
-# ===== SCALP TARGET BOOST (higher TP for scalps) =====
-SCALP_TP1_BOOST_PCT = 0.65
-SCALP_TP2_BOOST_PCT = 1.10
-SCALP_TP3_BOOST_PCT = 1.80
-
-# ===== GOLDEN TRADE MULTI-LEVEL TP =====
+# === Profit Management ===
 GOLDEN_TP_LEVELS = [0.80, 1.50, 2.50]  # 3 مستويات للصفقات الذهبية
 GOLDEN_TP_CLOSE_FRACTIONS = [0.30, 0.30, 0.40]
 
-# =================== SCENARIO ENGINE CONFIG ===================
-SCENARIO_ENGINE_ENABLED = True
+SCALP_TP_LEVELS = [0.40, 0.70]  # مستويين للسكالب
+SCALP_TP_CLOSE_FRACTIONS = [0.50, 0.50]
 
-DISPLACEMENT_ATR_MULT = 1.6
-MIN_SCALP_POINTS = 7
-POINT_BPS = 10
-MIN_SCALP_BPS = MIN_SCALP_POINTS * POINT_BPS
+TREND_TP_TRAIL_ATR = 1.8
+TREND_BREAKEVEN_ATR = 0.8
 
-CHOP_ADX_MAX = 18
-TREND_ADX_MIN = 20
-STRONG_TREND_ADX = 28
+# === Risk Management ===
+MAX_DRAWDOWN_PCT = 2.0
+MAX_LOSS_PER_TRADE_PCT = 0.8
+MIN_RISK_REWARD = 1.5
+DYNAMIC_SL_ATR_MULT = 1.2
 
-RSI_OVERBOUGHT = 70
-RSI_OVERSOLD = 30
-
-FVG_LOOKBACK = 60
-OB_LOOKBACK = 80
-VWAP_LEN = 50
-
-SCALP_TP_ATR_MULT = 1.0
-SCALP_SL_ATR_MULT = 0.8
-TREND_TRAIL_ATR_MULT = 1.6
-
-# =================== PROFESSIONAL FOOD PRINT ===================
-FOOD_PRINT_LOOKBACK = 100
-MIN_ZONE_STRENGTH = 0.6
-STRONG_ZONE_THRESHOLD = 0.8
-
-# =================== DANGER ZONE DETECTION ===================
-DANGER_ZONE_ADX_CHANGE = 0.3  # تغيير ADX بنسبة 30%
-DANGER_ZONE_VOLUME_DROP = -1.5  # انخفاض الحجم
-DANGER_ZONE_VWAP_BREAK = True   # اختراق VWAP مع حجم ضعيف
-DANGER_ZONE_RSI_EXTREME = 90    # RSI فوق 90 أو تحت 10
+# === Advanced Detection ===
+FALSE_BREAKOUT_CONFIRMATION = 3  # شمعات للتأكيد
+LIQUIDITY_TRAP_THRESHOLD = 0.7   # نسبة كسر ثم عودة
+MANIPULATION_DETECTION_WINDOW = 10
+VOLUME_SPIKE_THRESHOLD = 2.5
 
 # =================== DATA STRUCTURES ===================
-class Action(str, Enum):
-    BUY = "BUY"
-    SELL = "SELL"
-    HOLD = "HOLD"
-    NO_TRADE = "NO_TRADE"
+class MarketBias(str, Enum):
+    STRONG_BULL = "STRONG_BULL"
+    BULL = "BULL"
+    NEUTRAL = "NEUTRAL"
+    BEAR = "BEAR"
+    STRONG_BEAR = "STRONG_BEAR"
 
-class Mode(str, Enum):
-    SCALP = "SCALP"
-    TREND = "TREND"
-    GOLDEN = "GOLDEN"  # صفقات ذهبية صاروخية
-    NONE = "NONE"
-
-class Phase(str, Enum):
+class MarketPhase(str, Enum):
     ACCUMULATION = "ACCUMULATION"
-    EXPANSION = "EXPANSION"
-    TREND = "TREND"
+    MARKUP = "MARKUP"
     DISTRIBUTION = "DISTRIBUTION"
-    EXHAUSTION = "EXHAUSTION"
+    MARKDOWN = "MARKDOWN"
     CHOP = "CHOP"
-    UNKNOWN = "UNKNOWN"
+    BREAKOUT = "BREAKOUT"
+    REVERSAL = "REVERSAL"
+
+class TradeType(str, Enum):
+    GOLDEN_REVERSAL = "GOLDEN_REVERSAL"
+    GOLDEN_BREAKOUT = "GOLDEN_BREAKOUT"
+    TREND_FOLLOW = "TREND_FOLLOW"
+    SCALP_RETEST = "SCALP_RETEST"
+    LIQUIDITY_GRAB = "LIQUIDITY_GRAB"
+
+class OrderBlockType(str, Enum):
+    BULLISH_OB = "BULLISH_OB"
+    BEARISH_OB = "BEARISH_OB"
+    FVG_BULL = "FVG_BULL"
+    FVG_BEAR = "FVG_BEAR"
+    BOS_CONFIRMATION = "BOS_CONFIRMATION"
+    CHOCH_CONFIRMATION = "CHOCH_CONFIRMATION"
 
 @dataclass
-class SignalContext:
-    px: float
+class MarketStructure:
+    """هيكل السوق المتقدم"""
+    higher_highs: List[float] = field(default_factory=list)
+    higher_lows: List[float] = field(default_factory=list)
+    lower_highs: List[float] = field(default_factory=list)
+    lower_lows: List[float] = field(default_factory=list)
+    swing_highs: List[Dict] = field(default_factory=list)
+    swing_lows: List[Dict] = field(default_factory=list)
+    last_bos: Optional[Dict] = None
+    last_choch: Optional[Dict] = None
+    trend: str = "neutral"
+    structure: str = "intact"
+    itc_zones: List[Dict] = field(default_factory=list)  # Internal Retracement Zones
+
+@dataclass
+class SmartSignal:
+    """إشارة ذكية متكاملة"""
+    action: str  # BUY/SELL
+    trade_type: TradeType
+    entry_price: float
+    stop_loss: float
+    take_profits: List[float]
+    close_fractions: List[float]
+    confidence: float  # من 0-10
+    reasons: List[str]
+    zone_strength: float  # قوة المنطقة 0-10
+    risk_reward: float
+    market_context: Dict[str, Any]
+    timestamp: int
+    is_golden: bool = False
+    requires_confirmation: bool = True
+
+@dataclass
+class TradingContext:
+    """السياق الشامل للتداول"""
+    price: float
+    volume: float
+    volume_ma: float
+    volume_ratio: float
+    volume_zscore: float
     atr: float
+    rsi: float
+    rsi_ma: float
     adx: float
     di_plus: float
     di_minus: float
-    rsi: float
+    macd: float
+    macd_signal: float
+    macd_histogram: float
+    ma_fast: float
+    ma_slow: float
+    ma_trend: float
     vwap: float
-    vol_z: float
-    displacement: bool
-    phase: Phase
-    bias: str
-    notes: List[str]
-    market_strength: float
-    danger_zone: bool = False  # إضافة كشف المنطقة الخطرة
+    bias: MarketBias
+    phase: MarketPhase
+    market_strength: float  # 0-10
+    structure: MarketStructure
+    order_blocks: List[Dict]
+    fair_value_gaps: List[Dict]
+    liquidity_zones: List[Dict]
+    support_zones: List[Dict]
+    resistance_zones: List[Dict]
+    manipulation_signals: List[str]
+    danger_zones: List[str]
 
-@dataclass
-class ScenarioDecision:
-    action: Action
-    mode: Mode
-    reason: str
-    confidence: float
-    tp_price: Optional[float] = None
-    sl_price: Optional[float] = None
-    is_golden_trade: bool = False
-    zone_strength: float = 0.5  # قوة منطقة الدخول
-    danger_zone_detected: bool = False  # كشف المنطقة الخطرة
-    meta: Optional[Dict[str, Any]] = None
-
-# =================== PROFESSIONAL LOGGING ===================
-def log_i(msg): print(f"ℹ️ {msg}", flush=True)
-def log_g(msg): print(f"✅ {msg}", flush=True)
-def log_w(msg): print(f"🟨 {msg}", flush=True)
-def log_e(msg): print(f"❌ {msg}", flush=True)
-def log_d(msg): print(f"⚠️ [DANGER] {msg}", flush=True)  # تسجيل المناطق الخطرة
-
-def log_banner(text): print(f"\n{'—'*12} {text} {'—'*12}\n", flush=True)
-
-def save_state(state: dict):
-    try:
-        state["ts"] = int(time.time())
-        with open(STATE_PATH, "w", encoding="utf-8") as f:
-            json.dump(state, f, ensure_ascii=False, indent=2)
-        log_i(f"state saved → {STATE_PATH}")
-    except Exception as e:
-        log_w(f"state save failed: {e}")
-
-def load_state() -> dict:
-    try:
-        if not os.path.exists(STATE_PATH): return {}
-        with open(STATE_PATH, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception as e:
-        log_w(f"state load failed: {e}")
-    return {}
-
-# =================== INDICATOR FUNCTIONS ===================
-def _true_range(h, l, c_prev):
-    return np.maximum(h - l, np.maximum(np.abs(h - c_prev), np.abs(l - c_prev)))
-
-def calc_atr(df: pd.DataFrame, length: int = ATR_LEN) -> pd.Series:
-    h = df["high"].astype(float).values
-    l = df["low"].astype(float).values
-    c = df["close"].astype(float).values
-    c_prev = np.roll(c, 1)
-    c_prev[0] = c[0]
-    tr = _true_range(h, l, c_prev)
-    atr = pd.Series(tr).ewm(alpha=1/length, adjust=False).mean()
-    return atr
-
-def calc_rsi(df: pd.DataFrame, length: int = RSI_LEN) -> pd.Series:
-    c = df["close"].astype(float)
-    d = c.diff()
-    up = d.clip(lower=0)
-    dn = (-d).clip(lower=0)
-    rs = up.ewm(alpha=1/length, adjust=False).mean() / (dn.ewm(alpha=1/length, adjust=False).mean() + 1e-12)
-    return 100 - (100 / (1 + rs))
-
-def calc_adx_di(df: pd.DataFrame, length: int = ADX_LEN) -> Tuple[pd.Series, pd.Series, pd.Series]:
-    h = df["high"].astype(float)
-    l = df["low"].astype(float)
-    c = df["close"].astype(float)
-
-    up_move = h.diff()
-    dn_move = -l.diff()
-
-    plus_dm = np.where((up_move > dn_move) & (up_move > 0), up_move, 0.0)
-    minus_dm = np.where((dn_move > up_move) & (dn_move > 0), dn_move, 0.0)
-
-    tr = _true_range(h.values, l.values, c.shift(1).fillna(c.iloc[0]).values)
-    tr_sm = pd.Series(tr).ewm(alpha=1/length, adjust=False).mean()
-
-    plus_di = 100 * (pd.Series(plus_dm).ewm(alpha=1/length, adjust=False).mean() / (tr_sm + 1e-12))
-    minus_di = 100 * (pd.Series(minus_dm).ewm(alpha=1/length, adjust=False).mean() / (tr_sm + 1e-12))
-
-    dx = 100 * (np.abs(plus_di - minus_di) / (plus_di + minus_di + 1e-12))
-    adx = dx.ewm(alpha=1/length, adjust=False).mean()
-    return adx, plus_di, minus_di
-
-def calc_vwap(df: pd.DataFrame, length: int = VWAP_LEN) -> pd.Series:
-    tp = (df["high"].astype(float) + df["low"].astype(float) + df["close"].astype(float)) / 3.0
-    v = df["volume"].astype(float).replace(0, np.nan).ffill().fillna(1.0)
-    pv = tp * v
-    vwap = pv.rolling(length).sum() / (v.rolling(length).sum() + 1e-12)
-    return vwap.ffill()
-
-def zscore(s: pd.Series, length: int = 50) -> pd.Series:
-    m = s.rolling(length).mean()
-    sd = s.rolling(length).std(ddof=0)
-    return ((s - m) / (sd + 1e-12)).fillna(0.0)
-
-def is_displacement(df: pd.DataFrame, i: int, atr: float, mult: float = DISPLACEMENT_ATR_MULT) -> bool:
-    """شمعة قوية: جسم أو مدى أكبر من 1.6×ATR"""
-    if i <= 0:
-        return False
-    o = float(df["open"].iloc[i])
-    c = float(df["close"].iloc[i])
-    h = float(df["high"].iloc[i])
-    l = float(df["low"].iloc[i])
-    body = abs(c - o)
-    rng = (h - l)
-    return (body >= mult * atr) or (rng >= mult * atr)
-
-def candle_rejection(df: pd.DataFrame, i: int, side: str) -> bool:
-    """Reject بسيط: ذيل عكس الاتجاه كبير"""
-    o = float(df["open"].iloc[i])
-    c = float(df["close"].iloc[i])
-    h = float(df["high"].iloc[i])
-    l = float(df["low"].iloc[i])
-    body = abs(c - o) + 1e-12
-    upper_wick = h - max(o, c)
-    lower_wick = min(o, c) - l
-
-    if side == "sell":
-        return upper_wick >= 1.5 * body and c < o
-    if side == "buy":
-        return lower_wick >= 1.5 * body and c > o
-    return False
-
-def detect_fvg(df: pd.DataFrame, lookback: int = FVG_LOOKBACK) -> Dict[str, Any]:
-    """اكتشاف Fair Value Gaps"""
-    n = len(df)
-    if n < 3:
-        return {"ok": False}
-
-    start = max(2, n - lookback)
-    fvg_list = []
-    for i in range(start, n):
-        hi_2 = float(df["high"].iloc[i-2])
-        lo_2 = float(df["low"].iloc[i-2])
-        hi = float(df["high"].iloc[i])
-        lo = float(df["low"].iloc[i])
-
-        if lo > hi_2:
-            fvg_list.append({"type": "bull", "low": hi_2, "high": lo, "i": i})
-        if hi < lo_2:
-            fvg_list.append({"type": "bear", "low": hi, "high": lo_2, "i": i})
-
-    if not fvg_list:
-        return {"ok": False}
-
-    last = fvg_list[-1]
-    return {"ok": True, "last": last, "all": fvg_list}
-
-def detect_simple_ob(df: pd.DataFrame, lookback: int = OB_LOOKBACK) -> Dict[str, Any]:
-    """اكتشاف Order Blocks مبسّط"""
-    n = len(df)
-    if n < 5:
-        return {"ok": False}
-
-    start = max(2, n - lookback)
-    atr_s = calc_atr(df, ATR_LEN)
-
-    bull_ob = None
-    bear_ob = None
-
-    for i in range(start+2, n):
-        atr = float(atr_s.iloc[i])
-        disp = is_displacement(df, i, atr)
-        o = float(df["open"].iloc[i])
-        c = float(df["close"].iloc[i])
-
-        if disp and c > o:
-            for j in range(i-1, max(start, i-8), -1):
-                oj = float(df["open"].iloc[j]); cj = float(df["close"].iloc[j])
-                if cj < oj:
-                    bull_ob = {"low": float(df["low"].iloc[j]), "high": float(df["high"].iloc[j]), "i": j}
-                    break
-
-        if disp and c < o:
-            for j in range(i-1, max(start, i-8), -1):
-                oj = float(df["open"].iloc[j]); cj = float(df["close"].iloc[j])
-                if cj > oj:
-                    bear_ob = {"low": float(df["low"].iloc[j]), "high": float(df["high"].iloc[j]), "i": j}
-                    break
-
-    return {"ok": True, "bull_ob": bull_ob, "bear_ob": bear_ob}
-
-def near_zone(px: float, low: float, high: float, tolerance_bps: float = 15) -> bool:
-    if low is None or high is None:
-        return False
-    mid = (low + high) / 2.0
-    bps = abs(px - mid) / (mid + 1e-12) * 10000
-    return bps <= tolerance_bps or (low <= px <= high)
-
-def detect_liquidity_sweep(df: pd.DataFrame, lookback: int = 30) -> Dict[str, Any]:
-    """اكتشاف Liquidity Sweeps"""
-    n = len(df)
-    if n < lookback + 2:
-        return {"ok": False}
-
-    recent = df.iloc[-(lookback+1):-1]
-    prev_low = float(recent["low"].min())
-    prev_high = float(recent["high"].max())
-
-    o = float(df["open"].iloc[-1])
-    c = float(df["close"].iloc[-1])
-    h = float(df["high"].iloc[-1])
-    l = float(df["low"].iloc[-1])
-
-    sweep_low = (l < prev_low) and (c > prev_low) and ((min(o, c) - l) > (h - max(o, c)))
-    sweep_high = (h > prev_high) and (c < prev_high) and ((h - max(o, c)) > (min(o, c) - l))
-
-    return {"ok": True, "sweep_low": sweep_low, "sweep_high": sweep_high, "prev_low": prev_low, "prev_high": prev_high}
-
-def detect_bias(adx: float, di_plus: float, di_minus: float, vwap: float, px: float) -> str:
-    if adx < CHOP_ADX_MAX:
-        return "neutral"
-    if di_plus > di_minus and px >= vwap:
-        return "bull"
-    if di_minus > di_plus and px <= vwap:
-        return "bear"
-    return "neutral"
-
-def detect_phase(df: pd.DataFrame, i: int, atr: float, adx: float, vol_z: float, displacement: bool) -> Phase:
-    """كشف طور السوق الحالي"""
-    if adx < CHOP_ADX_MAX and not displacement:
-        if vol_z > 0.8:
-            return Phase.ACCUMULATION
-        return Phase.CHOP
-
-    if displacement and vol_z > 0.7:
-        return Phase.EXPANSION
-
-    if adx >= TREND_ADX_MIN:
-        return Phase.TREND
-
-    return Phase.UNKNOWN
-
-def bps_from_prices(a: float, b: float) -> float:
-    return abs(a - b) / (a + 1e-12) * 10000
-
-def scalp_tp_sl(px: float, atr: float, side: str, zone_strength: float = 0.5) -> Tuple[float, float]:
-    """حساب TP/SL للسكالب بناءً على قوة المنطقة"""
-    # تعديل TP/SL حسب قوة المنطقة
-    strength_multiplier = 1.0 + (zone_strength - 0.5)  # 0.5-1.5
+# =================== LOGGING SYSTEM ===================
+class ProLogger:
+    """نظام تسجيل محترف"""
     
-    min_tp_abs = px * (MIN_SCALP_BPS / 10000.0) * strength_multiplier
-    tp_abs = max(atr * SCALP_TP_ATR_MULT * strength_multiplier, min_tp_abs)
-    sl_abs = max(atr * SCALP_SL_ATR_MULT, px * (0.7 * MIN_SCALP_BPS / 10000.0))
-
-    if side == "buy":
-        return px + tp_abs, px - sl_abs
-    else:
-        return px - tp_abs, px + sl_abs
-
-def trend_initial_sl(px: float, atr: float, side: str) -> float:
-    """حساب SL الأولي للترند"""
-    sl_abs = atr * TREND_TRAIL_ATR_MULT
-    return (px - sl_abs) if side == "buy" else (px + sl_abs)
-
-def build_context(df: pd.DataFrame) -> SignalContext:
-    """بناء سياق السوق الحالي"""
-    df = df.copy()
-    atr_s = calc_atr(df, ATR_LEN)
-    rsi_s = calc_rsi(df, RSI_LEN)
-    adx_s, di_p_s, di_m_s = calc_adx_di(df, ADX_LEN)
-    vwap_s = calc_vwap(df, VWAP_LEN)
-    vol_z_s = zscore(df["volume"].astype(float), 50)
-
-    i = len(df) - 1
-    px = float(df["close"].iloc[i])
-    atr = float(atr_s.iloc[i])
-    adx = float(adx_s.iloc[i])
-    di_p = float(di_p_s.iloc[i])
-    di_m = float(di_m_s.iloc[i])
-    rsi = float(rsi_s.iloc[i])
-    vwap = float(vwap_s.iloc[i])
-    vol_z = float(vol_z_s.iloc[i])
-
-    disp = is_displacement(df, i, atr, DISPLACEMENT_ATR_MULT)
-    phase = detect_phase(df, i, atr, adx, vol_z, disp)
-    bias = detect_bias(adx, di_p, di_m, vwap, px)
+    @staticmethod
+    def info(msg):
+        print(f"{colored('ℹ️', 'blue')} {msg}", flush=True)
     
-    # حساب قوة السوق
-    market_strength = (adx / 50.0) * 0.4 + (vol_z / 3.0) * 0.3 + (abs(di_p - di_m) / 30.0) * 0.3
-
-    notes = []
-    if disp: notes.append(f"displacement>{DISPLACEMENT_ATR_MULT}xATR")
-    if adx < CHOP_ADX_MAX: notes.append("adx_chop")
-    if adx >= TREND_ADX_MIN: notes.append("adx_trend")
-    if di_p > di_m: notes.append("di_bull")
-    if di_m > di_p: notes.append("di_bear")
-    if px > vwap: notes.append("above_vwap")
-    if px < vwap: notes.append("below_vwap")
-    if rsi >= RSI_OVERBOUGHT: notes.append("rsi_overbought")
-    if rsi <= RSI_OVERSOLD: notes.append("rsi_oversold")
-
-    return SignalContext(
-        px=px, atr=atr, adx=adx, di_plus=di_p, di_minus=di_m, rsi=rsi,
-        vwap=vwap, vol_z=vol_z, displacement=disp, phase=phase, bias=bias, 
-        notes=notes, market_strength=market_strength
-    )
-
-# =================== ENHANCED FOOD PRINT DETECTION ===================
-def detect_food_print_advanced_v2(df: pd.DataFrame, lookback: int = FOOD_PRINT_LOOKBACK) -> Dict[str, Any]:
-    """
-    كشف فود برنت متقدم محسّن: مناطق السيولة والتراكم والتوزيع مع تحليل عميق
-    """
-    n = len(df)
-    if n < lookback + 10:
-        return {"ok": False}
+    @staticmethod
+    def success(msg):
+        print(f"{colored('✅', 'green')} {msg}", flush=True)
     
-    results = {
-        "liquidity_pools": [],
-        "accumulation_zones": [],
-        "distribution_zones": [],
-        "fair_value_gaps": [],
-        "danger_zones": [],
-        "zone_strength": 0.5,
-        "zone_quality": "UNKNOWN"
-    }
+    @staticmethod
+    def warning(msg):
+        print(f"{colored('⚠️', 'yellow')} {msg}", flush=True)
     
-    # 1. اكتشاف مناطق السيولة المتقدمة
-    window_size = 7
-    for i in range(max(0, n - lookback), max(0, n - window_size)):
-        if i + window_size > n:
-            continue
-            
-        window = df.iloc[i:i+window_size]
-        max_range = float(window["high"].max() - window["low"].min())
-        avg_body = float(abs(window["close"] - window["open"]).mean())
-        volume_avg = float(window["volume"].mean())
+    @staticmethod
+    def error(msg):
+        print(f"{colored('❌', 'red')} {msg}", flush=True)
+    
+    @staticmethod
+    def signal(msg):
+        print(f"{colored('🎯', 'cyan', attrs=['bold'])} {msg}", flush=True)
+    
+    @staticmethod
+    def trade(msg):
+        print(f"{colored('💰', 'magenta', attrs=['bold'])} {msg}", flush=True)
+    
+    @staticmethod
+    def golden(msg):
+        print(f"{colored('🏆', 'yellow', attrs=['bold'])} {msg}", flush=True)
+    
+    @staticmethod
+    def danger(msg):
+        print(f"{colored('🔥', 'red', attrs=['bold'])} {msg}", flush=True)
+    
+    @staticmethod
+    def banner(text):
+        print(f"\n{colored('='*60, 'cyan')}")
+        print(colored(f"   {text}", 'cyan', attrs=['bold']))
+        print(colored('='*60, 'cyan'), "\n")
+
+logger = ProLogger()
+
+# =================== TECHNICAL INDICATORS ===================
+class AdvancedIndicators:
+    """فئة المؤشرات المتقدمة"""
+    
+    @staticmethod
+    def calculate_all(df: pd.DataFrame) -> Dict[str, Any]:
+        """حساب جميع المؤشرات مرة واحدة"""
+        results = {}
         
-        # حساب الحجم التاريخي بأمان
-        lookback_start = max(0, i - 20)
-        if lookback_start < i:
-            lookback_vol = float(df["volume"].iloc[lookback_start:i].mean())
-        else:
-            lookback_vol = volume_avg
+        # الأسعار الأساسية
+        close = df['close'].astype(float)
+        high = df['high'].astype(float)
+        low = df['low'].astype(float)
+        volume = df['volume'].astype(float)
         
-        # منطقة سيولة حقيقية: شموع صغيرة + حجم مرتفع
-        if avg_body < max_range * 0.2 and volume_avg > lookback_vol * 1.5:
-            results["liquidity_pools"].append({
-                "start": i,
-                "end": i + window_size,
-                "range_low": float(window["low"].min()),
-                "range_high": float(window["high"].max()),
-                "volume_factor": volume_avg / max(lookback_vol, 1e-12)
-            })
-    
-    # 2. مناطق التراكم المتقدمة (سعر يتراكم والحجم يرتفع)
-    for i in range(max(0, n - lookback), max(0, n - 25)):
-        if i + 25 > n:
-            continue
-            
-        window = df.iloc[i:i+25]
-        first_third = window.iloc[:8]
-        second_third = window.iloc[8:16]
-        last_third = window.iloc[16:]
+        # 1. المتوسطات المتحركة
+        results['ma_fast'] = close.rolling(window=MA_FAST).mean()
+        results['ma_slow'] = close.rolling(window=MA_SLOW).mean()
+        results['ma_trend'] = close.rolling(window=MA_TREND).mean()
         
-        price_trend = (float(last_third["close"].mean()) > float(first_third["close"].mean()))
-        volume_trend = (float(first_third["volume"].mean()) > float(last_third["volume"].mean()) * 1.2)
+        # 2. RSI مع تحسينات
+        delta = close.diff()
+        gain = (delta.where(delta > 0, 0)).rolling(window=RSI_LEN).mean()
+        loss = (-delta.where(delta < 0, 0)).rolling(window=RSI_LEN).mean()
+        rs = gain / (loss + 1e-12)
+        results['rsi'] = 100 - (100 / (1 + rs))
+        results['rsi_ma'] = results['rsi'].rolling(window=RSI_LEN).mean()
         
-        if price_trend and volume_trend:
-            results["accumulation_zones"].append({
-                "start": i,
-                "end": i + 25,
-                "avg_price": float(window["close"].mean()),
-                "volume_ratio": float(first_third["volume"].mean()) / max(float(last_third["volume"].mean()), 1e-12)
-            })
-    
-    # 3. مناطق التوزيع المتقدمة
-    for i in range(max(0, n - lookback), max(0, n - 25)):
-        if i + 25 > n:
-            continue
-            
-        window = df.iloc[i:i+25]
-        first_third = window.iloc[:8]
-        second_third = window.iloc[8:16]
-        last_third = window.iloc[16:]
+        # 3. ATR
+        tr1 = high - low
+        tr2 = abs(high - close.shift())
+        tr3 = abs(low - close.shift())
+        tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+        results['atr'] = tr.rolling(window=ATR_LEN).mean()
         
-        price_trend = (float(last_third["close"].mean()) < float(first_third["close"].mean()))
-        volume_trend = (float(first_third["volume"].mean()) > float(last_third["volume"].mean()) * 1.2)
+        # 4. ADX & DI
+        plus_dm = high.diff()
+        minus_dm = low.diff() * -1
         
-        if price_trend and volume_trend:
-            results["distribution_zones"].append({
-                "start": i,
-                "end": i + 25,
-                "avg_price": float(window["close"].mean()),
-                "volume_ratio": float(first_third["volume"].mean()) / max(float(last_third["volume"].mean()), 1e-12)
-            })
-    
-    # 4. كشف المناطق الخطرة
-    for i in range(max(0, n - 10), max(0, n - 3)):
-        if i + 3 > n:
-            continue
-            
-        window = df.iloc[i:i+3]
-        if len(window) < 3:
-            continue
-            
-        # انخفاض حاد في الحجم + اختراق سعري
-        vol_drop = (float(window["volume"].iloc[-1]) < float(window["volume"].iloc[0]) * 0.5)
-        price_spike = (abs(float(window["close"].iloc[-1]) - float(window["close"].iloc[0])) / 
-                      max(float(window["close"].iloc[0]), 1e-12) > 0.02)
+        plus_dm = plus_dm.where((plus_dm > minus_dm) & (plus_dm > 0), 0)
+        minus_dm = minus_dm.where((minus_dm > plus_dm) & (minus_dm > 0), 0)
         
-        if vol_drop and price_spike:
-            results["danger_zones"].append({
-                "start": i,
-                "end": i + 3,
-                "reason": "Volume drop with price spike",
-                "risk_level": "HIGH"
-            })
-    
-    # 5. حساب قوة وجودة المنطقة
-    recent_price = float(df["close"].iloc[-1])
-    zone_strength = 0.5
-    zone_quality = "NEUTRAL"
-    
-    # عامل 1: قرب السعر من مناطق التراكم/التوزيع
-    accumulation_distance = None
-    for zone in results["accumulation_zones"]:
-        distance = abs(recent_price - zone["avg_price"]) / max(zone["avg_price"], 1e-12)
-        if accumulation_distance is None or distance < accumulation_distance:
-            accumulation_distance = distance
-    
-    if accumulation_distance and accumulation_distance < 0.015:
-        zone_strength += 0.3
-        zone_quality = "ACCUMULATION_ZONE"
-    
-    # عامل 2: وجود مناطق سيولة قريبة
-    liquidity_nearby = False
-    for pool in results["liquidity_pools"]:
-        if pool["range_low"] <= recent_price <= pool["range_high"]:
-            liquidity_nearby = True
-            break
-    
-    if liquidity_nearby:
-        zone_strength += 0.15
-        zone_quality = "LIQUIDITY_ZONE" if zone_quality == "NEUTRAL" else zone_quality
-    
-    # عامل 3: المناطق الخطرة
-    if results["danger_zones"]:
-        zone_strength -= 0.25
-        zone_quality = "DANGER_ZONE"
-    
-    # عامل 4: عدد المناطق المكتشفة
-    total_zones = len(results["accumulation_zones"]) + len(results["distribution_zones"])
-    if total_zones > 3:
-        zone_strength += min(0.15 * total_zones, 0.3)
-    
-    results["zone_strength"] = min(max(zone_strength, 0.1), 0.95)
-    results["zone_quality"] = zone_quality
-    
-    return {"ok": True, **results}
-
-# =================== DANGER ZONE DETECTION ===================
-def detect_danger_zone_advanced(df: pd.DataFrame, ctx: SignalContext) -> Dict[str, Any]:
-    """كشف المنطقة الخطرة المتقدم"""
-    danger_reasons = []
-    risk_level = "LOW"
-    
-    # 1. RSI في أقصى المدى
-    if ctx.rsi >= DANGER_ZONE_RSI_EXTREME or ctx.rsi <= (100 - DANGER_ZONE_RSI_EXTREME):
-        danger_reasons.append(f"RSI_EXTREME({ctx.rsi:.1f})")
-        risk_level = "HIGH"
-    
-    # 2. تغيير حاد في ADX
-    if len(df) > ADX_LEN:
-        adx_series = calc_adx_di(df, ADX_LEN)[0]
-        if len(adx_series) > 1:
-            current_adx = float(adx_series.iloc[-1])
-            prev_adx = float(adx_series.iloc[-2])
-            adx_change = abs(current_adx - prev_adx) / max(prev_adx, 1e-12)
-            if adx_change > DANGER_ZONE_ADX_CHANGE and current_adx < 20:
-                danger_reasons.append(f"ADX_CHANGE({adx_change:.2f})")
-                risk_level = "MEDIUM"
-    
-    # 3. انخفاض حاد في الحجم
-    if ctx.vol_z < DANGER_ZONE_VOLUME_DROP:
-        danger_reasons.append(f"VOLUME_DROP(z={ctx.vol_z:.2f})")
-        risk_level = "MEDIUM"
-    
-    # 4. اختراق VWAP مع حجم ضعيف
-    vwap_distance = abs(ctx.px - ctx.vwap) / max(ctx.vwap, 1e-12)
-    if DANGER_ZONE_VWAP_BREAK and vwap_distance > 0.005 and ctx.vol_z < 0:
-        danger_reasons.append(f"VWAP_BREAK_WEAK_VOLUME")
-        risk_level = "MEDIUM"
-    
-    # 5. شمعة إشارة خطيرة
-    candles = compute_candles(df)
-    if candles["wick_up_big"] and ctx.rsi > 70:
-        danger_reasons.append("UPPER_WICK_OVERSOLD")
-        risk_level = "HIGH"
-    if candles["wick_dn_big"] and ctx.rsi < 30:
-        danger_reasons.append("LOWER_WICK_OVERSOLD")
-        risk_level = "HIGH"
-    
-    # 6. انعكاس مفاجئ في الترند
-    if ctx.adx > 25 and abs(ctx.di_plus - ctx.di_minus) < 5:
-        danger_reasons.append("TREND_WEAKENING")
-        risk_level = "MEDIUM"
-    
-    return {
-        "is_danger_zone": len(danger_reasons) > 0,
-        "risk_level": risk_level,
-        "reasons": danger_reasons,
-        "adx": ctx.adx,
-        "rsi": ctx.rsi,
-        "vol_z": ctx.vol_z
-    }
-
-# =================== CANDLES MODULE ===================
-def _body(o,c): return abs(c-o)
-def _rng(h,l):  return max(h-l, 1e-12)
-def _upper_wick(h,o,c): return h - max(o,c)
-def _lower_wick(l,o,c): return min(o,c) - l
-
-def _is_doji(o,c,h,l,th=0.1):
-    return _body(o,c) <= th * _rng(h,l)
-
-def compute_candles(df):
-    if len(df) < 5:
-        return {"buy":False,"sell":False,"score_buy":0.0,"score_sell":0.0,
-                "wick_up_big":False,"wick_dn_big":False,"doji":False,"pattern":None}
-
-    o1,h1,l1,c1 = float(df["open"].iloc[-2]), float(df["high"].iloc[-2]), float(df["low"].iloc[-2]), float(df["close"].iloc[-2])
-    o0,h0,l0,c0 = float(df["open"].iloc[-3]), float(df["high"].iloc[-3]), float(df["low"].iloc[-3]), float(df["close"].iloc[-3])
-
-    strength_b = strength_s = 0.0
-    tags = []
-
-    # Bullish engulfing
-    if c0 < o0 and c1 > o1 and o1 <= c0 and c1 >= o0:
-        strength_b += 2.0; tags.append("bull_engulf")
-    
-    # Bearish engulfing
-    if c0 > o0 and c1 < o1 and o1 >= c0 and c1 <= o0:
-        strength_s += 2.0; tags.append("bear_engulf")
-    
-    # Hammer
-    if _lower_wick(l1,o1,c1) >= 2 * _body(o1,c1) and _upper_wick(h1,o1,c1) <= 0.4 * _body(o1,c1):
-        strength_b += 1.5; tags.append("hammer")
-    
-    # Shooting star
-    if _upper_wick(h1,o1,c1) >= 2 * _body(o1,c1) and _lower_wick(l1,o1,c1) <= 0.4 * _body(o1,c1):
-        strength_s += 1.5; tags.append("shooting_star")
-    
-    is_doji = _is_doji(o1,c1,h1,l1)
-    if is_doji: tags.append("doji")
-
-    rng1 = _rng(h1,l1); up = _upper_wick(h1,o1,c1); dn = _lower_wick(l1,o1,c1)
-    wick_up_big = (up >= 1.2*_body(o1,c1)) and (up >= 0.4*rng1)
-    wick_dn_big = (dn >= 1.2*_body(o1,c1)) and (dn >= 0.4*rng1)
-
-    if is_doji:
-        strength_b *= 0.8; strength_s *= 0.8
-
-    return {
-        "buy": strength_b>0, "sell": strength_s>0,
-        "score_buy": round(strength_b,2), "score_sell": round(strength_s,2),
-        "wick_up_big": bool(wick_up_big), "wick_dn_big": bool(wick_dn_big),
-        "doji": bool(is_doji), "pattern": ",".join(tags) if tags else None
-    }
-
-def is_golden_trade_setup_enhanced(ctx: SignalContext, fvg: Dict, ob: Dict, 
-                                  sweep: Dict, food_print: Dict) -> Tuple[bool, float]:
-    """كشف إعدادات الصفقات الذهبية مع فود برنت"""
-    
-    # الشروط الأساسية
-    if ctx.adx < 25:
-        return False, 0.0
-    
-    if not ctx.displacement:
-        return False, 0.0
-    
-    if ctx.vol_z < 0.5:
-        return False, 0.0
-    
-    # شروط فود برنت
-    zone_strength = food_print.get("zone_strength", 0.5) if food_print.get("ok") else 0.5
-    
-    if food_print.get("ok"):
-        # تحقق من مناطق التراكم للتداول الطويل
-        if ctx.bias == "bull":
-            accumulation_nearby = any(
-                zone["avg_price"] * 1.02 >= ctx.px >= zone["avg_price"] * 0.98
-                for zone in food_print.get("accumulation_zones", [])
-            )
-            if not accumulation_nearby:
-                zone_strength *= 0.7  # تقليل قوة المنطقة
+        tr_smooth = tr.rolling(window=ADX_LEN).mean()
+        plus_di = 100 * (plus_dm.rolling(window=ADX_LEN).mean() / tr_smooth)
+        minus_di = 100 * (minus_dm.rolling(window=ADX_LEN).mean() / tr_smooth)
         
-        # تحقق من مناطق التوزيع للتداول القصير
-        if ctx.bias == "bear":
-            distribution_nearby = any(
-                zone["avg_price"] * 1.02 >= ctx.px >= zone["avg_price"] * 0.98
-                for zone in food_print.get("distribution_zones", [])
-            )
-            if not distribution_nearby:
-                zone_strength *= 0.7  # تقليل قوة المنطقة
-    
-    # RSI مناسب
-    if ctx.bias == "bull" and ctx.rsi > 70:
-        zone_strength *= 0.6
-    if ctx.bias == "bear" and ctx.rsi < 30:
-        zone_strength *= 0.6
-    
-    # منطقة دخول واضحة
-    has_entry_zone = False
-    if fvg.get("ok"):
-        last_fvg = fvg.get("last")
-        if last_fvg:
-            if last_fvg["type"] == "bull" and ctx.bias == "bull":
-                has_entry_zone = True
-            elif last_fvg["type"] == "bear" and ctx.bias == "bear":
-                has_entry_zone = True
-    
-    if ob.get("ok"):
-        bull_ob = ob.get("bull_ob")
-        bear_ob = ob.get("bear_ob")
-        if (bull_ob and ctx.bias == "bull") or (bear_ob and ctx.bias == "bear"):
-            has_entry_zone = True
-    
-    if not has_entry_zone:
-        zone_strength *= 0.5
-    
-    # الشروط النهائية للصفقات الذهبية
-    is_golden = (zone_strength >= MIN_ZONE_STRENGTH and 
-                 has_entry_zone and 
-                 ctx.displacement and 
-                 ctx.adx >= 25)
-    
-    return is_golden, zone_strength
+        dx = 100 * abs(plus_di - minus_di) / (plus_di + minus_di + 1e-12)
+        results['adx'] = dx.rolling(window=ADX_LEN).mean()
+        results['di_plus'] = plus_di
+        results['di_minus'] = minus_di
+        
+        # 5. MACD
+        exp1 = close.ewm(span=MACD_FAST, adjust=False).mean()
+        exp2 = close.ewm(span=MACD_SLOW, adjust=False).mean()
+        results['macd'] = exp1 - exp2
+        results['macd_signal'] = results['macd'].ewm(span=MACD_SIGNAL, adjust=False).mean()
+        results['macd_histogram'] = results['macd'] - results['macd_signal']
+        
+        # 6. VWAP
+        typical_price = (high + low + close) / 3
+        results['vwap'] = (typical_price * volume).cumsum() / volume.cumsum()
+        
+        # 7. Volume Analysis
+        results['volume_ma'] = volume.rolling(window=VOLUME_MA).mean()
+        results['volume_ratio'] = volume / results['volume_ma']
+        volume_z = (volume - volume.rolling(window=50).mean()) / (volume.rolling(window=50).std() + 1e-12)
+        results['volume_zscore'] = volume_z
+        
+        return results
 
-def should_promote_scalp_to_trend(entry_px: float, px: float, side: str, ctx: SignalContext) -> bool:
-    """ترقية الصفقة من سكالب لترند"""
-    profit_bps = (px - entry_px) / max(entry_px, 1e-12) * 10000
-    if side == "sell":
-        profit_bps = (entry_px - px) / max(entry_px, 1e-12) * 10000
-
-    if profit_bps < MIN_SCALP_BPS:
-        return False
-
-    if ctx.adx < TREND_ADX_MIN:
-        return False
-
-    if side == "buy" and ctx.bias != "bull":
-        return False
-    if side == "sell" and ctx.bias != "bear":
-        return False
-
-    if side == "buy" and ctx.rsi >= 85:
-        return False
-    if side == "sell" and ctx.rsi <= 15:
-        return False
-
-    return True
-
-def should_take_scalp_profit(entry_px: float, current_px: float, 
-                            side: str, ctx: SignalContext, 
-                            zone_strength: float) -> Tuple[bool, float]:
-    """
-    تحديد جني الأرباح للسكالب بناءً على قوة المنطقة
-    """
-    profit_bps = abs(current_px - entry_px) / max(entry_px, 1e-12) * 10000
-    
-    # للمناطق القوية: نصبر أكثر
-    if zone_strength > 0.7:
-        min_profit_bps = MIN_SCALP_BPS * 1.5  # زيادة الهدف للمناطق القوية
-        max_profit_bps = MIN_SCALP_BPS * 3.0
-    else:
-        min_profit_bps = MIN_SCALP_BPS  # الهدف الأساسي
-        max_profit_bps = MIN_SCALP_BPS * 1.5
-    
-    # للمناطق الضعيفة: نخرج مبكراً
-    if zone_strength < 0.4:
-        min_profit_bps = MIN_SCALP_BPS * 0.5
-        max_profit_bps = MIN_SCALP_BPS
-    
-    # تحقق من تحقيق الهدف
-    if profit_bps >= max_profit_bps:
-        return True, 1.0  # إغلاق كامل
-    
-    if profit_bps >= min_profit_bps:
-        # خروج جزئي للمناطق متوسطة القوة
-        if 0.4 <= zone_strength <= 0.7:
-            close_pct = 0.5  # إغلاق نصف المركز
-            return True, close_pct
-    
-    return False, 0.0
-
-# =================== SMART TRADE COUNCIL ENHANCED ===================
-class SmartTradeCouncilEnhanced:
-    """مجلس إدارة ذكي محسّن مع كاشف فود برنت"""
+# =================== MARKET STRUCTURE DETECTOR ===================
+class MarketStructureDetector:
+    """كاشف هيكل السوق المتقدم"""
     
     def __init__(self):
-        self.members = [
-            self._risk_manager,
-            self._trend_analyst,
-            self._volume_analyst,
-            self._price_action_analyst,
-            self._footprint_analyst  # عضو جديد: محلل فود برنت
-        ]
-        self.weights = [0.25, 0.20, 0.20, 0.15, 0.20]  # أوزان القرارات
-    
-    def evaluate_trade(self, trade_data: Dict, market_ctx: SignalContext, 
-                      footprint_data: Dict) -> Dict:
-        """تقييم الصفقة من قبل جميع أعضاء المجلس مع فود برنت"""
-        decisions = []
+        self.swing_history = deque(maxlen=100)
+        self.structure = MarketStructure()
         
-        for member in self.members:
-            if member.__name__ == "_footprint_analyst":
-                decision = member(trade_data, market_ctx, footprint_data)
-            else:
-                decision = member(trade_data, market_ctx)
-            decisions.append(decision)
+    def detect_swings(self, df: pd.DataFrame, lookback: int = SWING_LOOKBACK) -> MarketStructure:
+        """كشف النقاط المحورية (Swing Highs/Lows)"""
+        highs = df['high'].astype(float).values
+        lows = df['low'].astype(float).values
         
-        # دمج القرارات المرجحة
-        final_decision = self._weighted_decision(decisions)
-        return final_decision
-    
-    def _risk_manager(self, trade_data: Dict, ctx: SignalContext) -> Dict:
-        """مدير المخاطر"""
-        entry = trade_data.get("entry", 0)
-        current = ctx.px
-        side = trade_data.get("side", "long")
+        swing_highs = []
+        swing_lows = []
         
-        if side == "long":
-            profit_pct = (current - entry) / max(entry, 1e-12) * 100
-            stop_distance = abs(entry - trade_data.get("sl_price", 0)) / max(entry, 1e-12) * 100
-        else:
-            profit_pct = (entry - current) / max(entry, 1e-12) * 100
-            stop_distance = abs(entry - trade_data.get("sl_price", 0)) / max(entry, 1e-12) * 100
-        
-        risk_reward = profit_pct / max(stop_distance, 1e-12) if stop_distance > 0 else 0
-        
-        if risk_reward < 0.5 and profit_pct > 0.3:
-            return {"action": "close", "reason": "نسبة المخاطرة/العائد سيئة", "confidence": 0.8}
-        elif risk_reward > 2 and profit_pct > 1.0:
-            return {"action": "take_profit", "reason": "نسبة المخاطرة/العائد ممتازة", "confidence": 0.9}
-        
-        return {"action": "hold", "reason": "نسبة المخاطرة/العائد متوسطة", "confidence": 0.6}
-    
-    def _trend_analyst(self, trade_data: Dict, ctx: SignalContext) -> Dict:
-        """محلل الترند"""
-        entry_bias = trade_data.get("entry_context", {}).get("bias", "neutral")
-        current_bias = ctx.bias
-        
-        if entry_bias != current_bias and ctx.adx > 25:
-            return {"action": "close", "reason": "انعكاس الترند", "confidence": 0.85}
-        
-        if ctx.adx < 15 and ctx.px < trade_data.get("entry", 0) * 0.99:
-            return {"action": "close", "reason": "ضعف الترند مع خسارة", "confidence": 0.7}
-        
-        return {"action": "hold", "reason": "الترند سليم", "confidence": 0.75}
-    
-    def _volume_analyst(self, trade_data: Dict, ctx: SignalContext) -> Dict:
-        """محلل الحجم"""
-        if ctx.vol_z < -1.5:
-            return {"action": "close", "reason": "حجم ضعيف جداً", "confidence": 0.8}
-        
-        if ctx.vol_z > 2.0 and ctx.displacement:
-            return {"action": "hold", "reason": "حجم قوي مع إزاحة", "confidence": 0.9}
-        
-        return {"action": "hold", "reason": "حجم طبيعي", "confidence": 0.6}
-    
-    def _price_action_analyst(self, trade_data: Dict, ctx: SignalContext) -> Dict:
-        """محلل حركة السعر"""
-        df = trade_data.get("current_candles", None)
-        if df is not None and len(df) > 1:
-            last_candle = df.iloc[-1]
-            o = float(last_candle["open"])
-            c = float(last_candle["close"])
-            h = float(last_candle["high"])
-            l = float(last_candle["low"])
+        for i in range(2, len(df) - 2):
+            # Swing High
+            if (highs[i] > highs[i-1] and highs[i] > highs[i-2] and
+                highs[i] > highs[i+1] and highs[i] > highs[i+2]):
+                swing_highs.append({
+                    'index': i,
+                    'price': highs[i],
+                    'time': int(df['time'].iloc[i])
+                })
             
-            body = abs(c - o)
-            upper_wick = h - max(o, c)
-            lower_wick = min(o, c) - l
-            
-            side = trade_data.get("side", "long")
-            
-            # شمعة انعكاسية قوية
-            if side == "long" and upper_wick > body * 2.5 and c < o:
-                return {"action": "close", "reason": "شمعة انعكاسية قوية", "confidence": 0.85}
-            if side == "short" and lower_wick > body * 2.5 and c > o:
-                return {"action": "close", "reason": "شمعة انعكاسية قوية", "confidence": 0.85}
+            # Swing Low
+            if (lows[i] < lows[i-1] and lows[i] < lows[i-2] and
+                lows[i] < lows[i+1] and lows[i] < lows[i+2]):
+                swing_lows.append({
+                    'index': i,
+                    'price': lows[i],
+                    'time': int(df['time'].iloc[i])
+                })
         
-        return {"action": "hold", "reason": "حركة سعر طبيعية", "confidence": 0.65}
+        self.structure.swing_highs = swing_highs[-5:]  # آخر 5
+        self.structure.swing_lows = swing_lows[-5:]    # آخر 5
+        
+        return self._analyze_structure(swing_highs, swing_lows)
     
-    def _footprint_analyst(self, trade_data: Dict, ctx: SignalContext, 
-                          footprint_data: Dict) -> Dict:
-        """محلل فود برنت"""
-        if not footprint_data.get("ok", False):
-            return {"action": "hold", "reason": "لا بيانات فود برنت", "confidence": 0.5}
+    def _analyze_structure(self, swing_highs: List, swing_lows: List) -> MarketStructure:
+        """تحليل هيكل السوق"""
+        if len(swing_highs) < 3 or len(swing_lows) < 3:
+            return self.structure
         
-        zone_strength = footprint_data.get("zone_strength", 0.5)
-        zone_quality = footprint_data.get("zone_quality", "UNKNOWN")
-        danger_zones = footprint_data.get("danger_zones", [])
+        # تحليل Higher Highs/Lower Lows
+        self.structure.higher_highs = []
+        self.structure.higher_lows = []
+        self.structure.lower_highs = []
+        self.structure.lower_lows = []
         
-        # إذا كانت المنطقة خطرة
-        if danger_zones:
-            recent_danger = any(dz["end"] >= len(trade_data.get("current_candles", [])) - 5 
-                              for dz in danger_zones)
-            if recent_danger:
-                return {"action": "close", "reason": "منطقة خطرة في فود برنت", "confidence": 0.9}
+        # كشف BOS (Break of Structure)
+        if len(swing_highs) >= 3:
+            last_3_highs = swing_highs[-3:]
+            if (last_3_highs[-1]['price'] > last_3_highs[-2]['price'] and
+                last_3_highs[-2]['price'] > last_3_highs[-3]['price']):
+                self.structure.last_bos = {
+                    'type': 'bullish',
+                    'price': last_3_highs[-1]['price'],
+                    'time': last_3_highs[-1]['time']
+                }
+                self.structure.trend = "bullish"
         
-        # إذا كانت قوة المنطقة ضعيفة
-        if zone_strength < 0.4:
-            return {"action": "close", "reason": f"قوة منطقة ضعيفة ({zone_strength:.2f})", "confidence": 0.7}
+        if len(swing_lows) >= 3:
+            last_3_lows = swing_lows[-3:]
+            if (last_3_lows[-1]['price'] < last_3_lows[-2]['price'] and
+                last_3_lows[-2]['price'] < last_3_lows[-3]['price']):
+                self.structure.last_bos = {
+                    'type': 'bearish',
+                    'price': last_3_lows[-1]['price'],
+                    'time': last_3_lows[-1]['time']
+                }
+                self.structure.trend = "bearish"
         
-        # إذا كانت المنطقة عالية الجودة
-        if zone_quality in ["ACCUMULATION_ZONE", "LIQUIDITY_ZONE"] and zone_strength > 0.7:
-            return {"action": "hold", "reason": f"منطقة عالية الجودة: {zone_quality}", "confidence": 0.85}
+        # كشف CHoCH (Change of Character)
+        self._detect_choch(swing_highs, swing_lows)
         
-        return {"action": "hold", "reason": f"جودة المنطقة: {zone_quality}", "confidence": 0.6}
+        # كشف مناطق ITC (Internal Retracement)
+        self._detect_itc_zones(swing_highs, swing_lows)
+        
+        return self.structure
     
-    def _weighted_decision(self, decisions: List[Dict]) -> Dict:
-        """دمج القرارات المرجحة"""
-        if not decisions:
-            return {"action": "hold", "reason": "لا توجد قرارات", "confidence": 0.5}
-        
-        # حساب متوسط الثقة لكل إجراء
-        action_scores = {}
-        for i, decision in enumerate(decisions):
-            action = decision["action"]
-            confidence = decision["confidence"] * self.weights[i]
+    def _detect_choch(self, swing_highs: List, swing_lows: List):
+        """كشف تغيير الطابع"""
+        if len(swing_highs) >= 4 and len(swing_lows) >= 4:
+            # CHoCH هابط (Bullish to Bearish)
+            if (swing_highs[-1]['price'] < swing_highs[-2]['price'] and
+                swing_lows[-1]['price'] < swing_lows[-2]['price']):
+                self.structure.last_choch = {
+                    'type': 'bearish',
+                    'price': swing_lows[-1]['price'],
+                    'time': swing_lows[-1]['time']
+                }
             
-            if action not in action_scores:
-                action_scores[action] = {"score": 0, "reasons": []}
-            
-            action_scores[action]["score"] += confidence
-            action_scores[action]["reasons"].append(decision["reason"])
+            # CHoCH صاعد (Bearish to Bullish)
+            elif (swing_lows[-1]['price'] > swing_lows[-2]['price'] and
+                  swing_highs[-1]['price'] > swing_highs[-2]['price']):
+                self.structure.last_choch = {
+                    'type': 'bullish',
+                    'price': swing_highs[-1]['price'],
+                    'time': swing_highs[-1]['time']
+                }
+    
+    def _detect_itc_zones(self, swing_highs: List, swing_lows: List):
+        """كشف مناطق التراجع الداخلي"""
+        itc_zones = []
         
-        # اختيار الإجراء بأعلى درجة
-        best_action = max(action_scores.items(), key=lambda x: x[1]["score"])
+        for i in range(1, min(len(swing_highs), len(swing_lows))):
+            # منطقة بين Swing High و Swing Low
+            zone = {
+                'high': swing_highs[i-1]['price'],
+                'low': swing_lows[i-1]['price'],
+                'mid': (swing_highs[i-1]['price'] + swing_lows[i-1]['price']) / 2,
+                'time': swing_highs[i-1]['time']
+            }
+            itc_zones.append(zone)
+        
+        self.structure.itc_zones = itc_zones[-3:]  # آخر 3 مناطق
+
+# =================== ORDER BLOCK & FVG DETECTOR ===================
+class OrderBlockDetector:
+    """كاشف Order Blocks و Fair Value Gaps"""
+    
+    @staticmethod
+    def detect_order_blocks(df: pd.DataFrame, lookback: int = OB_LOOKBACK) -> List[Dict]:
+        """كشف Order Blocks المتقدمة"""
+        blocks = []
+        close = df['close'].astype(float).values
+        high = df['high'].astype(float).values
+        low = df['low'].astype(float).values
+        volume = df['volume'].astype(float).values
+        
+        for i in range(2, min(len(df), lookback)):
+            # Bullish OB: شمعة هابطة قوية تليها شمعة صاعدة
+            if (close[i-1] < high[i-2] and  # كسر قمة الشمعة السابقة
+                close[i] > close[i-1] and   # إغلاق أعلى
+                volume[i] > volume[i-1] * 1.5):  # حجم مرتفع
+                
+                block = {
+                    'type': OrderBlockType.BULLISH_OB,
+                    'high': high[i-2],
+                    'low': low[i-2],
+                    'entry': close[i],
+                    'time': int(df['time'].iloc[i]),
+                    'strength': min(9.0, (volume[i] / volume[i-1]) * 3)
+                }
+                blocks.append(block)
+            
+            # Bearish OB: شمعة صاعدة قوية تليها شمعة هابطة
+            elif (close[i-1] > low[i-2] and   # كسر قاع الشمعة السابقة
+                  close[i] < close[i-1] and    # إغلاق أقل
+                  volume[i] > volume[i-1] * 1.5):
+                
+                block = {
+                    'type': OrderBlockType.BEARISH_OB,
+                    'high': high[i-2],
+                    'low': low[i-2],
+                    'entry': close[i],
+                    'time': int(df['time'].iloc[i]),
+                    'strength': min(9.0, (volume[i] / volume[i-1]) * 3)
+                }
+                blocks.append(block)
+        
+        return blocks[-5:]  # آخر 5 Order Blocks
+    
+    @staticmethod
+    def detect_fvgs(df: pd.DataFrame, lookback: int = FVG_LOOKBACK) -> List[Dict]:
+        """كشف Fair Value Gaps"""
+        fvgs = []
+        high = df['high'].astype(float).values
+        low = df['low'].astype(float).values
+        
+        for i in range(2, min(len(df), lookback)):
+            # Bullish FVG
+            if low[i] > high[i-2]:
+                fvg = {
+                    'type': OrderBlockType.FVG_BULL,
+                    'low': high[i-2],
+                    'high': low[i],
+                    'time': int(df['time'].iloc[i]),
+                    'gap_size': (low[i] - high[i-2]) / high[i-2] * 100
+                }
+                fvgs.append(fvg)
+            
+            # Bearish FVG
+            elif high[i] < low[i-2]:
+                fvg = {
+                    'type': OrderBlockType.FVG_BEAR,
+                    'low': high[i],
+                    'high': low[i-2],
+                    'time': int(df['time'].iloc[i]),
+                    'gap_size': (low[i-2] - high[i]) / low[i-2] * 100
+                }
+                fvgs.append(fvg)
+        
+        return fvgs[-3:]  # آخر 3 FVGs
+
+# =================== LIQUIDITY & MANIPULATION DETECTOR ===================
+class LiquidityDetector:
+    """كاشف السيولة والتلاعب"""
+    
+    @staticmethod
+    def detect_liquidity_zones(df: pd.DataFrame, lookback: int = LIQUIDITY_LOOKBACK) -> List[Dict]:
+        """كشف مناطق السيولة (Liquidity Pools)"""
+        zones = []
+        high = df['high'].astype(float).values
+        low = df['low'].astype(float).values
+        volume = df['volume'].astype(float).values
+        
+        # كشف Highs & Lows الأخيرة
+        recent_highs = []
+        recent_lows = []
+        
+        for i in range(max(0, len(df) - lookback), len(df) - 1):
+            # High Liquidity Zone
+            if high[i] == max(high[max(0, i-5):i+1]):
+                recent_highs.append({
+                    'price': high[i],
+                    'time': int(df['time'].iloc[i]),
+                    'volume': volume[i]
+                })
+            
+            # Low Liquidity Zone
+            if low[i] == min(low[max(0, i-5):i+1]):
+                recent_lows.append({
+                    'price': low[i],
+                    'time': int(df['time'].iloc[i]),
+                    'volume': volume[i]
+                })
+        
+        # تحويل إلى مناطق
+        for h in recent_highs[-3:]:  # آخر 3 قمم
+            zone = {
+                'type': 'resistance_liquidity',
+                'price': h['price'],
+                'range_high': h['price'] * 1.002,
+                'range_low': h['price'] * 0.998,
+                'strength': min(10.0, h['volume'] / np.mean(volume) * 2),
+                'time': h['time']
+            }
+            zones.append(zone)
+        
+        for l in recent_lows[-3:]:  # آخر 3 قيعان
+            zone = {
+                'type': 'support_liquidity',
+                'price': l['price'],
+                'range_high': l['price'] * 1.002,
+                'range_low': l['price'] * 0.998,
+                'strength': min(10.0, l['volume'] / np.mean(volume) * 2),
+                'time': l['time']
+            }
+            zones.append(zone)
+        
+        return zones
+    
+    @staticmethod
+    def detect_manipulation(df: pd.DataFrame) -> List[str]:
+        """كشف علامات التلاعب في السوق"""
+        signals = []
+        close = df['close'].astype(float).values
+        high = df['high'].astype(float).values
+        low = df['low'].astype(float).values
+        volume = df['volume'].astype(float).values
+        
+        if len(df) < MANIPULATION_DETECTION_WINDOW + 1:
+            return signals
+        
+        # 1. False Breakouts (كسر وهمي)
+        for i in range(len(df) - MANIPULATION_DETECTION_WINDOW, len(df) - 1):
+            # كسر قمة ثم عودة
+            if (high[i] > max(high[i-3:i]) and  # كسر قمة
+                close[i+1] < high[i] and        # إغلاق أقل
+                close[i+2] < close[i+1]):       # استمرار الهبوط
+                signals.append(f"FALSE_BREAKOUT_HIGH_{i}")
+            
+            # كسر قاع ثم عودة
+            if (low[i] < min(low[i-3:i]) and    # كسر قاع
+                close[i+1] > low[i] and         # إغلاق أعلى
+                close[i+2] > close[i+1]):       # استمرار الصعود
+                signals.append(f"FALSE_BREAKOUT_LOW_{i}")
+        
+        # 2. Volume Spikes (قفزات حجم مفاجئة)
+        volume_ma = np.mean(volume[-VOLUME_MA:])
+        if volume[-1] > volume_ma * VOLUME_SPIKE_THRESHOLD:
+            signals.append(f"VOLUME_SPIKE_{volume[-1]/volume_ma:.1f}x")
+        
+        # 3. Wick Rejections (رفض بالذيل)
+        current_candle = df.iloc[-1]
+        o, c, h, l = current_candle['open'], current_candle['close'], current_candle['high'], current_candle['low']
+        body = abs(c - o)
+        upper_wick = h - max(o, c)
+        lower_wick = min(o, c) - l
+        
+        if upper_wick > body * 2 and c < o:  # رفض من الأعلى
+            signals.append("WICK_REJECTION_HIGH")
+        if lower_wick > body * 2 and c > o:  # رفض من الأسفل
+            signals.append("WICK_REJECTION_LOW")
+        
+        return signals
+
+# =================== GOLDEN ZONE DETECTOR ===================
+class GoldenZoneDetector:
+    """كاشف المناطق الذهبية (القمم والقيعان الذهبية)"""
+    
+    def __init__(self):
+        self.golden_zones = []
+        self.last_golden_signal = None
+        
+    def detect_golden_zones(self, df: pd.DataFrame, ctx: TradingContext) -> List[Dict]:
+        """كشف المناطق الذهبية المتقدمة"""
+        golden_zones = []
+        
+        # 1. Golden Bottom (قاع ذهبي)
+        bottom_zones = self._detect_golden_bottoms(df, ctx)
+        golden_zones.extend(bottom_zones)
+        
+        # 2. Golden Top (قمة ذهبية)
+        top_zones = self._detect_golden_tops(df, ctx)
+        golden_zones.extend(top_zones)
+        
+        # 3. Trend Reversal Zones (مناطق انعكاس الترند)
+        reversal_zones = self._detect_trend_reversals(df, ctx)
+        golden_zones.extend(reversal_zones)
+        
+        self.golden_zones = golden_zones[-5:]  # آخر 5 مناطق ذهبية
+        return self.golden_zones
+    
+    def _detect_golden_bottoms(self, df: pd.DataFrame, ctx: TradingContext) -> List[Dict]:
+        """كشف القيعان الذهبية"""
+        bottoms = []
+        close = df['close'].astype(float).values
+        low = df['low'].astype(float).values
+        volume = df['volume'].astype(float).values
+        
+        for i in range(len(df) - 10, len(df) - 1):
+            # شروط القاع الذهبي:
+            # 1. سعر منخفض جديد أو قريب من القاع
+            # 2. حجم مرتفع
+            # 3. RSI تشبع بيع
+            # 4. إغلاق أعلى من الفتح
+            # 5. تأكيد من المؤشرات
+            
+            is_new_low = low[i] == min(low[max(0, i-20):i+1])
+            volume_spike = volume[i] > np.mean(volume[max(0, i-10):i]) * 1.5
+            bullish_close = close[i] > df['open'].iloc[i]
+            
+            if is_new_low and volume_spike and bullish_close:
+                # حساب قوة الإشارة
+                strength = self._calculate_bottom_strength(df, i, ctx)
+                
+                if strength >= GOLDEN_ZONE_MIN_STRENGTH:
+                    bottom = {
+                        'type': 'GOLDEN_BOTTOM',
+                        'price': low[i],
+                        'entry': close[i],
+                        'strength': strength,
+                        'time': int(df['time'].iloc[i]),
+                        'reasons': [
+                            f"New low detected",
+                            f"Volume spike: {volume[i]/np.mean(volume[max(0,i-10):i]):.1f}x",
+                            f"Bullish close",
+                            f"RSI: {ctx.rsi:.1f}",
+                            f"Strength: {strength:.1f}/10"
+                        ]
+                    }
+                    bottoms.append(bottom)
+        
+        return bottoms
+    
+    def _detect_golden_tops(self, df: pd.DataFrame, ctx: TradingContext) -> List[Dict]:
+        """كشف القمم الذهبية"""
+        tops = []
+        close = df['close'].astype(float).values
+        high = df['high'].astype(float).values
+        volume = df['volume'].astype(float).values
+        
+        for i in range(len(df) - 10, len(df) - 1):
+            # شروط القمة الذهبية:
+            # 1. سعر مرتفع جديد أو قريب من القمة
+            # 2. حجم مرتفع
+            # 3. RSI تشبع شراء
+            # 4. إغلاق أقل من الفتح
+            # 5. تأكيد من المؤشرات
+            
+            is_new_high = high[i] == max(high[max(0, i-20):i+1])
+            volume_spike = volume[i] > np.mean(volume[max(0, i-10):i]) * 1.5
+            bearish_close = close[i] < df['open'].iloc[i]
+            
+            if is_new_high and volume_spike and bearish_close:
+                # حساب قوة الإشارة
+                strength = self._calculate_top_strength(df, i, ctx)
+                
+                if strength >= GOLDEN_ZONE_MIN_STRENGTH:
+                    top = {
+                        'type': 'GOLDEN_TOP',
+                        'price': high[i],
+                        'entry': close[i],
+                        'strength': strength,
+                        'time': int(df['time'].iloc[i]),
+                        'reasons': [
+                            f"New high detected",
+                            f"Volume spike: {volume[i]/np.mean(volume[max(0,i-10):i]):.1f}x",
+                            f"Bearish close",
+                            f"RSI: {ctx.rsi:.1f}",
+                            f"Strength: {strength:.1f}/10"
+                        ]
+                    }
+                    tops.append(top)
+        
+        return tops
+    
+    def _detect_trend_reversals(self, df: pd.DataFrame, ctx: TradingContext) -> List[Dict]:
+        """كشف مناطق انعكاس الترند"""
+        reversals = []
+        
+        # شروط انعكاس الترند:
+        # 1. تغيير في هيكل السوق (BOS/CHoCH)
+        # 2. تأكيد من المؤشرات
+        # 3. حجم قوي
+        # 4. اختراق المتوسطات
+        
+        if ctx.structure.last_choch:
+            strength = self._calculate_reversal_strength(df, ctx)
+            
+            if strength >= GOLDEN_ZONE_MIN_STRENGTH:
+                reversal = {
+                    'type': 'TREND_REVERSAL',
+                    'direction': ctx.structure.last_choch['type'],
+                    'price': ctx.structure.last_choch['price'],
+                    'strength': strength,
+                    'time': ctx.structure.last_choch['time'],
+                    'reasons': [
+                        f"CHoCH detected: {ctx.structure.last_choch['type']}",
+                        f"Market structure change",
+                        f"ADX: {ctx.adx:.1f}",
+                        f"Volume ratio: {ctx.volume_ratio:.1f}",
+                        f"Strength: {strength:.1f}/10"
+                    ]
+                }
+                reversals.append(reversal)
+        
+        return reversals
+    
+    def _calculate_bottom_strength(self, df: pd.DataFrame, idx: int, ctx: TradingContext) -> float:
+        """حساب قوة القاع الذهبي"""
+        strength = 0.0
+        
+        # 1. RSI تشبع بيع (20 نقطة)
+        if ctx.rsi < 30:
+            strength += 2.0
+        elif ctx.rsi < 40:
+            strength += 1.0
+        
+        # 2. حجم مرتفع (20 نقطة)
+        if ctx.volume_ratio > 2.0:
+            strength += 2.0
+        elif ctx.volume_ratio > 1.5:
+            strength += 1.5
+        
+        # 3. تأكيد MACD (20 نقطة)
+        if ctx.macd_histogram > 0 and ctx.macd > ctx.macd_signal:
+            strength += 2.0
+        
+        # 4. هيكل السوق (20 نقطة)
+        if ctx.structure.trend == "bearish" and ctx.structure.last_choch:
+            if ctx.structure.last_choch['type'] == 'bullish':
+                strength += 2.0
+        
+        # 5. Order Block قريب (10 نقطة)
+        for ob in ctx.order_blocks:
+            if ob['type'] == OrderBlockType.BULLISH_OB:
+                if abs(df['close'].iloc[idx] - ob['entry']) / ob['entry'] < 0.01:
+                    strength += 1.0
+        
+        # 6. اختراق المتوسطات (10 نقطة)
+        if df['close'].iloc[idx] > ctx.ma_fast and df['close'].iloc[idx] > ctx.ma_slow:
+            strength += 1.0
+        
+        return min(10.0, strength)
+    
+    def _calculate_top_strength(self, df: pd.DataFrame, idx: int, ctx: TradingContext) -> float:
+        """حساب قوة القمة الذهبية"""
+        strength = 0.0
+        
+        # 1. RSI تشبع شراء (20 نقطة)
+        if ctx.rsi > 70:
+            strength += 2.0
+        elif ctx.rsi > 60:
+            strength += 1.0
+        
+        # 2. حجم مرتفع (20 نقطة)
+        if ctx.volume_ratio > 2.0:
+            strength += 2.0
+        elif ctx.volume_ratio > 1.5:
+            strength += 1.5
+        
+        # 3. تأكيد MACD (20 نقطة)
+        if ctx.macd_histogram < 0 and ctx.macd < ctx.macd_signal:
+            strength += 2.0
+        
+        # 4. هيكل السوق (20 نقطة)
+        if ctx.structure.trend == "bullish" and ctx.structure.last_choch:
+            if ctx.structure.last_choch['type'] == 'bearish':
+                strength += 2.0
+        
+        # 5. Order Block قريب (10 نقطة)
+        for ob in ctx.order_blocks:
+            if ob['type'] == OrderBlockType.BEARISH_OB:
+                if abs(df['close'].iloc[idx] - ob['entry']) / ob['entry'] < 0.01:
+                    strength += 1.0
+        
+        # 6. اختراق المتوسطات (10 نقطة)
+        if df['close'].iloc[idx] < ctx.ma_fast and df['close'].iloc[idx] < ctx.ma_slow:
+            strength += 1.0
+        
+        return min(10.0, strength)
+    
+    def _calculate_reversal_strength(self, df: pd.DataFrame, ctx: TradingContext) -> float:
+        """حساب قوة انعكاس الترند"""
+        strength = 0.0
+        
+        # 1. تأكيد CHoCH (30 نقطة)
+        if ctx.structure.last_choch:
+            strength += 3.0
+        
+        # 2. حجم مرتفع (20 نقطة)
+        if ctx.volume_ratio > 1.8:
+            strength += 2.0
+        
+        # 3. تأكيد مؤشرات (30 نقطة)
+        if (ctx.macd_histogram > 0 and ctx.structure.last_choch['type'] == 'bullish') or \
+           (ctx.macd_histogram < 0 and ctx.structure.last_choch['type'] == 'bearish'):
+            strength += 3.0
+        
+        # 4. RSI تأكيد (20 نقطة)
+        if (ctx.rsi < 40 and ctx.structure.last_choch['type'] == 'bullish') or \
+           (ctx.rsi > 60 and ctx.structure.last_choch['type'] == 'bearish'):
+            strength += 2.0
+        
+        return min(10.0, strength)
+
+# =================== SMART TRADE COUNCIL (7 MEMBERS) ===================
+class SupremeTradeCouncil:
+    """مجلس الإدارة الأعلى (7 أعضاء)"""
+    
+    def __init__(self):
+        self.members = {
+            'market_structure': self._market_structure_analyst,
+            'volume_flow': self._volume_flow_analyst,
+            'momentum': self._momentum_analyst,
+            'trend': self._trend_analyst,
+            'liquidity': self._liquidity_analyst,
+            'risk': self._risk_analyst,
+            'manipulation': self._manipulation_analyst
+        }
+        self.weights = {
+            'market_structure': 0.20,
+            'volume_flow': 0.15,
+            'momentum': 0.15,
+            'trend': 0.15,
+            'liquidity': 0.15,
+            'risk': 0.10,
+            'manipulation': 0.10
+        }
+    
+    def evaluate_signal(self, signal: SmartSignal, ctx: TradingContext, df: pd.DataFrame) -> Dict[str, Any]:
+        """تقييم الإشارة من قبل جميع الأعضاء"""
+        decisions = {}
+        total_score = 0.0
+        max_score = 0.0
+        
+        for name, analyst in self.members.items():
+            decision = analyst(signal, ctx, df)
+            decisions[name] = decision
+            
+            score = decision.get('score', 0) * self.weights[name]
+            total_score += score
+            max_score += 10 * self.weights[name]  # أعلى درجة لكل عضو = 10
+        
+        final_score = (total_score / max_score) * 10 if max_score > 0 else 0
+        
+        # جمع الأسباب
+        all_reasons = []
+        for name, decision in decisions.items():
+            if decision.get('approve', False):
+                all_reasons.extend(decision.get('reasons', []))
         
         return {
-            "action": best_action[0],
-            "reason": " | ".join(best_action[1]["reasons"][:2]),
-            "confidence": best_action[1]["score"],
-            "all_decisions": decisions
+            'approved': final_score >= 7.0,
+            'score': final_score,
+            'confidence': min(0.95, final_score / 10),
+            'reasons': all_reasons[:5],  # أول 5 أسباب
+            'details': decisions,
+            'vote': 'BUY' if signal.action == 'BUY' else 'SELL'
+        }
+    
+    def _market_structure_analyst(self, signal: SmartSignal, ctx: TradingContext, df: pd.DataFrame) -> Dict:
+        """محلل هيكل السوق"""
+        score = 0.0
+        reasons = []
+        
+        # تأكيد من هيكل السوق
+        if signal.action == 'BUY':
+            if ctx.structure.trend in ["bullish", "neutral"]:
+                score += 3.0
+                reasons.append("Trend supports BUY")
+            
+            if ctx.structure.last_bos and ctx.structure.last_bos['type'] == 'bullish':
+                score += 4.0
+                reasons.append("Bullish BOS confirmed")
+            
+            if ctx.structure.last_choch and ctx.structure.last_choch['type'] == 'bullish':
+                score += 3.0
+                reasons.append("Bullish CHoCH detected")
+        
+        elif signal.action == 'SELL':
+            if ctx.structure.trend in ["bearish", "neutral"]:
+                score += 3.0
+                reasons.append("Trend supports SELL")
+            
+            if ctx.structure.last_bos and ctx.structure.last_bos['type'] == 'bearish':
+                score += 4.0
+                reasons.append("Bearish BOS confirmed")
+            
+            if ctx.structure.last_choch and ctx.structure.last_choch['type'] == 'bearish':
+                score += 3.0
+                reasons.append("Bearish CHoCH detected")
+        
+        # مناطق ITC قريبة
+        for zone in ctx.structure.itc_zones[-2:]:
+            if zone['low'] <= signal.entry_price <= zone['high']:
+                score += 2.0
+                reasons.append(f"Entry in ITC zone: {zone['low']:.6f}-{zone['high']:.6f}")
+        
+        return {
+            'approve': score >= 6.0,
+            'score': min(10.0, score),
+            'reasons': reasons
+        }
+    
+    def _volume_flow_analyst(self, signal: SmartSignal, ctx: TradingContext, df: pd.DataFrame) -> Dict:
+        """محلل تدفق الحجم"""
+        score = 0.0
+        reasons = []
+        
+        # حجم قوي
+        if ctx.volume_ratio > 1.8:
+            score += 4.0
+            reasons.append(f"Strong volume: {ctx.volume_ratio:.1f}x")
+        elif ctx.volume_ratio > 1.3:
+            score += 2.0
+            reasons.append(f"Good volume: {ctx.volume_ratio:.1f}x")
+        
+        # Z-score إيجابي
+        if ctx.volume_zscore > 1.5:
+            score += 3.0
+            reasons.append(f"Volume z-score: {ctx.volume_zscore:.1f}")
+        elif ctx.volume_zscore > 0.5:
+            score += 1.0
+        
+        # تدفق الحجم في اتجاه الصفقة
+        last_5_volume = df['volume'].astype(float).values[-5:]
+        if len(last_5_volume) >= 2:
+            volume_trend = np.mean(last_5_volume[-2:]) / np.mean(last_5_volume[:2])
+            if volume_trend > 1.2:
+                score += 3.0
+                reasons.append(f"Volume increasing: {volume_trend:.1f}x")
+        
+        return {
+            'approve': score >= 5.0,
+            'score': min(10.0, score),
+            'reasons': reasons
+        }
+    
+    def _momentum_analyst(self, signal: SmartSignal, ctx: TradingContext, df: pd.DataFrame) -> Dict:
+        """محلل الزخم"""
+        score = 0.0
+        reasons = []
+        
+        # RSI في المنطقة المناسبة
+        if signal.action == 'BUY':
+            if ctx.rsi < 40:
+                score += 3.0
+                reasons.append(f"RSI oversold: {ctx.rsi:.1f}")
+            elif ctx.rsi < 50:
+                score += 2.0
+                reasons.append(f"RSI neutral-bullish: {ctx.rsi:.1f}")
+        else:  # SELL
+            if ctx.rsi > 60:
+                score += 3.0
+                reasons.append(f"RSI overbought: {ctx.rsi:.1f}")
+            elif ctx.rsi > 50:
+                score += 2.0
+                reasons.append(f"RSI neutral-bearish: {ctx.rsi:.1f}")
+        
+        # MACD تأكيد
+        if signal.action == 'BUY':
+            if ctx.macd_histogram > 0 and ctx.macd > ctx.macd_signal:
+                score += 4.0
+                reasons.append("MACD bullish")
+        else:
+            if ctx.macd_histogram < 0 and ctx.macd < ctx.macd_signal:
+                score += 4.0
+                reasons.append("MACD bearish")
+        
+        # ADX قوي
+        if ctx.adx > 25:
+            score += 3.0
+            reasons.append(f"Strong trend: ADX={ctx.adx:.1f}")
+        elif ctx.adx > 20:
+            score += 2.0
+            reasons.append(f"Moderate trend: ADX={ctx.adx:.1f}")
+        
+        return {
+            'approve': score >= 6.0,
+            'score': min(10.0, score),
+            'reasons': reasons
+        }
+    
+    def _trend_analyst(self, signal: SmartSignal, ctx: TradingContext, df: pd.DataFrame) -> Dict:
+        """محلل الترند"""
+        score = 0.0
+        reasons = []
+        
+        # المتوسطات المتحركة
+        if signal.action == 'BUY':
+            if ctx.ma_fast > ctx.ma_slow and ctx.ma_slow > ctx.ma_trend:
+                score += 5.0
+                reasons.append("All MAs bullish aligned")
+            elif ctx.ma_fast > ctx.ma_slow:
+                score += 3.0
+                reasons.append("Fast MA above Slow MA")
+            
+            if signal.entry_price > ctx.ma_fast:
+                score += 2.0
+                reasons.append("Price above Fast MA")
+        else:  # SELL
+            if ctx.ma_fast < ctx.ma_slow and ctx.ma_slow < ctx.ma_trend:
+                score += 5.0
+                reasons.append("All MAs bearish aligned")
+            elif ctx.ma_fast < ctx.ma_slow:
+                score += 3.0
+                reasons.append("Fast MA below Slow MA")
+            
+            if signal.entry_price < ctx.ma_fast:
+                score += 2.0
+                reasons.append("Price below Fast MA")
+        
+        # VWAP تأكيد
+        if signal.action == 'BUY' and signal.entry_price > ctx.vwap:
+            score += 2.0
+            reasons.append("Price above VWAP")
+        elif signal.action == 'SELL' and signal.entry_price < ctx.vwap:
+            score += 2.0
+            reasons.append("Price below VWAP")
+        
+        # DI تأكيد
+        if signal.action == 'BUY' and ctx.di_plus > ctx.di_minus:
+            score += 1.0
+            reasons.append("DI+ above DI-")
+        elif signal.action == 'SELL' and ctx.di_minus > ctx.di_plus:
+            score += 1.0
+            reasons.append("DI- above DI+")
+        
+        return {
+            'approve': score >= 5.0,
+            'score': min(10.0, score),
+            'reasons': reasons
+        }
+    
+    def _liquidity_analyst(self, signal: SmartSignal, ctx: TradingContext, df: pd.DataFrame) -> Dict:
+        """محلل السيولة"""
+        score = 0.0
+        reasons = []
+        
+        # Order Blocks قريبة
+        for ob in ctx.order_blocks[-3:]:
+            distance = abs(signal.entry_price - ob['entry']) / ob['entry']
+            if distance < 0.005:  # 0.5%
+                score += 3.0
+                reasons.append(f"Near {ob['type'].value} at {ob['entry']:.6f}")
+        
+        # FVGs قريبة
+        for fvg in ctx.fair_value_gaps[-2:]:
+            if fvg['low'] <= signal.entry_price <= fvg['high']:
+                score += 2.0
+                reasons.append(f"In FVG zone: {fvg['low']:.6f}-{fvg['high']:.6f}")
+        
+        # مناطق سيولة قريبة
+        for zone in ctx.liquidity_zones:
+            if zone['range_low'] <= signal.entry_price <= zone['range_high']:
+                score += zone.get('strength', 1)
+                reasons.append(f"Liquidity zone: {zone['type']}")
+        
+        return {
+            'approve': score >= 4.0,
+            'score': min(10.0, score),
+            'reasons': reasons
+        }
+    
+    def _risk_analyst(self, signal: SmartSignal, ctx: TradingContext, df: pd.DataFrame) -> Dict:
+        """محلل المخاطر"""
+        score = 0.0
+        reasons = []
+        
+        # نسبة المخاطرة/العائد
+        if signal.risk_reward >= 2.0:
+            score += 5.0
+            reasons.append(f"Great R:R = {signal.risk_reward:.1f}")
+        elif signal.risk_reward >= 1.5:
+            score += 3.0
+            reasons.append(f"Good R:R = {signal.risk_reward:.1f}")
+        
+        # قوة المنطقة
+        if signal.zone_strength >= 8.0:
+            score += 3.0
+            reasons.append(f"Very strong zone: {signal.zone_strength:.1f}/10")
+        elif signal.zone_strength >= 6.0:
+            score += 2.0
+            reasons.append(f"Strong zone: {signal.zone_strength:.1f}/10")
+        
+        # ATR مناسب
+        stop_distance = abs(signal.entry_price - signal.stop_loss) / signal.entry_price * 100
+        atr_percent = ctx.atr / signal.entry_price * 100
+        
+        if stop_distance <= atr_percent * 1.5:
+            score += 2.0
+            reasons.append(f"SL distance reasonable: {stop_distance:.2f}%")
+        
+        return {
+            'approve': score >= 6.0,
+            'score': min(10.0, score),
+            'reasons': reasons
+        }
+    
+    def _manipulation_analyst(self, signal: SmartSignal, ctx: TradingContext, df: pd.DataFrame) -> Dict:
+        """محلل التلاعب"""
+        score = 10.0  # ابدأ بدرجة كاملة
+        reasons = ["No manipulation detected"]
+        
+        # تحقق من علامات التلاعب
+        if ctx.manipulation_signals:
+            for manip in ctx.manipulation_signals:
+                if "FALSE_BREAKOUT" in manip:
+                    score -= 3.0
+                    reasons.append("False breakout detected")
+                elif "VOLUME_SPIKE" in manip:
+                    score -= 1.0
+                elif "WICK_REJECTION" in manip:
+                    if (signal.action == 'BUY' and "HIGH" in manip) or \
+                       (signal.action == 'SELL' and "LOW" in manip):
+                        score -= 4.0
+                        reasons.append("Wick rejection against trade")
+        
+        # مناطق خطرة
+        if ctx.danger_zones:
+            score -= len(ctx.danger_zones) * 2.0
+            reasons.append(f"{len(ctx.danger_zones)} danger zones")
+        
+        return {
+            'approve': score >= 6.0,
+            'score': max(0.0, min(10.0, score)),
+            'reasons': reasons
         }
 
-# =================== ENHANCED TRADE MANAGER ===================
-class TradeManagerProfessional:
-    """مدير الصفقات المحترف مع إدارة ديناميكية متقدمة"""
+# =================== ULTIMATE SIGNAL GENERATOR ===================
+class UltimateSignalGenerator:
+    """مولد الإشارات المتكامل"""
     
     def __init__(self):
-        self.golden_tp_levels = []
-        self.golden_close_fractions = []
-        self.current_tp_level = 0
-        self.promoted_to_trend = False
-        self.entry_context = None
-        self.danger_zone_detected = False
-        self.smart_council = SmartTradeCouncilEnhanced()  # المجلس المحسّن
-        self.prev_adx = None
-        self.prev_vwap_bias = None
-        self.consecutive_warnings = 0
-        self.last_profit_pct = 0
-        self.best_profit_pct = 0
-        self.initial_sl = None
-        self.trade_start_time = None
+        self.indicators = AdvancedIndicators()
+        self.structure_detector = MarketStructureDetector()
+        self.ob_detector = OrderBlockDetector()
+        self.liquidity_detector = LiquidityDetector()
+        self.golden_detector = GoldenZoneDetector()
+        self.council = SupremeTradeCouncil()
+        self.last_signals = deque(maxlen=10)
         
-    def update_context(self, ctx: SignalContext, footprint_data: Dict):
-        """تحديث سياق السوق للإدارة الذكية مع فود برنت"""
-        self.entry_context = ctx
+    def analyze_market(self, df: pd.DataFrame) -> TradingContext:
+        """تحليل السوق الشامل"""
+        # حساب جميع المؤشرات
+        indicators = self.indicators.calculate_all(df)
         
-        # كشف المناطق الخطرة المتقدم
-        self.danger_zone_detected = self._detect_danger_zone_advanced(ctx, footprint_data)
+        # كشف هيكل السوق
+        structure = self.structure_detector.detect_swings(df)
         
-        if self.danger_zone_detected:
-            self.consecutive_warnings += 1
+        # كشف Order Blocks و FVGs
+        order_blocks = self.ob_detector.detect_order_blocks(df)
+        fvgs = self.ob_detector.detect_fvgs(df)
+        
+        # كشف السيولة والتلاعب
+        liquidity_zones = self.liquidity_detector.detect_liquidity_zones(df)
+        manipulation_signals = self.liquidity_detector.detect_manipulation(df)
+        
+        # تحديد التحيز والطور
+        current_idx = len(df) - 1
+        bias = self._determine_bias(indicators, df, current_idx)
+        phase = self._determine_phase(indicators, structure, current_idx)
+        
+        # قوة السوق
+        market_strength = self._calculate_market_strength(indicators, structure, current_idx)
+        
+        # مناطق الخطر
+        danger_zones = self._detect_danger_zones(indicators, df, current_idx)
+        
+        # بناء السياق
+        ctx = TradingContext(
+            price=float(df['close'].iloc[current_idx]),
+            volume=float(df['volume'].iloc[current_idx]),
+            volume_ma=float(indicators['volume_ma'].iloc[current_idx]),
+            volume_ratio=float(indicators['volume_ratio'].iloc[current_idx]),
+            volume_zscore=float(indicators['volume_zscore'].iloc[current_idx]),
+            atr=float(indicators['atr'].iloc[current_idx]),
+            rsi=float(indicators['rsi'].iloc[current_idx]),
+            rsi_ma=float(indicators['rsi_ma'].iloc[current_idx]),
+            adx=float(indicators['adx'].iloc[current_idx]),
+            di_plus=float(indicators['di_plus'].iloc[current_idx]),
+            di_minus=float(indicators['di_minus'].iloc[current_idx]),
+            macd=float(indicators['macd'].iloc[current_idx]),
+            macd_signal=float(indicators['macd_signal'].iloc[current_idx]),
+            macd_histogram=float(indicators['macd_histogram'].iloc[current_idx]),
+            ma_fast=float(indicators['ma_fast'].iloc[current_idx]),
+            ma_slow=float(indicators['ma_slow'].iloc[current_idx]),
+            ma_trend=float(indicators['ma_trend'].iloc[current_idx]),
+            vwap=float(indicators['vwap'].iloc[current_idx]),
+            bias=bias,
+            phase=phase,
+            market_strength=market_strength,
+            structure=structure,
+            order_blocks=order_blocks,
+            fair_value_gaps=fvgs,
+            liquidity_zones=liquidity_zones,
+            support_zones=[z for z in liquidity_zones if 'support' in z['type']],
+            resistance_zones=[z for z in liquidity_zones if 'resistance' in z['type']],
+            manipulation_signals=manipulation_signals,
+            danger_zones=danger_zones
+        )
+        
+        return ctx
+    
+    def _determine_bias(self, indicators: Dict, df: pd.DataFrame, idx: int) -> MarketBias:
+        """تحديد تحيز السوق"""
+        ma_fast = indicators['ma_fast'].iloc[idx]
+        ma_slow = indicators['ma_slow'].iloc[idx]
+        ma_trend = indicators['ma_trend'].iloc[idx]
+        price = df['close'].iloc[idx]
+        
+        # قواعد التحيز
+        if price > ma_fast > ma_slow > ma_trend:
+            return MarketBias.STRONG_BULL
+        elif price > ma_fast > ma_slow:
+            return MarketBias.BULL
+        elif price < ma_fast < ma_slow < ma_trend:
+            return MarketBias.STRONG_BEAR
+        elif price < ma_fast < ma_slow:
+            return MarketBias.BEAR
         else:
-            self.consecutive_warnings = max(0, self.consecutive_warnings - 1)
+            return MarketBias.NEUTRAL
     
-    def _detect_danger_zone_advanced(self, ctx: SignalContext, footprint_data: Dict) -> bool:
-        """كشف المناطق الخطرة المتقدم"""
-        danger_signals = []
+    def _determine_phase(self, indicators: Dict, structure: MarketStructure, idx: int) -> MarketPhase:
+        """تحديد طور السوق"""
+        adx = indicators['adx'].iloc[idx]
+        volume_ratio = indicators['volume_ratio'].iloc[idx]
+        di_plus = indicators['di_plus'].iloc[idx]
+        di_minus = indicators['di_minus'].iloc[idx]
         
-        # 1. تحذيرات فود برنت
-        if footprint_data.get("ok", False):
-            danger_zones = footprint_data.get("danger_zones", [])
-            if danger_zones and any(dz["risk_level"] == "HIGH" for dz in danger_zones):
-                danger_signals.append("FOOTPRINT_HIGH_RISK")
-        
-        # 2. RSI في أقصى المدى
-        if ctx.rsi >= 90 or ctx.rsi <= 10:
-            danger_signals.append("RSI_EXTREME")
-            
-        # 3. تغيير حاد في ADX
-        if self.prev_adx is not None:
-            adx_change = abs(ctx.adx - self.prev_adx) / max(self.prev_adx, 1e-12)
-            if adx_change > 0.4 and ctx.adx < 18:
-                danger_signals.append("ADX_CRASH")
-        
-        # 4. اختراق VWAP مع حجم ضعيف
-        current_bias = "above" if ctx.px > ctx.vwap else "below"
-        if self.prev_vwap_bias is not None:
-            if current_bias != self.prev_vwap_bias and ctx.vol_z < -0.8:
-                danger_signals.append("VWAP_BREAK_WEAK_VOL")
-        
-        # 5. تحذيرات متتالية
-        if self.consecutive_warnings >= 3:
-            danger_signals.append("CONSECUTIVE_WARNINGS")
-        
-        # تحديث القيم السابقة
-        self.prev_adx = ctx.adx
-        self.prev_vwap_bias = current_bias
-        
-        return len(danger_signals) >= 2  # إشارتين خطيرتين أو أكثر
-    
-    def manage_golden_trade_advanced(self, px: float, entry_px: float, side: str, 
-                                   tp_levels: list, close_fractions: list,
-                                   ctx: SignalContext) -> dict:
-        """إدارة الصفقات الذهبية مع 3 مستويات TP متقدم"""
-        if not tp_levels or len(tp_levels) < 3:
-            return {"action": "hold", "close_pct": 0.0, "reason": "No TP levels"}
-        
-        hit_tp1 = (px >= tp_levels[0]) if side == "long" else (px <= tp_levels[0])
-        hit_tp2 = (px >= tp_levels[1]) if side == "long" else (px <= tp_levels[1])
-        hit_tp3 = (px >= tp_levels[2]) if side == "long" else (px <= tp_levels[2])
-        
-        current_profit_pct = abs(px - entry_px) / max(entry_px, 1e-12) * 100
-        
-        # تحديث أفضل ربح
-        if current_profit_pct > self.best_profit_pct:
-            self.best_profit_pct = current_profit_pct
-        
-        # TP3: إغلاق كامل
-        if hit_tp3 and self.current_tp_level < 3:
-            self.current_tp_level = 3
-            return {
-                "action": "close",
-                "reason": "🏆 GOLDEN TP3 HIT - Maximum profit achieved",
-                "close_pct": 1.0,
-                "profit_pct": current_profit_pct
-            }
-        
-        # TP2: إغلاق جزئي
-        elif hit_tp2 and self.current_tp_level < 2:
-            self.current_tp_level = 2
-            return {
-                "action": "partial",
-                "reason": "🎯 GOLDEN TP2 HIT - Taking partial profit",
-                "close_pct": close_fractions[1],
-                "profit_pct": current_profit_pct
-            }
-        
-        # TP1: إغلاق جزئي
-        elif hit_tp1 and self.current_tp_level < 1:
-            self.current_tp_level = 1
-            return {
-                "action": "partial",
-                "reason": "✅ GOLDEN TP1 HIT - First profit taken",
-                "close_pct": close_fractions[0],
-                "profit_pct": current_profit_pct
-            }
-        
-        # خروج استثنائي: فقدان الربح بعد الوصول للذروة
-        if self.best_profit_pct > 1.5 and current_profit_pct < self.best_profit_pct * 0.5:
-            return {
-                "action": "close",
-                "reason": "📉 Profit retracement - Protecting gains",
-                "close_pct": 1.0,
-                "profit_pct": current_profit_pct
-            }
-        
-        # خروج استثنائي من المنطقة الخطرة
-        if self.danger_zone_detected:
-            return {
-                "action": "close",
-                "reason": "⚠️ DANGER ZONE DETECTED - Emergency exit",
-                "close_pct": 1.0,
-                "profit_pct": current_profit_pct
-            }
-        
-        return {"action": "hold", "close_pct": 0.0, "reason": "Holding for next TP"}
-    
-    def manage_scalp_trade_professional(self, px: float, entry_px: float, side: str,
-                                      ctx: SignalContext, zone_strength: float) -> dict:
-        """إدارة الصفقات السكالب بشكل محترف بناءً على قوة المنطقة"""
-        profit_pct = abs(px - entry_px) / max(entry_px, 1e-12) * 100
-        
-        # تحديث أفضل ربح
-        if profit_pct > self.best_profit_pct:
-            self.best_profit_pct = profit_pct
-        
-        # المناطق القوية: نصبر أكثر
-        if zone_strength > 0.7:
-            min_target = MIN_SCALP_BPS * 1.8 / 10000 * 100  # 1.8x للقوة العالية
-            max_target = MIN_SCALP_BPS * 3.0 / 10000 * 100
-        # المناطق المتوسطة: هدف عادي
-        elif zone_strength > 0.5:
-            min_target = MIN_SCALP_BPS * 1.2 / 10000 * 100
-            max_target = MIN_SCALP_BPS * 2.0 / 10000 * 100
-        # المناطق الضعيفة: نخرج مبكراً
+        if adx < 20 and volume_ratio < 1.2:
+            return MarketPhase.CHOP
+        elif adx > 25 and di_plus > di_minus:
+            return MarketPhase.MARKUP
+        elif adx > 25 and di_minus > di_plus:
+            return MarketPhase.MARKDOWN
+        elif volume_ratio > 1.5 and structure.last_bos:
+            return MarketPhase.BREAKOUT
+        elif structure.last_choch:
+            return MarketPhase.REVERSAL
+        elif volume_ratio > 1.3 and abs(di_plus - di_minus) < 5:
+            return MarketPhase.ACCUMULATION if di_plus > di_minus else MarketPhase.DISTRIBUTION
         else:
-            min_target = MIN_SCALP_BPS * 0.8 / 10000 * 100
-            max_target = MIN_SCALP_BPS * 1.2 / 10000 * 100
+            return MarketPhase.CHOP
+    
+    def _calculate_market_strength(self, indicators: Dict, structure: MarketStructure, idx: int) -> float:
+        """حساب قوة السوق"""
+        strength = 0.0
         
-        # إغلاق عند تحقيق الهدف الأقصى
-        if profit_pct >= max_target:
-            return {
-                "action": "close",
-                "reason": f"🎯 MAX SCALP TARGET HIT ({profit_pct:.2f}%) - ZoneStr: {zone_strength:.2f}",
-                "close_pct": 1.0,
-                "profit_pct": profit_pct
-            }
+        # ADX (30%)
+        adx = indicators['adx'].iloc[idx]
+        strength += min(3.0, adx / 50 * 3)
         
-        # إغلاق جزئي عند تحقيق الهدف الأدنى (للمناطق المتوسطة والقوية)
-        if profit_pct >= min_target and zone_strength > 0.5:
-            close_pct = 0.5 if zone_strength > 0.7 else 0.3
-            return {
-                "action": "partial",
-                "reason": f"✅ SCALP TARGET HIT ({profit_pct:.2f}%) - Partial exit",
-                "close_pct": close_pct,
-                "profit_pct": profit_pct
-            }
+        # Volume (30%)
+        volume_ratio = indicators['volume_ratio'].iloc[idx]
+        strength += min(3.0, volume_ratio * 1.5)
         
-        # خروج سريع إذا كانت المنطقة ضعيفة وفقدنا الربح
-        if zone_strength < 0.5 and profit_pct > 0.3 and profit_pct < self.best_profit_pct * 0.7:
-            return {
-                "action": "close",
-                "reason": "📉 Weak zone profit retracement",
-                "close_pct": 1.0,
-                "profit_pct": profit_pct
-            }
+        # Trend Structure (20%)
+        if structure.trend != "neutral":
+            strength += 2.0
         
-        return {"action": "hold", "close_pct": 0.0, "reason": "Holding scalp position"}
+        # Momentum (20%)
+        macd_hist = abs(indicators['macd_histogram'].iloc[idx])
+        strength += min(2.0, macd_hist * 10)
+        
+        return min(10.0, strength)
+    
+    def _detect_danger_zones(self, indicators: Dict, df: pd.DataFrame, idx: int) -> List[str]:
+        """كشف المناطق الخطرة"""
+        dangers = []
+        
+        # RSI في أقصى المدى
+        rsi = indicators['rsi'].iloc[idx]
+        if rsi > 85 or rsi < 15:
+            dangers.append(f"RSI_EXTREME_{rsi:.1f}")
+        
+        # حجم ضعيف جدًا
+        volume_ratio = indicators['volume_ratio'].iloc[idx]
+        if volume_ratio < 0.5:
+            dangers.append(f"LOW_VOLUME_{volume_ratio:.1f}")
+        
+        # ADX ضعيف مع تقلبات كبيرة
+        adx = indicators['adx'].iloc[idx]
+        atr = indicators['atr'].iloc[idx]
+        price = df['close'].iloc[idx]
+        
+        if adx < 15 and atr / price * 100 > 1.5:
+            dangers.append(f"HIGH_VOLATILITY_CHOP")
+        
+        # اختراق كاذب حديث
+        if len(df) > 5:
+            recent_high = df['high'].iloc[idx-5:idx].max()
+            recent_low = df['low'].iloc[idx-5:idx].min()
+            
+            if price > recent_high * 1.01 or price < recent_low * 0.99:
+                if volume_ratio < 1.0:
+                    dangers.append("FAKE_BREAKOUT_SUSPECTED")
+        
+        return dangers
+    
+    def generate_signals(self, df: pd.DataFrame) -> List[SmartSignal]:
+        """توليد إشارات ذكية متكاملة"""
+        signals = []
+        
+        # تحليل السوق أولاً
+        ctx = self.analyze_market(df)
+        
+        # 1. إشارات المناطق الذهبية
+        golden_signals = self._generate_golden_signals(df, ctx)
+        signals.extend(golden_signals)
+        
+        # 2. إشارات Break of Structure
+        bos_signals = self._generate_bos_signals(df, ctx)
+        signals.extend(bos_signals)
+        
+        # 3. إشارات Retest
+        retest_signals = self._generate_retest_signals(df, ctx)
+        signals.extend(retest_signals)
+        
+        # 4. إشارات Trend Following
+        trend_signals = self._generate_trend_signals(df, ctx)
+        signals.extend(trend_signals)
+        
+        # 5. تقييم جميع الإشارات بواسطة المجلس
+        evaluated_signals = []
+        for signal in signals:
+            evaluation = self.council.evaluate_signal(signal, ctx, df)
+            
+            if evaluation['approved']:
+                signal.confidence = evaluation['confidence']
+                signal.reasons.extend(evaluation['reasons'])
+                evaluated_signals.append(signal)
+        
+        # حفظ آخر الإشارات
+        self.last_signals.extend(evaluated_signals[:3])
+        
+        return evaluated_signals
+    
+    def _generate_golden_signals(self, df: pd.DataFrame, ctx: TradingContext) -> List[SmartSignal]:
+        """توليد إشارات المناطق الذهبية"""
+        signals = []
+        current_price = ctx.price
+        
+        # كشف المناطق الذهبية
+        golden_zones = self.golden_detector.detect_golden_zones(df, ctx)
+        
+        for zone in golden_zones[-3:]:  # آخر 3 مناطق ذهبية
+            if zone['type'] == 'GOLDEN_BOTTOM':
+                # حساب TP/SL للقاع الذهبي
+                entry = current_price
+                sl = entry * 0.995  # 0.5% stop loss
+                
+                # 3 مستويات TP للصفقات الذهبية
+                tps = [
+                    entry * (1 + GOLDEN_TP_LEVELS[0]/100),
+                    entry * (1 + GOLDEN_TP_LEVELS[1]/100),
+                    entry * (1 + GOLDEN_TP_LEVELS[2]/100)
+                ]
+                
+                signal = SmartSignal(
+                    action='BUY',
+                    trade_type=TradeType.GOLDEN_REVERSAL,
+                    entry_price=entry,
+                    stop_loss=sl,
+                    take_profits=tps,
+                    close_fractions=GOLDEN_TP_CLOSE_FRACTIONS,
+                    confidence=zone['strength'] / 10 * 0.8,
+                    reasons=zone['reasons'],
+                    zone_strength=zone['strength'],
+                    risk_reward=(tps[0] - entry) / (entry - sl),
+                    market_context=ctx.__dict__,
+                    timestamp=int(time.time()),
+                    is_golden=True,
+                    requires_confirmation=True
+                )
+                signals.append(signal)
+            
+            elif zone['type'] == 'GOLDEN_TOP':
+                # حساب TP/SL للقمة الذهبية
+                entry = current_price
+                sl = entry * 1.005  # 0.5% stop loss
+                
+                # 3 مستويات TP للصفقات الذهبية
+                tps = [
+                    entry * (1 - GOLDEN_TP_LEVELS[0]/100),
+                    entry * (1 - GOLDEN_TP_LEVELS[1]/100),
+                    entry * (1 - GOLDEN_TP_LEVELS[2]/100)
+                ]
+                
+                signal = SmartSignal(
+                    action='SELL',
+                    trade_type=TradeType.GOLDEN_REVERSAL,
+                    entry_price=entry,
+                    stop_loss=sl,
+                    take_profits=tps,
+                    close_fractions=GOLDEN_TP_CLOSE_FRACTIONS,
+                    confidence=zone['strength'] / 10 * 0.8,
+                    reasons=zone['reasons'],
+                    zone_strength=zone['strength'],
+                    risk_reward=(entry - tps[0]) / (sl - entry),
+                    market_context=ctx.__dict__,
+                    timestamp=int(time.time()),
+                    is_golden=True,
+                    requires_confirmation=True
+                )
+                signals.append(signal)
+        
+        return signals
+    
+    def _generate_bos_signals(self, df: pd.DataFrame, ctx: TradingContext) -> List[SmartSignal]:
+        """توليد إشارات Break of Structure"""
+        signals = []
+        current_price = ctx.price
+        
+        if ctx.structure.last_bos:
+            # تأخر بسيط بعد BOS للدخول على Retest
+            if ctx.structure.last_bos['type'] == 'bullish' and current_price > ctx.structure.last_bos['price']:
+                # انتظار تراجع بسيط
+                recent_low = min(df['low'].iloc[-5:])
+                if current_price <= recent_low * 1.01:  # قريب من القاع الأخير
+                    entry = current_price
+                    sl = entry * 0.992  # 0.8% stop loss
+                    
+                    # مستويين TP للسكالب
+                    tps = [
+                        entry * (1 + SCALP_TP_LEVELS[0]/100),
+                        entry * (1 + SCALP_TP_LEVELS[1]/100)
+                    ]
+                    
+                    signal = SmartSignal(
+                        action='BUY',
+                        trade_type=TradeType.GOLDEN_BREAKOUT,
+                        entry_price=entry,
+                        stop_loss=sl,
+                        take_profits=tps,
+                        close_fractions=SCALP_TP_CLOSE_FRACTIONS,
+                        confidence=0.7,
+                        reasons=[
+                            f"Bullish BOS at {ctx.structure.last_bos['price']:.6f}",
+                            f"Retesting support",
+                            f"Volume ratio: {ctx.volume_ratio:.1f}"
+                        ],
+                        zone_strength=7.0,
+                        risk_reward=(tps[0] - entry) / (entry - sl),
+                        market_context=ctx.__dict__,
+                        timestamp=int(time.time()),
+                        is_golden=False,
+                        requires_confirmation=True
+                    )
+                    signals.append(signal)
+            
+            elif ctx.structure.last_bos['type'] == 'bearish' and current_price < ctx.structure.last_bos['price']:
+                # انتظار ارتداد بسيط
+                recent_high = max(df['high'].iloc[-5:])
+                if current_price >= recent_high * 0.99:  # قريب من القمة الأخيرة
+                    entry = current_price
+                    sl = entry * 1.008  # 0.8% stop loss
+                    
+                    # مستويين TP للسكالب
+                    tps = [
+                        entry * (1 - SCALP_TP_LEVELS[0]/100),
+                        entry * (1 - SCALP_TP_LEVELS[1]/100)
+                    ]
+                    
+                    signal = SmartSignal(
+                        action='SELL',
+                        trade_type=TradeType.GOLDEN_BREAKOUT,
+                        entry_price=entry,
+                        stop_loss=sl,
+                        take_profits=tps,
+                        close_fractions=SCALP_TP_CLOSE_FRACTIONS,
+                        confidence=0.7,
+                        reasons=[
+                            f"Bearish BOS at {ctx.structure.last_bos['price']:.6f}",
+                            f"Retesting resistance",
+                            f"Volume ratio: {ctx.volume_ratio:.1f}"
+                        ],
+                        zone_strength=7.0,
+                        risk_reward=(entry - tps[0]) / (sl - entry),
+                        market_context=ctx.__dict__,
+                        timestamp=int(time.time()),
+                        is_golden=False,
+                        requires_confirmation=True
+                    )
+                    signals.append(signal)
+        
+        return signals
+    
+    def _generate_retest_signals(self, df: pd.DataFrame, ctx: TradingContext) -> List[SmartSignal]:
+        """توليد إشارات إعادة الاختبار"""
+        signals = []
+        current_price = ctx.price
+        
+        # إعادة اختبار Order Blocks
+        for ob in ctx.order_blocks[-3:]:
+            distance = abs(current_price - ob['entry']) / ob['entry']
+            
+            if distance < 0.003:  # 0.3% قريب من OB
+                if ob['type'] == OrderBlockType.BULLISH_OB:
+                    entry = current_price
+                    sl = min(ob['low'] * 0.998, entry * 0.995)
+                    
+                    tps = [
+                        entry * (1 + SCALP_TP_LEVELS[0]/100),
+                        entry * (1 + SCALP_TP_LEVELS[1]/100)
+                    ]
+                    
+                    signal = SmartSignal(
+                        action='BUY',
+                        trade_type=TradeType.SCALP_RETEST,
+                        entry_price=entry,
+                        stop_loss=sl,
+                        take_profits=tps,
+                        close_fractions=SCALP_TP_CLOSE_FRACTIONS,
+                        confidence=0.6,
+                        reasons=[
+                            f"Retesting Bullish OB at {ob['entry']:.6f}",
+                            f"OB strength: {ob['strength']:.1f}/10",
+                            f"Distance: {distance*100:.2f}%"
+                        ],
+                        zone_strength=ob['strength'],
+                        risk_reward=(tps[0] - entry) / (entry - sl),
+                        market_context=ctx.__dict__,
+                        timestamp=int(time.time()),
+                        is_golden=False,
+                        requires_confirmation=True
+                    )
+                    signals.append(signal)
+                
+                elif ob['type'] == OrderBlockType.BEARISH_OB:
+                    entry = current_price
+                    sl = max(ob['high'] * 1.002, entry * 1.005)
+                    
+                    tps = [
+                        entry * (1 - SCALP_TP_LEVELS[0]/100),
+                        entry * (1 - SCALP_TP_LEVELS[1]/100)
+                    ]
+                    
+                    signal = SmartSignal(
+                        action='SELL',
+                        trade_type=TradeType.SCALP_RETEST,
+                        entry_price=entry,
+                        stop_loss=sl,
+                        take_profits=tps,
+                        close_fractions=SCALP_TP_CLOSE_FRACTIONS,
+                        confidence=0.6,
+                        reasons=[
+                            f"Retesting Bearish OB at {ob['entry']:.6f}",
+                            f"OB strength: {ob['strength']:.1f}/10",
+                            f"Distance: {distance*100:.2f}%"
+                        ],
+                        zone_strength=ob['strength'],
+                        risk_reward=(entry - tps[0]) / (sl - entry),
+                        market_context=ctx.__dict__,
+                        timestamp=int(time.time()),
+                        is_golden=False,
+                        requires_confirmation=True
+                    )
+                    signals.append(signal)
+        
+        return signals
+    
+    def _generate_trend_signals(self, df: pd.DataFrame, ctx: TradingContext) -> List[SmartSignal]:
+        """توليد إشارات متابعة الترند"""
+        signals = []
+        current_price = ctx.price
+        
+        # إشارات متابعة الترند القوي
+        if ctx.adx > 25 and ctx.market_strength > 6.0:
+            if ctx.bias in [MarketBias.STRONG_BULL, MarketBias.BULL]:
+                # دخول على تراجع بسيط في الترند الصاعد
+                if current_price <= ctx.ma_fast * 1.005:  # قريب من MA السريع
+                    entry = current_price
+                    sl = entry * 0.99  # 1% stop loss
+                    
+                    # TP ديناميكي للترند
+                    tps = [
+                        entry * (1 + TREND_TP_TRAIL_ATR/100),
+                        entry * (1 + TREND_TP_TRAIL_ATR * 1.5/100)
+                    ]
+                    
+                    signal = SmartSignal(
+                        action='BUY',
+                        trade_type=TradeType.TREND_FOLLOW,
+                        entry_price=entry,
+                        stop_loss=sl,
+                        take_profits=tps,
+                        close_fractions=[0.5, 0.5],  # نصف في كل مستوى
+                        confidence=0.65,
+                        reasons=[
+                            f"Strong bullish trend (ADX: {ctx.adx:.1f})",
+                            f"Retesting MA Fast: {ctx.ma_fast:.6f}",
+                            f"Market strength: {ctx.market_strength:.1f}/10"
+                        ],
+                        zone_strength=7.5,
+                        risk_reward=(tps[0] - entry) / (entry - sl),
+                        market_context=ctx.__dict__,
+                        timestamp=int(time.time()),
+                        is_golden=False,
+                        requires_confirmation=False  # لا يحتاج تأكيد في ترند قوي
+                    )
+                    signals.append(signal)
+            
+            elif ctx.bias in [MarketBias.STRONG_BEAR, MarketBias.BEAR]:
+                # دخول على ارتداد بسيط في الترند الهابط
+                if current_price >= ctx.ma_fast * 0.995:  # قريب من MA السريع
+                    entry = current_price
+                    sl = entry * 1.01  # 1% stop loss
+                    
+                    # TP ديناميكي للترند
+                    tps = [
+                        entry * (1 - TREND_TP_TRAIL_ATR/100),
+                        entry * (1 - TREND_TP_TRAIL_ATR * 1.5/100)
+                    ]
+                    
+                    signal = SmartSignal(
+                        action='SELL',
+                        trade_type=TradeType.TREND_FOLLOW,
+                        entry_price=entry,
+                        stop_loss=sl,
+                        take_profits=tps,
+                        close_fractions=[0.5, 0.5],  # نصف في كل مستوى
+                        confidence=0.65,
+                        reasons=[
+                            f"Strong bearish trend (ADX: {ctx.adx:.1f})",
+                            f"Retesting MA Fast: {ctx.ma_fast:.6f}",
+                            f"Market strength: {ctx.market_strength:.1f}/10"
+                        ],
+                        zone_strength=7.5,
+                        risk_reward=(entry - tps[0]) / (sl - entry),
+                        market_context=ctx.__dict__,
+                        timestamp=int(time.time()),
+                        is_golden=False,
+                        requires_confirmation=False
+                    )
+                    signals.append(signal)
+        
+        return signals
 
-# =================== ENHANCED SCENARIO DECISION ===================
-def scenario_decide_professional(df: pd.DataFrame) -> ScenarioDecision:
-    """اتخاذ القرار المحترف مع فود برنت محسن وكشف المناطق الخطرة"""
-    if not SCENARIO_ENGINE_ENABLED:
-        return ScenarioDecision(Action.NO_TRADE, Mode.NONE, "Scenario Engine Disabled", 0.0)
+# =================== PROFESSIONAL TRADE MANAGER ===================
+class ProfessionalTradeManager:
+    """مدير الصفقات المحترف"""
     
-    ctx = build_context(df)
-    fvg = detect_fvg(df, FVG_LOOKBACK)
-    ob = detect_simple_ob(df, OB_LOOKBACK)
-    sweep = detect_liquidity_sweep(df, 30)
-    food_print = detect_food_print_advanced_v2(df, FOOD_PRINT_LOOKBACK)  # إصدار محسن
-    danger_zone = detect_danger_zone_advanced(df, ctx)  # كشف المنطقة الخطرة
-    
-    # تحديث السياق بخطر المنطقة
-    ctx.danger_zone = danger_zone["is_danger_zone"]
-    
-    px = ctx.px
-    notes = list(ctx.notes)
-    
-    # إضافة معلومات المنطقة الخطرة
-    if danger_zone["is_danger_zone"]:
-        notes.append(f"DANGER_ZONE({danger_zone['risk_level']})")
-        for reason in danger_zone["reasons"]:
-            notes.append(reason)
-    
-    # ====================
-    # 1. منع الدخول في المناطق الخطرة
-    # ====================
-    if danger_zone["is_danger_zone"] and danger_zone["risk_level"] in ["HIGH", "MEDIUM"]:
-        return ScenarioDecision(
-            Action.NO_TRADE,
-            Mode.NONE,
-            f"🚫 DANGER ZONE DETECTED: {', '.join(danger_zone['reasons'][:2])}",
-            0.9,
-            danger_zone_detected=True,
-            meta={
-                "ctx": ctx.__dict__,
-                "danger_zone": danger_zone,
-                "food_print": food_print,
-                "notes": notes
-            }
-        )
-    
-    # ====================
-    # 2. كشف الصفقات الذهبية أولاً مع فود برنت محسن
-    # ====================
-    golden_trade, zone_strength = is_golden_trade_setup_enhanced(ctx, fvg, ob, sweep, food_print)
-    
-    if golden_trade and zone_strength >= STRONG_ZONE_THRESHOLD:
-        notes.append(f"GOLDEN_TRADE_SETUP_STR:{zone_strength:.2f}")
+    def __init__(self):
+        self.current_trade = None
+        self.trade_history = []
+        self.entry_time = None
+        self.best_price = None
+        self.trail_stop = None
+        self.tp_levels_hit = []
+        self.consecutive_losses = 0
+        self.consecutive_wins = 0
+        self.total_pnl = 0.0
+        self.max_drawdown = 0.0
+        self.cooldown_until = 0
         
-        if ctx.bias == "bull":
-            # حساب TP على 3 مستويات للصفقات الذهبية
-            tp1 = px * (1 + GOLDEN_TP_LEVELS[0]/100)
-            tp2 = px * (1 + GOLDEN_TP_LEVELS[1]/100)
-            tp3 = px * (1 + GOLDEN_TP_LEVELS[2]/100)
-            sl = trend_initial_sl(px, ctx.atr, "buy")
-            
-            return ScenarioDecision(
-                action=Action.BUY,
-                mode=Mode.GOLDEN,
-                reason=f"🏆 GOLDEN BUY: Strong trend + Displacement + Premium zone (ADX:{ctx.adx:.1f}, VolZ:{ctx.vol_z:.2f}, ZoneStr:{zone_strength:.2f})",
-                confidence=min(0.95, 0.7 + zone_strength * 0.25),
-                tp_price=tp1,
-                sl_price=sl,
-                is_golden_trade=True,
-                zone_strength=zone_strength,
-                meta={
-                    "ctx": ctx.__dict__,
-                    "ob": ob,
-                    "fvg": fvg,
-                    "sweep": sweep,
-                    "food_print": food_print,
-                    "danger_zone": danger_zone,
-                    "notes": notes,
-                    "golden_tp_levels": [tp1, tp2, tp3],
-                    "golden_close_fractions": GOLDEN_TP_CLOSE_FRACTIONS
-                }
-            )
+    def open_trade(self, signal: SmartSignal, qty: float, entry_price: float):
+        """فتح صفقة جديدة"""
+        self.current_trade = {
+            'signal': signal,
+            'qty': qty,
+            'entry_price': entry_price,
+            'entry_time': time.time(),
+            'best_price': entry_price,
+            'trail_stop': signal.stop_loss,
+            'tp_levels_hit': [],
+            'current_pnl': 0.0,
+            'max_pnl': 0.0,
+            'status': 'OPEN'
+        }
+        self.entry_time = time.time()
+        self.best_price = entry_price
         
-        elif ctx.bias == "bear":
-            tp1 = px * (1 - GOLDEN_TP_LEVELS[0]/100)
-            tp2 = px * (1 - GOLDEN_TP_LEVELS[1]/100)
-            tp3 = px * (1 - GOLDEN_TP_LEVELS[2]/100)
-            sl = trend_initial_sl(px, ctx.atr, "sell")
-            
-            return ScenarioDecision(
-                action=Action.SELL,
-                mode=Mode.GOLDEN,
-                reason=f"🏆 GOLDEN SELL: Strong trend + Displacement + Premium zone (ADX:{ctx.adx:.1f}, VolZ:{ctx.vol_z:.2f}, ZoneStr:{zone_strength:.2f})",
-                confidence=min(0.95, 0.7 + zone_strength * 0.25),
-                tp_price=tp1,
-                sl_price=sl,
-                is_golden_trade=True,
-                zone_strength=zone_strength,
-                meta={
-                    "ctx": ctx.__dict__,
-                    "ob": ob,
-                    "fvg": fvg,
-                    "sweep": sweep,
-                    "food_print": food_print,
-                    "danger_zone": danger_zone,
-                    "notes": notes,
-                    "golden_tp_levels": [tp1, tp2, tp3],
-                    "golden_close_fractions": GOLDEN_TP_CLOSE_FRACTIONS
-                }
-            )
+        logger.trade(f"📈 TRADE OPENED: {signal.action} {qty:.4f} @ {entry_price:.6f}")
+        logger.trade(f"   Type: {signal.trade_type.value}")
+        logger.trade(f"   Confidence: {signal.confidence:.2f}")
+        logger.trade(f"   Zone Strength: {signal.zone_strength:.1f}/10")
+        logger.trade(f"   SL: {signal.stop_loss:.6f}")
+        logger.trade(f"   TPs: {', '.join([f'{tp:.6f}' for tp in signal.take_profits])}")
+        
+        for reason in signal.reasons[:3]:
+            logger.info(f"   📝 {reason}")
     
-    # ====================
-    # 3. منع التداول في الـ Chop
-    # ====================
-    if ctx.phase == Phase.CHOP:
-        if sweep.get("ok") and (sweep.get("sweep_low") or sweep.get("sweep_high")):
-            notes.append("chop_but_sweep")
+    def manage_trade(self, current_price: float, ctx: TradingContext) -> Optional[str]:
+        """إدارة الصفقة الحالية"""
+        if not self.current_trade:
+            return None
+        
+        signal = self.current_trade['signal']
+        entry = self.current_trade['entry_price']
+        qty = self.current_trade['qty']
+        
+        # حساب PnL الحالي
+        if signal.action == 'BUY':
+            pnl_pct = (current_price - entry) / entry * 100
+        else:  # SELL
+            pnl_pct = (entry - current_price) / entry * 100
+        
+        self.current_trade['current_pnl'] = pnl_pct
+        self.current_trade['max_pnl'] = max(self.current_trade['max_pnl'], pnl_pct)
+        
+        # تحديث أفضل سعر للترايلينغ
+        if signal.action == 'BUY':
+            if current_price > self.current_trade['best_price']:
+                self.current_trade['best_price'] = current_price
         else:
-            return ScenarioDecision(
-                Action.NO_TRADE, 
-                Mode.NONE, 
-                f"CHOP: Low ADX ({ctx.adx:.1f}), no clear setup", 
-                0.35,
-                zone_strength=zone_strength,
-                danger_zone_detected=danger_zone["is_danger_zone"],
-                meta={
-                    "ctx": ctx.__dict__, 
-                    "notes": notes, 
-                    "food_print": food_print,
-                    "danger_zone": danger_zone
-                }
-            )
-    
-    # ====================
-    # 4. الدخول في المناطق القوية فقط (للسكالب)
-    # ====================
-    if zone_strength < MIN_ZONE_STRENGTH:
-        return ScenarioDecision(
-            Action.NO_TRADE,
-            Mode.NONE,
-            f"Zone too weak for scalp ({zone_strength:.2f} < {MIN_ZONE_STRENGTH})",
-            0.4,
-            zone_strength=zone_strength,
-            danger_zone_detected=danger_zone["is_danger_zone"],
-            meta={
-                "ctx": ctx.__dict__,
-                "food_print": food_print,
-                "danger_zone": danger_zone,
-                "notes": notes
-            }
-        )
-    
-    # ====================
-    # 5. منع الدخول عكس الترند القوي
-    # ====================
-    strong_bull = (ctx.adx >= TREND_ADX_MIN and ctx.di_plus > ctx.di_minus)
-    strong_bear = (ctx.adx >= TREND_ADX_MIN and ctx.di_minus > ctx.di_plus)
-    
-    # ====================
-    # 6. مناطق الدخول (OB/FVG)
-    # ====================
-    near_bull_ob = False
-    near_bear_ob = False
-    bull_ob = ob.get("bull_ob")
-    bear_ob = ob.get("bear_ob")
-    
-    if bull_ob:
-        near_bull_ob = near_zone(px, bull_ob["low"], bull_ob["high"], tolerance_bps=20)
-    if bear_ob:
-        near_bear_ob = near_zone(px, bear_ob["low"], bear_ob["high"], tolerance_bps=20)
-    
-    near_bull_fvg = False
-    near_bear_fvg = False
-    last_fvg = fvg.get("last") if fvg.get("ok") else None
-    if last_fvg:
-        if last_fvg["type"] == "bull":
-            near_bull_fvg = near_zone(px, last_fvg["low"], last_fvg["high"], tolerance_bps=20)
-        if last_fvg["type"] == "bear":
-            near_bear_fvg = near_zone(px, last_fvg["low"], last_fvg["high"], tolerance_bps=20)
-    
-    # ====================
-    # 7. تأكيد الدخول
-    # ====================
-    confirm_buy = candle_rejection(df, len(df)-1, "buy") or ctx.displacement
-    confirm_sell = candle_rejection(df, len(df)-1, "sell") or ctx.displacement
-    
-    # ====================
-    # 8. إعدادات السكالب (مع مراعاة قوة المنطقة)
-    # ====================
-    scalp_buy_setup = (sweep.get("sweep_low") or near_bull_ob or near_bull_fvg) and confirm_buy
-    scalp_sell_setup = (sweep.get("sweep_high") or near_bear_ob or near_bear_fvg) and confirm_sell
-    
-    # منع السكالب عكس الترند إلا في مناطق قوية
-    if strong_bull and scalp_sell_setup:
-        if not (candle_rejection(df, len(df)-1, "sell") and sweep.get("sweep_high") and zone_strength > 0.8):
-            scalp_sell_setup = False
-            notes.append("blocked_scalp_sell_vs_bull_trend")
-    
-    if strong_bear and scalp_buy_setup:
-        if not (candle_rejection(df, len(df)-1, "buy") and sweep.get("sweep_low") and zone_strength > 0.8):
-            scalp_buy_setup = False
-            notes.append("blocked_scalp_buy_vs_bear_trend")
-    
-    # ====================
-    # 9. إعدادات الترند
-    # ====================
-    trend_ok = (ctx.phase in (Phase.EXPANSION, Phase.TREND)) and ctx.displacement and (ctx.adx >= TREND_ADX_MIN)
-    
-    trend_buy_setup = trend_ok and (ctx.bias == "bull") and (near_bull_ob or near_bull_fvg or (px >= ctx.vwap))
-    trend_sell_setup = trend_ok and (ctx.bias == "bear") and (near_bear_ob or near_bear_fvg or (px <= ctx.vwap))
-    
-    # ====================
-    # 10. اتخاذ القرار النهائي
-    # ====================
-    if trend_buy_setup:
-        sl = trend_initial_sl(px, ctx.atr, "buy")
-        return ScenarioDecision(
-            Action.BUY, 
-            Mode.TREND, 
-            f"TREND BUY: {ctx.phase.value} phase + displacement + bullish bias (ZoneStr:{zone_strength:.2f})", 
-            0.82,
-            tp_price=None,  # الترند بدون TP ثابت
-            sl_price=sl,
-            zone_strength=zone_strength,
-            danger_zone_detected=danger_zone["is_danger_zone"],
-            meta={"ctx": ctx.__dict__, "ob": ob, "fvg": fvg, "sweep": sweep, "food_print": food_print, "danger_zone": danger_zone, "notes": notes}
-        )
-    
-    if trend_sell_setup:
-        sl = trend_initial_sl(px, ctx.atr, "sell")
-        return ScenarioDecision(
-            Action.SELL, 
-            Mode.TREND, 
-            f"TREND SELL: {ctx.phase.value} phase + displacement + bearish bias (ZoneStr:{zone_strength:.2f})", 
-            0.82,
-            tp_price=None,
-            sl_price=sl,
-            zone_strength=zone_strength,
-            danger_zone_detected=danger_zone["is_danger_zone"],
-            meta={"ctx": ctx.__dict__, "ob": ob, "fvg": fvg, "sweep": sweep, "food_print": food_print, "danger_zone": danger_zone, "notes": notes}
-        )
-    
-    if scalp_buy_setup and zone_strength >= MIN_ZONE_STRENGTH:
-        tp, sl = scalp_tp_sl(px, ctx.atr, "buy", zone_strength)
-        return ScenarioDecision(
-            Action.BUY, 
-            Mode.SCALP, 
-            f"SCALP BUY: zone touch + confirm (min {MIN_SCALP_POINTS} points, ZoneStr:{zone_strength:.2f})", 
-            0.68,
-            tp_price=tp,
-            sl_price=sl,
-            zone_strength=zone_strength,
-            danger_zone_detected=danger_zone["is_danger_zone"],
-            meta={"ctx": ctx.__dict__, "ob": ob, "fvg": fvg, "sweep": sweep, "food_print": food_print, "danger_zone": danger_zone, "notes": notes}
-        )
-    
-    if scalp_sell_setup and zone_strength >= MIN_ZONE_STRENGTH:
-        tp, sl = scalp_tp_sl(px, ctx.atr, "sell", zone_strength)
-        return ScenarioDecision(
-            Action.SELL, 
-            Mode.SCALP, 
-            f"SCALP SELL: zone touch + confirm (min {MIN_SCALP_POINTS} points, ZoneStr:{zone_strength:.2f})", 
-            0.68,
-            tp_price=tp,
-            sl_price=sl,
-            zone_strength=zone_strength,
-            danger_zone_detected=danger_zone["is_danger_zone"],
-            meta={"ctx": ctx.__dict__, "ob": ob, "fvg": fvg, "sweep": sweep, "food_print": food_print, "danger_zone": danger_zone, "notes": notes}
-        )
-    
-    return ScenarioDecision(
-        Action.HOLD, 
-        Mode.NONE, 
-        f"Waiting for better setup (Phase: {ctx.phase.value}, Bias: {ctx.bias}, ZoneStr:{zone_strength:.2f})", 
-        0.45,
-        zone_strength=zone_strength,
-        danger_zone_detected=danger_zone["is_danger_zone"],
-        meta={"ctx": ctx.__dict__, "ob": ob, "fvg": fvg, "sweep": sweep, "food_print": food_print, "danger_zone": danger_zone, "notes": notes}
-    )
-
-# =================== EXCHANGE SETUP ===================
-def make_ex():
-    return ccxt.bingx({
-        "apiKey": API_KEY,
-        "secret": API_SECRET,
-        "enableRateLimit": True,
-        "timeout": 20000,
-        "options": {"defaultType": "swap"}
-    })
-
-ex = make_ex()
-MARKET = {}
-AMT_PREC = 0
-LOT_STEP = None
-LOT_MIN  = None
-
-def load_market_specs():
-    global MARKET, AMT_PREC, LOT_STEP, LOT_MIN
-    try:
-        ex.load_markets()
-        MARKET = ex.markets.get(SYMBOL, {})
-        AMT_PREC = int((MARKET.get("precision", {}) or {}).get("amount", 0) or 0)
-        LOT_STEP = (MARKET.get("limits", {}) or {}).get("amount", {}).get("step", None)
-        LOT_MIN  = (MARKET.get("limits", {}) or {}).get("amount", {}).get("min",  None)
-        log_i(f"precision={AMT_PREC}, step={LOT_STEP}, min={LOT_MIN}")
-    except Exception as e:
-        log_w(f"load_market_specs: {e}")
-
-def ensure_leverage_mode():
-    try:
-        try:
-            ex.set_leverage(LEVERAGE, SYMBOL, params={"side": "BOTH"})
-            log_g(f"leverage set: {LEVERAGE}x")
-        except Exception as e:
-            log_w(f"set_leverage warn: {e}")
-        log_i(f"position mode: {POSITION_MODE}")
-    except Exception as e:
-        log_w(f"ensure_leverage_mode: {e}")
-
-try:
-    load_market_specs()
-    ensure_leverage_mode()
-except Exception as e:
-    log_w(f"exchange init: {e}")
-
-# =================== HELPERS ===================
-_consec_err = 0
-last_loop_ts = time.time()
-
-def _round_amt(q):
-    if q is None: return 0.0
-    try:
-        d = Decimal(str(q))
-        if LOT_STEP and isinstance(LOT_STEP,(int,float)) and LOT_STEP>0:
-            step = Decimal(str(LOT_STEP))
-            d = (d/step).to_integral_value(rounding=ROUND_DOWN)*step
-        prec = int(AMT_PREC) if AMT_PREC and AMT_PREC>=0 else 0
-        d = d.quantize(Decimal(1).scaleb(-prec), rounding=ROUND_DOWN)
-        if LOT_MIN and isinstance(LOT_MIN,(int,float)) and LOT_MIN>0 and d < Decimal(str(LOT_MIN)): return 0.0
-        return float(d)
-    except (InvalidOperation, ValueError, TypeError):
-        return max(0.0, float(q))
-
-def safe_qty(q): 
-    q = _round_amt(q)
-    if q<=0: log_w(f"qty invalid after normalize → {q}")
-    return q
-
-def fmt(v, d=6, na="—"):
-    try:
-        if v is None or (isinstance(v,float) and (math.isnan(v) or math.isinf(v))): return na
-        return f"{float(v):.{d}f}"
-    except Exception:
-        return na
-
-def with_retry(fn, tries=3, base_wait=0.4):
-    global _consec_err
-    for i in range(tries):
-        try:
-            r = fn()
-            _consec_err = 0
-            return r
-        except Exception:
-            _consec_err += 1
-            if i == tries-1: raise
-            time.sleep(base_wait*(2**i) + random.random()*0.25)
-
-def fetch_ohlcv(limit=600):
-    rows = with_retry(lambda: ex.fetch_ohlcv(SYMBOL, timeframe=INTERVAL, limit=limit, params={"type":"swap"}))
-    return pd.DataFrame(rows, columns=["time","open","high","low","close","volume"])
-
-def price_now():
-    try:
-        t = with_retry(lambda: ex.fetch_ticker(SYMBOL))
-        return t.get("last") or t.get("close")
-    except Exception: return None
-
-def balance_usdt():
-    if not MODE_LIVE: return 100.0
-    try:
-        b = with_retry(lambda: ex.fetch_balance(params={"type":"swap"}))
-        return b.get("total",{}).get("USDT") or b.get("free",{}).get("USDT")
-    except Exception: return None
-
-def orderbook_spread_bps():
-    try:
-        ob = with_retry(lambda: ex.fetch_order_book(SYMBOL, limit=5))
-        bid = ob["bids"][0][0] if ob["bids"] else None
-        ask = ob["asks"][0][0] if ob["asks"] else None
-        if not (bid and ask): return None
-        mid = (bid+ask)/2.0
-        return ((ask-bid)/mid)*10000.0
-    except Exception:
+            if current_price < self.current_trade['best_price']:
+                self.current_trade['best_price'] = current_price
+        
+        # 1. تحقق من Stop Loss
+        if self._check_stop_loss(current_price, signal):
+            return self._close_trade("STOP_LOSS", current_price, pnl_pct)
+        
+        # 2. تحقق من Take Profit Levels
+        tp_action = self._check_take_profits(current_price, signal)
+        if tp_action:
+            return self._close_trade(tp_action, current_price, pnl_pct)
+        
+        # 3. إدارة Trailing Stop للترند
+        if signal.trade_type in [TradeType.TREND_FOLLOW, TradeType.GOLDEN_BREAKOUT]:
+            trail_action = self._manage_trailing_stop(current_price, signal, ctx)
+            if trail_action:
+                return self._close_trade(trail_action, current_price, pnl_pct)
+        
+        # 4. حماية الربح
+        if self.current_trade['max_pnl'] > 0.5 and pnl_pct < self.current_trade['max_pnl'] * 0.5:
+            return self._close_trade("PROFIT_PROTECTION", current_price, pnl_pct)
+        
+        # 5. كشف المناطق الخطرة
+        if ctx.danger_zones and len(ctx.danger_zones) >= 2:
+            return self._close_trade("DANGER_ZONE", current_price, pnl_pct)
+        
+        # 6. Time Stop (حسب نوع الصفقة)
+        time_in_trade = time.time() - self.entry_time
+        if signal.trade_type == TradeType.SCALP_RETEST and time_in_trade > 1800:  # 30 دقيقة
+            return self._close_trade("TIME_STOP_SCALP", current_price, pnl_pct)
+        elif time_in_trade > 7200:  # ساعتين
+            return self._close_trade("TIME_STOP_MAX", current_price, pnl_pct)
+        
         return None
-
-# =================== TRADE EXECUTION ===================
-trade_manager = TradeManagerProfessional()
-
-STATE = {
-    "open": False,
-    "side": None,
-    "entry": None,
-    "qty": 0.0,
-    "pnl": 0.0,
-    "mode": None,
-    "decision_reason": None,
-    "is_golden": False,
-    "zone_strength": 0.5,
-    "tp_price": None,
-    "sl_price": None,
-    "entry_time": None,
-    "bars_in_trade": 0,
-    "max_profit_pct": 0.0,
-    "trade_manager": {},
-    "entry_context": None,
-    "trail_price": None,
-    "breakeven_armed": False,
-    "breakeven_price": None
-}
-
-compound_pnl = 0.0
-wait_for_next_signal_side = None
-
-def compute_size(balance, price):
-    effective = balance or 0.0
-    capital = effective * RISK_ALLOC * LEVERAGE
-    raw = max(0.0, capital / max(float(price or 0.0), 1e-9))
-    return safe_qty(raw)
-
-def _params_open(side):
-    if POSITION_MODE == "hedge":
-        return {"positionSide": "LONG" if side=="buy" else "SHORT", "reduceOnly": False}
-    return {"positionSide": "BOTH", "reduceOnly": False}
-
-def _params_close():
-    if POSITION_MODE == "hedge":
-        return {"positionSide": "LONG" if STATE.get("side")=="long" else "SHORT", "reduceOnly": True}
-    return {"positionSide": "BOTH", "reduceOnly": True}
-
-def open_market_enhanced(decision: ScenarioDecision, balance: float, current_price: float) -> bool:
-    """فتح صفقة بناءً على قرار السيناريو"""
-    if decision.action not in [Action.BUY, Action.SELL]:
-        log_w(f"No trade action: {decision.action}")
-        return False
     
-    side = "buy" if decision.action == Action.BUY else "sell"
-    qty = compute_size(balance, current_price)
+    def _check_stop_loss(self, current_price: float, signal: SmartSignal) -> bool:
+        """تحقق من Stop Loss"""
+        if signal.action == 'BUY':
+            return current_price <= signal.stop_loss
+        else:
+            return current_price >= signal.stop_loss
     
-    if qty <= 0:
-        log_e("Invalid quantity")
-        return False
+    def _check_take_profits(self, current_price: float, signal: SmartSignal) -> Optional[str]:
+        """تحقق من مستويات Take Profit"""
+        for i, tp in enumerate(signal.take_profits):
+            if i in self.current_trade['tp_levels_hit']:
+                continue
+            
+            if signal.action == 'BUY':
+                hit = current_price >= tp
+            else:
+                hit = current_price <= tp
+            
+            if hit:
+                self.current_trade['tp_levels_hit'].append(i)
+                
+                # إغلاق كلي أو جزئي حسب الكسور
+                close_fraction = signal.close_fractions[i]
+                if close_fraction >= 1.0 or len(signal.take_profits) == i + 1:
+                    return f"TP{i+1}_FULL"
+                else:
+                    # هنا يمكن تطبيق إغلاق جزئي
+                    return f"TP{i+1}_PARTIAL"
+        
+        return None
     
-    log_banner("ENTERING TRADE")
-    log_g(f"🎯 DECISION: {decision.action.value} | MODE: {decision.mode.value}")
-    log_g(f"📈 REASON: {decision.reason}")
-    log_g(f"💪 CONFIDENCE: {decision.confidence:.2f}")
-    log_g(f"🏆 ZONE STRENGTH: {decision.zone_strength:.2f}")
+    def _manage_trailing_stop(self, current_price: float, signal: SmartSignal, ctx: TradingContext) -> Optional[str]:
+        """إدارة Trailing Stop للترند"""
+        atr_percent = ctx.atr / current_price * 100
+        
+        if signal.action == 'BUY':
+            # تحديث الترailing Stop
+            new_trail = current_price * (1 - atr_percent * TREND_BREAKEVEN_ATR / 100)
+            if new_trail > self.current_trade['trail_stop']:
+                self.current_trade['trail_stop'] = new_trail
+            
+            # تحقق من كسر الترailing
+            if current_price <= self.current_trade['trail_stop']:
+                return "TRAIL_STOP"
+        
+        else:  # SELL
+            new_trail = current_price * (1 + atr_percent * TREND_BREAKEVEN_ATR / 100)
+            if new_trail < self.current_trade['trail_stop']:
+                self.current_trade['trail_stop'] = new_trail
+            
+            if current_price >= self.current_trade['trail_stop']:
+                return "TRAIL_STOP"
+        
+        return None
     
-    if decision.is_golden_trade:
-        log_g("🏆 GOLDEN TRADE DETECTED - 3 Level TP Activated")
+    def _close_trade(self, reason: str, exit_price: float, pnl_pct: float) -> str:
+        """إغلاق الصفقة"""
+        signal = self.current_trade['signal']
+        entry = self.current_trade['entry_price']
+        qty = self.current_trade['qty']
+        
+        # حساب PnL النهائي
+        if signal.action == 'BUY':
+            pnl = (exit_price - entry) * qty
+        else:
+            pnl = (entry - exit_price) * qty
+        
+        self.total_pnl += pnl
+        
+        # تحديث الإحصائيات
+        if pnl_pct < 0:
+            self.consecutive_losses += 1
+            self.consecutive_wins = 0
+            self.max_drawdown = min(self.max_drawdown, pnl_pct)
+            
+            # كولدآون بعد الخسارة
+            loss_size = abs(pnl_pct)
+            if loss_size > MAX_LOSS_PER_TRADE_PCT:
+                self.cooldown_until = time.time() + COOLDOWN_AFTER_LOSS * 2
+            else:
+                self.cooldown_until = time.time() + COOLDOWN_AFTER_LOSS
+        else:
+            self.consecutive_wins += 1
+            self.consecutive_losses = 0
+            self.cooldown_until = time.time() + COOLDOWN_AFTER_WIN
+        
+        # تسجيل في التاريخ
+        trade_record = {
+            'timestamp': int(time.time()),
+            'action': signal.action,
+            'type': signal.trade_type.value,
+            'entry': entry,
+            'exit': exit_price,
+            'qty': qty,
+            'pnl': pnl,
+            'pnl_pct': pnl_pct,
+            'reason': reason,
+            'duration': time.time() - self.entry_time,
+            'signal': signal.__dict__
+        }
+        self.trade_history.append(trade_record)
+        
+        # تسجيل النتيجة
+        color = "green" if pnl_pct > 0 else "red"
+        logger.trade(colored(f"📊 TRADE CLOSED: {signal.action} @ {exit_price:.6f}", color))
+        logger.trade(colored(f"   PnL: {pnl_pct:+.2f}% | Total: {self.total_pnl:+.2f} USDT", color))
+        logger.trade(f"   Reason: {reason}")
+        logger.trade(f"   Duration: {trade_record['duration']:.0f}s")
+        
+        # إعادة تعيين
+        self.current_trade = None
+        self.entry_time = None
+        self.best_price = None
+        
+        return reason
     
-    # تنفيذ الأمر
-    if EXECUTE_ORDERS and not DRY_RUN and MODE_LIVE:
+    def should_trade(self) -> bool:
+        """هل يمكن التداول الآن؟"""
+        if time.time() < self.cooldown_until:
+            return False
+        
+        if self.consecutive_losses >= 3:
+            return False
+        
+        if abs(self.max_drawdown) > MAX_DRAWDOWN_PCT:
+            return False
+        
+        return True
+
+# =================== EXCHANGE INTEGRATION ===================
+class BingXExchange:
+    """تكامل مع منصة BingX"""
+    
+    def __init__(self):
+        self.exchange = ccxt.bingx({
+            "apiKey": API_KEY,
+            "secret": API_SECRET,
+            "enableRateLimit": True,
+            "timeout": 15000,
+            "options": {"defaultType": "swap"}
+        })
+        self.symbol = SYMBOL
+        self.load_market_info()
+        
+    def load_market_info(self):
+        """تحميل معلومات السوق"""
         try:
-            ex.set_leverage(LEVERAGE, SYMBOL, params={"side": "BOTH"})
-            ex.create_order(SYMBOL, "market", side, qty, None, _params_open(side))
-            log_g(f"✅ TRADE EXECUTED: {side.upper()} {qty:.4f} @ {current_price:.6f}")
+            self.exchange.load_markets()
+            market = self.exchange.market(self.symbol)
+            self.precision = market['precision']['amount']
+            self.min_qty = market['limits']['amount']['min']
+            logger.info(f"Market loaded: {self.symbol}")
+        except Exception as e:
+            logger.error(f"Failed to load market: {e}")
+    
+    def get_balance(self) -> float:
+        """الحصول على الرصيد"""
+        try:
+            balance = self.exchange.fetch_balance(params={"type": "swap"})
+            return balance['USDT']['total']
+        except Exception as e:
+            logger.error(f"Failed to get balance: {e}")
+            return 0.0
+    
+    def get_current_price(self) -> float:
+        """الحصول على السعر الحالي"""
+        try:
+            ticker = self.exchange.fetch_ticker(self.symbol)
+            return ticker['last']
+        except Exception as e:
+            logger.error(f"Failed to get price: {e}")
+            return 0.0
+    
+    def get_orderbook_spread(self) -> float:
+        """الحصول على السبريد"""
+        try:
+            orderbook = self.exchange.fetch_order_book(self.symbol, limit=5)
+            bid = orderbook['bids'][0][0] if orderbook['bids'] else 0
+            ask = orderbook['asks'][0][0] if orderbook['asks'] else 0
+            if bid and ask:
+                return ((ask - bid) / ((ask + bid) / 2)) * 10000
+        except Exception as e:
+            logger.error(f"Failed to get spread: {e}")
+        return 0.0
+    
+    def execute_order(self, side: str, qty: float) -> bool:
+        """تنفيذ أمر"""
+        if DRY_RUN or not MODE_LIVE:
+            logger.info(f"DRY RUN: Would {side.upper()} {qty:.4f} {self.symbol}")
+            return True
+        
+        try:
+            # ضبط الرافعة
+            self.exchange.set_leverage(LEVERAGE, self.symbol, params={"side": "BOTH"})
             
-            # تخزين بيانات الصفقة
-            STATE.update({
-                "open": True,
-                "side": "long" if side == "buy" else "short",
-                "entry": current_price,
-                "qty": qty,
-                "mode": decision.mode.value.lower(),
-                "decision_reason": decision.reason,
-                "is_golden": decision.is_golden_trade,
-                "zone_strength": decision.zone_strength,
-                "tp_price": decision.tp_price,
-                "sl_price": decision.sl_price,
-                "entry_time": int(time.time()),
-                "bars_in_trade": 0,
-                "max_profit_pct": 0.0,
-                "trade_manager": {
-                    "golden_tp_levels": decision.meta.get("golden_tp_levels", []) if decision.is_golden_trade else [],
-                    "golden_close_fractions": decision.meta.get("golden_close_fractions", []) if decision.is_golden_trade else [],
-                    "current_tp_level": 0,
-                    "promoted": False
-                }
-            })
+            # تنفيذ الأمر
+            order = self.exchange.create_order(
+                symbol=self.symbol,
+                type='market',
+                side=side,
+                amount=qty,
+                params={"positionSide": "LONG" if side == "buy" else "SHORT", "reduceOnly": False}
+            )
             
-            # تخزين سياق الدخول
-            if decision.meta and 'ctx' in decision.meta:
-                STATE["entry_context"] = decision.meta['ctx']
-            
-            # إعداد مدير الصفقة
-            trade_manager.initial_sl = decision.sl_price
-            trade_manager.trade_start_time = time.time()
-            trade_manager.golden_tp_levels = decision.meta.get("golden_tp_levels", []) if decision.is_golden_trade else []
-            trade_manager.golden_close_fractions = decision.meta.get("golden_close_fractions", []) if decision.is_golden_trade else []
-            
-            save_state(STATE)
+            logger.success(f"Order executed: {side.upper()} {qty:.4f}")
             return True
             
         except Exception as e:
-            log_e(f"❌ EXECUTION FAILED: {e}")
+            logger.error(f"Failed to execute order: {e}")
             return False
-    else:
-        log_i(f"DRY_RUN: Would {side.upper()} {qty:.4f} @ {current_price:.6f}")
-        return True
-
-def close_market_strict(reason="MANUAL"):
-    """إغلاق صارم للصفقة"""
-    global compound_pnl
     
-    try:
-        if MODE_LIVE and EXECUTE_ORDERS and not DRY_RUN:
-            side_to_close = "sell" if STATE.get("side") == "long" else "buy"
-            qty_to_close = safe_qty(STATE.get("qty", 0))
-            
-            if qty_to_close <= 0:
-                log_w("No quantity to close")
-                return
-            
-            ex.create_order(SYMBOL, "market", side_to_close, qty_to_close, None, _params_close())
-            log_g(f"✅ POSITION CLOSED: {reason}")
+    def close_position(self, side: str, qty: float) -> bool:
+        """إغلاق المركز"""
+        if DRY_RUN or not MODE_LIVE:
+            logger.info(f"DRY RUN: Would close {side.upper()} {qty:.4f}")
+            return True
         
-        # حساب PnL
-        entry = STATE.get("entry", 0)
-        current_price = price_now() or entry
-        side = STATE.get("side", "long")
-        qty = STATE.get("qty", 0)
-        
-        if side == "long":
-            pnl = (current_price - entry) * qty
-        else:
-            pnl = (entry - current_price) * qty
-        
-        compound_pnl += pnl
-        
-        # إعادة تعيين الحالة
-        STATE.update({
-            "open": False,
-            "side": None,
-            "entry": None,
-            "qty": 0,
-            "pnl": 0,
-            "mode": None,
-            "decision_reason": None,
-            "is_golden": False,
-            "zone_strength": 0.5,
-            "tp_price": None,
-            "sl_price": None,
-            "entry_time": None,
-            "bars_in_trade": 0,
-            "max_profit_pct": 0.0,
-            "trade_manager": {},
-            "entry_context": None,
-            "trail_price": None,
-            "breakeven_armed": False,
-            "breakeven_price": None
-        })
-        
-        save_state(STATE)
-        
-    except Exception as e:
-        log_e(f"❌ CLOSE FAILED: {e}")
-
-# =================== ENHANCED POSITION MANAGEMENT ===================
-def manage_open_position_professional(df: pd.DataFrame, current_price: float):
-    """إدارة الصفقة المفتوحة ديناميكياً مع مجلس الإدارة المحسّن"""
-    if not STATE.get("open"):
-        return
-    
-    # تحديث عدد الشمعات في الصفقة
-    STATE["bars_in_trade"] = STATE.get("bars_in_trade", 0) + 1
-    
-    # حساب الربح الحالي
-    entry = STATE.get("entry", 0)
-    side = STATE.get("side", "long")
-    qty = STATE.get("qty", 0)
-    
-    if side == "long":
-        profit_pct = (current_price - entry) / max(entry, 1e-12) * 100
-    else:
-        profit_pct = (entry - current_price) / max(entry, 1e-12) * 100
-    
-    STATE["pnl"] = profit_pct
-    
-    # تحديث أقصى ربح
-    if profit_pct > STATE.get("max_profit_pct", 0):
-        STATE["max_profit_pct"] = profit_pct
-    
-    # بناء سياق السوق الحالي
-    ctx = build_context(df)
-    food_print = detect_food_print_advanced_v2(df, FOOD_PRINT_LOOKBACK)
-    trade_manager.update_context(ctx, food_print)
-    
-    log_i(f"📊 TRADE STATUS: {side.upper()} | PnL: {profit_pct:.2f}% | Bars: {STATE['bars_in_trade']} | MaxPnL: {STATE['max_profit_pct']:.2f}%")
-    
-    # ====================
-    # 1. إدارة الصفقات الذهبية (3 مستويات TP)
-    # ====================
-    if STATE.get("is_golden"):
-        tm = STATE.get("trade_manager", {})
-        tp_levels = tm.get("golden_tp_levels", [])
-        close_fractions = tm.get("golden_close_fractions", [])
-        
-        if len(tp_levels) >= 3:
-            action = trade_manager.manage_golden_trade_advanced(
-                current_price, entry, side, 
-                tp_levels, close_fractions, ctx
+        try:
+            close_side = "sell" if side == "long" else "buy"
+            order = self.exchange.create_order(
+                symbol=self.symbol,
+                type='market',
+                side=close_side,
+                amount=qty,
+                params={"positionSide": "LONG" if side == "long" else "SHORT", "reduceOnly": True}
             )
             
-            if action["action"] == "close":
-                log_g(f"🏆 {action['reason']} - Profit: {action['profit_pct']:.2f}%")
-                close_market_strict(action["reason"])
-                return
-            elif action["action"] == "partial":
-                log_g(f"🎯 {action['reason']} - Closing {action['close_pct']*100:.0f}% at {action['profit_pct']:.2f}% profit")
-                close_market_strict(action["reason"])
-                return
-    
-    # ====================
-    # 2. إدارة الصفقات السكالب المحترفة
-    # ====================
-    if STATE.get("mode") == "scalp":
-        zone_strength = STATE.get("zone_strength", 0.5)
-        action = trade_manager.manage_scalp_trade_professional(
-            current_price, entry, side, ctx, zone_strength
-        )
-        
-        if action["action"] == "close":
-            log_g(f"🎯 {action['reason']}")
-            close_market_strict(action["reason"])
-            return
-        elif action["action"] == "partial":
-            log_g(f"✅ {action['reason']}")
-            close_market_strict(action["reason"])
-            return
-    
-    # ====================
-    # 3. مجلس الإدارة الذكي المحسّن مع فود برنت
-    # ====================
-    trade_data = {
-        "entry": entry,
-        "current_price": current_price,
-        "side": "long" if side == "long" else "short",
-        "sl_price": STATE.get("sl_price"),
-        "entry_context": STATE.get("entry_context", {}),
-        "current_candles": df
-    }
-    
-    council_decision = trade_manager.smart_council.evaluate_trade(
-        trade_data, ctx, food_print
-    )
-    
-    if council_decision["action"] == "close" and council_decision["confidence"] > 0.75:
-        log_w(f"🏛️ SMART COUNCIL DECISION: {council_decision['reason']}")
-        close_market_strict(f"COUNCIL: {council_decision['reason']}")
-        return
-    elif council_decision["action"] == "take_profit" and profit_pct > 0.5:
-        log_g(f"🏛️ SMART COUNCIL: Taking profit at {profit_pct:.2f}%")
-        close_market_strict(f"COUNCIL_TAKE_PROFIT: {profit_pct:.2f}%")
-        return
-    
-    # ====================
-    # 4. كشف المناطق الخطرة والخروج الفوري
-    # ====================
-    if trade_manager.danger_zone_detected:
-        log_d("⚠️ DANGER ZONE DETECTED - Emergency exit!")
-        close_market_strict("DANGER_ZONE_EMERGENCY")
-        return
-    
-    # ====================
-    # 5. حماية الربح بعد الوصول للذروة
-    # ====================
-    if STATE["max_profit_pct"] > 1.0 and profit_pct < STATE["max_profit_pct"] * 0.6:
-        log_w(f"📉 Profit retracement: {profit_pct:.2f}% from {STATE['max_profit_pct']:.2f}% max")
-        close_market_strict("PROFIT_PROTECTION")
-        return
-    
-    # ====================
-    # 6. ترقية السكالب لترند
-    # ====================
-    if STATE.get("mode") == "scalp" and not STATE.get("trade_manager", {}).get("promoted", False):
-        if should_promote_scalp_to_trend(entry, current_price, side, ctx):
-            log_g("🚀 PROMOTING SCALP TO TREND - Switching to trail mode")
-            STATE["mode"] = "trend"
-            STATE["trade_manager"]["promoted"] = True
-            STATE["tp_price"] = None  # إلغاء TP الثابت
-    
-    # ====================
-    # 7. إدارة SL الديناميكي
-    # ====================
-    initial_sl = STATE.get("sl_price")
-    if initial_sl:
-        sl_hit = (current_price <= initial_sl) if side == "long" else (current_price >= initial_sl)
-        if sl_hit:
-            log_w(f"🛑 SL HIT: {current_price:.6f} vs SL {initial_sl:.6f}")
-            close_market_strict("SL_HIT")
-            return
-    
-    # ====================
-    # 8. إدارة TP للسكالب مع مراعاة قوة المنطقة
-    # ====================
-    if STATE.get("mode") == "scalp":
-        zone_strength = STATE.get("zone_strength", 0.5)
-        should_take_profit, close_pct = should_take_scalp_profit(entry, current_price, side, ctx, zone_strength)
-        
-        if should_take_profit:
-            if close_pct >= 1.0:
-                log_g(f"🎯 TP HIT (ZoneStr:{zone_strength:.2f}): {current_price:.6f}")
-                close_market_strict("TP_HIT")
-                return
-            elif close_pct > 0:
-                log_g(f"🎯 PARTIAL TP ({close_pct*100:.0f}%) HIT (ZoneStr:{zone_strength:.2f})")
-                close_market_strict("PARTIAL_TP_HIT")
-                return
-    
-    # ====================
-    # 9. Trailing Stop للترند
-    # ====================
-    if STATE.get("mode") == "trend":
-        atr = ctx.atr
-        trail_distance = atr * ATR_TRAIL_MULT
-        
-        if not STATE.get("trail_price"):
-            STATE["trail_price"] = entry - trail_distance if side == "long" else entry + trail_distance
-        else:
-            if side == "long":
-                new_trail = current_price - trail_distance
-                if new_trail > STATE["trail_price"]:
-                    STATE["trail_price"] = new_trail
-            else:
-                new_trail = current_price + trail_distance
-                if new_trail < STATE["trail_price"]:
-                    STATE["trail_price"] = new_trail
-        
-        # التحقق من كسر الترailing
-        trail_hit = (current_price <= STATE["trail_price"]) if side == "long" else (current_price >= STATE["trail_price"])
-        if trail_hit:
-            log_w(f"🔄 TRAIL STOP: {current_price:.6f} vs Trail {STATE['trail_price']:.6f}")
-            close_market_strict("TRAIL_STOP")
-            return
-    
-    # ====================
-    # 10. Early Fail Protection
-    # ====================
-    if STATE["bars_in_trade"] <= EARLY_FAIL_BARS and profit_pct <= EARLY_FAIL_PNL_PCT:
-        log_w(f"🧨 EARLY FAIL: PnL {profit_pct:.2f}% <= {EARLY_FAIL_PNL_PCT}%")
-        close_market_strict("EARLY_FAIL")
-        return
-    
-    # ====================
-    # 11. Time Stop Protection
-    # ====================
-    if STATE["bars_in_trade"] >= TIME_STOP_BARS and profit_pct < TIME_STOP_MIN_PNL_PCT:
-        log_w(f"⏱️ TIME STOP: Bars {STATE['bars_in_trade']}, PnL {profit_pct:.2f}%")
-        close_market_strict("TIME_STOP")
-        return
-    
-    # ====================
-    # 12. Breakeven Protection
-    # ====================
-    if not STATE.get("breakeven_armed") and profit_pct >= BREAKEVEN_AFTER:
-        STATE["breakeven_armed"] = True
-        STATE["breakeven_price"] = entry
-        log_i("🛡️ BREAKEVEN ARMED")
-    
-    if STATE.get("breakeven_armed"):
-        be_hit = (current_price <= STATE["breakeven_price"]) if side == "long" else (current_price >= STATE["breakeven_price"])
-        if be_hit:
-            log_w(f"⚖️ BREAKEVEN HIT: {current_price:.6f}")
-            close_market_strict("BREAKEVEN")
-            return
-    
-    save_state(STATE)
-
-# =================== TIME TO CANDLE CLOSE ===================
-def time_to_candle_close(df: pd.DataFrame) -> int:
-    """حساب الوقت المتبقي حتى إغلاق الشمعة"""
-    if df.empty:
-        return BASE_SLEEP
-    
-    tf_map = {
-        "1m": 60,
-        "5m": 300,
-        "15m": 900,
-        "1h": 3600,
-        "4h": 14400
-    }
-    
-    tf = tf_map.get(INTERVAL, 900)  # افتراضي 15 دقيقة
-    cur_start_ms = int(df["time"].iloc[-1])
-    now_ms = int(time.time()*1000)
-    next_close_ms = cur_start_ms + tf*1000
-    
-    while next_close_ms <= now_ms:
-        next_close_ms += tf*1000
-    
-    left = max(0, next_close_ms - now_ms)
-    return int(left/1000)
-
-# =================== MAIN TRADING LOOP ===================
-def trade_loop_professional():
-    """الحلقة الرئيسية المحترفة مع جميع التحسينات"""
-    loop_i = 0
-    
-    while True:
-        try:
-            # جمع البيانات
-            bal = balance_usdt()
-            px = price_now()
-            df = fetch_ohlcv()
-            
-            if px is None or df.empty:
-                time.sleep(BASE_SLEEP)
-                continue
-            
-            # إدارة الصفقة المفتوحة بالمحسنة
-            if STATE.get("open"):
-                manage_open_position_professional(df, px)
-            
-            # اتخاذ قرار جديد فقط إذا لم تكن هناك صفقة مفتوحة
-            if not STATE.get("open"):
-                # التحقق من السبريد
-                spread_bps = orderbook_spread_bps()
-                if spread_bps and spread_bps > MAX_SPREAD_BPS:
-                    log_w(f"Spread too high: {spread_bps:.1f}bps > {MAX_SPREAD_BPS}bps")
-                    time.sleep(BASE_SLEEP)
-                    continue
-                
-                # اتخاذ القرار بواسطة Scenario Engine المحسن
-                decision = scenario_decide_professional(df)
-                
-                # طباعة تقرير مفصل
-                log_banner("PROFESSIONAL SCENARIO ANALYSIS")
-                log_i(f"📊 MARKET PHASE: {decision.meta.get('ctx', {}).get('phase', 'UNKNOWN')}")
-                log_i(f"🧭 MARKET BIAS: {decision.meta.get('ctx', {}).get('bias', 'neutral')}")
-                log_i(f"💪 MARKET STRENGTH: {decision.meta.get('ctx', {}).get('market_strength', 0):.2f}")
-                log_i(f"📈 ADX: {decision.meta.get('ctx', {}).get('adx', 0):.1f}")
-                log_i(f"📉 RSI: {decision.meta.get('ctx', {}).get('rsi', 0):.1f}")
-                log_i(f"💰 VOLUME Z: {decision.meta.get('ctx', {}).get('vol_z', 0):.2f}")
-                log_i(f"🏆 ZONE STRENGTH: {decision.zone_strength:.2f}")
-                
-                if decision.action in [Action.BUY, Action.SELL]:
-                    log_g(f"🎯 SIGNAL: {decision.action.value} | MODE: {decision.mode.value}")
-                    log_g(f"📝 REASON: {decision.reason}")
-                    log_g(f"💪 CONFIDENCE: {decision.confidence:.2f}")
-                    
-                    if decision.is_golden_trade:
-                        log_g("🏆 GOLDEN TRADE DETECTED - High probability setup!")
-                        log_g(f"🎯 TP Levels: {decision.meta.get('golden_tp_levels', [])}")
-                    
-                    # تنفيذ الصفقة
-                    open_market_enhanced(decision, bal, px)
-                else:
-                    if decision.action == Action.HOLD:
-                        log_i(f"⏳ HOLDING: {decision.reason}")
-                    else:
-                        log_i(f"🚫 NO TRADE: {decision.reason}")
-            
-            # النوم قبل الدورة التالية
-            loop_i += 1
-            sleep_s = NEAR_CLOSE_S if time_to_candle_close(df) <= 10 else BASE_SLEEP
-            time.sleep(sleep_s)
+            logger.success(f"Position closed: {side} {qty:.4f}")
+            return True
             
         except Exception as e:
-            log_e(f"loop error: {e}\n{traceback.format_exc()}")
-            time.sleep(BASE_SLEEP)
+            logger.error(f"Failed to close position: {e}")
+            return False
+
+# =================== MAIN BOT ENGINE ===================
+class UltimateDogeProBot:
+    """المحرك الرئيسي للبوت"""
+    
+    def __init__(self):
+        self.exchange = BingXExchange()
+        self.signal_generator = UltimateSignalGenerator()
+        self.trade_manager = ProfessionalTradeManager()
+        self.ohlcv_data = None
+        self.last_update = 0
+        self.update_interval = 15  # ثانية
+        self.is_running = True
+        
+        # الإحصائيات
+        self.total_trades = 0
+        self.winning_trades = 0
+        self.losing_trades = 0
+        self.total_profit = 0.0
+        
+        logger.banner("ULTIMATE DOGE PRO BOT INITIALIZED")
+    
+    def fetch_ohlcv(self) -> pd.DataFrame:
+        """جلب بيانات OHLCV"""
+        try:
+            ohlcv = self.exchange.exchange.fetch_ohlcv(
+                SYMBOL, 
+                timeframe=INTERVAL, 
+                limit=200
+            )
+            df = pd.DataFrame(
+                ohlcv, 
+                columns=['timestamp', 'open', 'high', 'low', 'close', 'volume']
+            )
+            df['time'] = df['timestamp']
+            return df
+        except Exception as e:
+            logger.error(f"Failed to fetch OHLCV: {e}")
+            return None
+    
+    def calculate_position_size(self, balance: float, entry_price: float) -> float:
+        """حجم المركز"""
+        risk_amount = balance * RISK_ALLOC * LEVERAGE
+        raw_qty = risk_amount / entry_price
+        
+        # تقريب حسب دقة السوق
+        precision = self.exchange.precision
+        if precision > 0:
+            qty = round(raw_qty, precision)
+        else:
+            qty = int(raw_qty)
+        
+        # التحقق من الحد الأدنى
+        if qty < self.exchange.min_qty:
+            return 0.0
+        
+        return qty
+    
+    def run_cycle(self):
+        """دورة التداول الرئيسية"""
+        try:
+            # 1. تحديث البيانات
+            current_time = time.time()
+            if current_time - self.last_update >= self.update_interval:
+                self.ohlcv_data = self.fetch_ohlcv()
+                self.last_update = current_time
+            
+            if self.ohlcv_data is None or len(self.ohlcv_data) < 50:
+                time.sleep(5)
+                return
+            
+            # 2. التحقق من السبريد
+            spread = self.exchange.get_orderbook_spread()
+            if spread > MAX_SPREAD_BPS:
+                logger.warning(f"Spread too high: {spread:.1f} bps")
+                time.sleep(10)
+                return
+            
+            # 3. إذا كانت هناك صفقة مفتوحة، إدارتها
+            if self.trade_manager.current_trade:
+                current_price = self.exchange.get_current_price()
+                if current_price > 0:
+                    close_reason = self.trade_manager.manage_trade(
+                        current_price, 
+                        self.signal_generator.analyze_market(self.ohlcv_data)
+                    )
+                    
+                    if close_reason:
+                        # إغلاق الصفقة في البورصة
+                        signal = self.trade_manager.current_trade['signal']
+                        qty = self.trade_manager.current_trade['qty']
+                        side = "long" if signal.action == "BUY" else "short"
+                        self.exchange.close_position(side, qty)
+                        
+                        # تحديث الإحصائيات
+                        self.total_trades += 1
+                        last_trade = self.trade_manager.trade_history[-1]
+                        if last_trade['pnl_pct'] > 0:
+                            self.winning_trades += 1
+                        else:
+                            self.losing_trades += 1
+                        self.total_profit += last_trade['pnl']
+            
+            # 4. إذا لم تكن هناك صفقة مفتوحة، البحث عن إشارات
+            elif self.trade_manager.should_trade():
+                # تحليل السوق
+                ctx = self.signal_generator.analyze_market(self.ohlcv_data)
+                
+                # توليد الإشارات
+                signals = self.signal_generator.generate_signals(self.ohlcv_data)
+                
+                # اختيار أفضل إشارة
+                if signals:
+                    # فرز حسب الثقة وقوة المنطقة
+                    signals.sort(key=lambda x: (x.confidence * 0.6 + x.zone_strength/10 * 0.4), reverse=True)
+                    best_signal = signals[0]
+                    
+                    # عرض الإشارة
+                    logger.banner("NEW TRADE SIGNAL DETECTED")
+                    logger.golden(f"🏆 {best_signal.trade_type.value}")
+                    logger.signal(f"Action: {best_signal.action}")
+                    logger.signal(f"Entry: {best_signal.entry_price:.6f}")
+                    logger.signal(f"Confidence: {best_signal.confidence:.2f}")
+                    logger.signal(f"Zone Strength: {best_signal.zone_strength:.1f}/10")
+                    logger.signal(f"R:R Ratio: {best_signal.risk_reward:.2f}")
+                    
+                    for i, reason in enumerate(best_signal.reasons[:5]):
+                        logger.info(f"{i+1}. {reason}")
+                    
+                    # الحصول على الرصيد وحساب الحجم
+                    balance = self.exchange.get_balance()
+                    qty = self.calculate_position_size(balance, best_signal.entry_price)
+                    
+                    if qty > 0:
+                        # تنفيذ الصفقة
+                        if self.exchange.execute_order(
+                            "buy" if best_signal.action == "BUY" else "sell",
+                            qty
+                        ):
+                            self.trade_manager.open_trade(best_signal, qty, best_signal.entry_price)
+            
+            # 5. عرض الإحصائيات كل 10 دورات
+            if self.total_trades > 0 and self.total_trades % 10 == 0:
+                self.show_statistics()
+            
+            # 6. النوم قبل الدورة التالية
+            sleep_time = 5 if self.trade_manager.current_trade else 10
+            time.sleep(sleep_time)
+            
+        except Exception as e:
+            logger.error(f"Error in run cycle: {e}")
+            traceback.print_exc()
+            time.sleep(30)
+    
+    def show_statistics(self):
+        """عرض الإحصائيات"""
+        logger.banner("TRADING STATISTICS")
+        
+        win_rate = (self.winning_trades / self.total_trades * 100) if self.total_trades > 0 else 0
+        avg_win = 0
+        avg_loss = 0
+        
+        if self.trade_manager.trade_history:
+            wins = [t['pnl_pct'] for t in self.trade_manager.trade_history if t['pnl_pct'] > 0]
+            losses = [t['pnl_pct'] for t in self.trade_manager.trade_history if t['pnl_pct'] < 0]
+            
+            avg_win = np.mean(wins) if wins else 0
+            avg_loss = np.mean(losses) if losses else 0
+        
+        logger.info(f"Total Trades: {self.total_trades}")
+        logger.info(f"Winning Trades: {self.winning_trades} ({win_rate:.1f}%)")
+        logger.info(f"Losing Trades: {self.losing_trades}")
+        logger.info(f"Total Profit: {self.total_profit:.2f} USDT")
+        logger.info(f"Avg Win: {avg_win:+.2f}%")
+        logger.info(f"Avg Loss: {avg_loss:+.2f}%")
+        logger.info(f"Consecutive Wins: {self.trade_manager.consecutive_wins}")
+        logger.info(f"Consecutive Losses: {self.trade_manager.consecutive_losses}")
+        logger.info(f"Max Drawdown: {self.trade_manager.max_drawdown:.2f}%")
+    
+    def run(self):
+        """تشغيل البوت"""
+        logger.success("🚀 Starting Ultimate Doge Pro Bot...")
+        
+        while self.is_running:
+            try:
+                self.run_cycle()
+            except KeyboardInterrupt:
+                logger.warning("Bot stopped by user")
+                self.is_running = False
+            except Exception as e:
+                logger.error(f"Unexpected error: {e}")
+                traceback.print_exc()
+                time.sleep(60)
 
 # =================== FLASK API ===================
 app = Flask(__name__)
+bot = UltimateDogeProBot()
 
-@app.route("/")
+@app.route('/')
 def home():
-    mode = 'LIVE' if MODE_LIVE else 'PAPER'
-    return f"✅ Professional Scenario Engine Bot v8.0 — {SYMBOL} {INTERVAL} — {mode}"
+    return '''
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>Ultimate Doge Pro Bot</title>
+        <style>
+            body { font-family: Arial, sans-serif; margin: 40px; }
+            .container { max-width: 800px; margin: 0 auto; }
+            .status { padding: 20px; border-radius: 10px; margin: 20px 0; }
+            .running { background: #d4edda; color: #155724; }
+            .stopped { background: #f8d7da; color: #721c24; }
+            .stat { margin: 10px 0; padding: 10px; background: #f8f9fa; border-radius: 5px; }
+        </style>
+    </head>
+    <body>
+        <div class="container">
+            <h1>🚀 Ultimate Doge Pro Bot v10.0</h1>
+            <div class="status running">
+                <h2>✅ Bot is Running</h2>
+                <p><strong>Symbol:</strong> ''' + SYMBOL + '''</p>
+                <p><strong>Interval:</strong> ''' + INTERVAL + '''</p>
+                <p><strong>Mode:</strong> ''' + ("LIVE" if MODE_LIVE else "PAPER") + '''</p>
+            </div>
+            <h2>Quick Links</h2>
+            <ul>
+                <li><a href="/metrics">📊 Trading Metrics</a></li>
+                <li><a href="/health">❤️ Health Check</a></li>
+                <li><a href="/statistics">📈 Statistics</a></li>
+                <li><a href="/signals">🎯 Recent Signals</a></li>
+            </ul>
+        </div>
+    </body>
+    </html>
+    '''
 
-@app.route("/metrics")
+@app.route('/metrics')
 def metrics():
-    return jsonify({
-        "symbol": SYMBOL,
-        "interval": INTERVAL,
-        "mode": "live" if MODE_LIVE else "paper",
-        "leverage": LEVERAGE,
-        "risk_alloc": RISK_ALLOC,
-        "price": price_now(),
-        "state": STATE,
-        "compound_pnl": compound_pnl,
-        "engine": "PROFESSIONAL_SCENARIO_ENGINE_v8",
-        "trade_manager": trade_manager.__dict__ if hasattr(trade_manager, '__dict__') else {},
-        "council": trade_manager.smart_council.__dict__ if hasattr(trade_manager, 'smart_council') else {}
-    })
+    return {
+        'bot': BOT_VERSION,
+        'symbol': SYMBOL,
+        'interval': INTERVAL,
+        'mode': 'LIVE' if MODE_LIVE else 'PAPER',
+        'leverage': LEVERAGE,
+        'risk_allocation': RISK_ALLOC,
+        'status': 'running',
+        'timestamp': datetime.utcnow().isoformat()
+    }
 
-@app.route("/health")
+@app.route('/health')
 def health():
-    return jsonify({
-        "ok": True,
-        "mode": "live" if MODE_LIVE else "paper",
-        "open": STATE["open"],
-        "side": STATE["side"],
-        "qty": STATE["qty"],
-        "compound_pnl": compound_pnl,
-        "timestamp": datetime.utcnow().isoformat(),
-        "engine": "PROFESSIONAL_SCENARIO_ENGINE"
-    }), 200
+    try:
+        price = bot.exchange.get_current_price()
+        balance = bot.exchange.get_balance()
+        
+        return {
+            'status': 'healthy',
+            'price': price,
+            'balance': balance,
+            'current_trade': bot.trade_manager.current_trade is not None,
+            'exchange_connected': price > 0
+        }
+    except Exception as e:
+        return {'status': 'error', 'message': str(e)}, 500
+
+@app.route('/statistics')
+def statistics():
+    stats = {
+        'total_trades': bot.total_trades,
+        'winning_trades': bot.winning_trades,
+        'losing_trades': bot.losing_trades,
+        'total_profit': bot.total_profit,
+        'win_rate': (bot.winning_trades / bot.total_trades * 100) if bot.total_trades > 0 else 0,
+        'current_trade': bot.trade_manager.current_trade,
+        'consecutive_wins': bot.trade_manager.consecutive_wins,
+        'consecutive_losses': bot.trade_manager.consecutive_losses,
+        'total_pnl': bot.trade_manager.total_pnl,
+        'max_drawdown': bot.trade_manager.max_drawdown
+    }
+    return stats
+
+@app.route('/signals')
+def signals():
+    if bot.signal_generator.last_signals:
+        signals = []
+        for signal in list(bot.signal_generator.last_signals)[-5:]:
+            signals.append({
+                'action': signal.action,
+                'type': signal.trade_type.value,
+                'entry': signal.entry_price,
+                'confidence': signal.confidence,
+                'zone_strength': signal.zone_strength,
+                'timestamp': signal.timestamp,
+                'reasons': signal.reasons[:3]
+            })
+        return {'signals': signals}
+    return {'signals': []}
 
 # =================== MAIN EXECUTION ===================
 if __name__ == "__main__":
-    log_banner("PROFESSIONAL SCENARIO ENGINE BOT v8.0")
-    
-    # تحميل الحالة السابقة
-    state = load_state() or {}
-    state.setdefault("in_position", False)
-    
-    if RESUME_ON_RESTART:
-        try:
-            # هنا يمكن إضافة منطق استئناف الصفقات
-            pass
-        except Exception as e:
-            log_w(f"resume error: {e}")
-    
-    # عرض إعدادات البوت
-    print(colored(f"🔥 MODE: {'LIVE' if MODE_LIVE else 'PAPER'} • {SYMBOL} • {INTERVAL}", "yellow"))
-    print(colored(f"💰 RISK: {int(RISK_ALLOC*100)}% × {LEVERAGE}x", "yellow"))
-    print(colored(f"🧠 ENGINE: Professional Scenario Engine v8.0", "yellow"))
-    print(colored(f"🏛️ SMART COUNCIL: 5-Member with Footprint Analyst", "yellow"))
-    print(colored(f"🏆 GOLDEN TRADES: 3-Level TP ({GOLDEN_TP_LEVELS}%)", "yellow"))
-    print(colored(f"🗺️ FOOD PRINT: Advanced V2 Detection", "yellow"))
-    print(colored(f"⚠️ DANGER ZONE: Advanced Detection System", "yellow"))
-    print(colored(f"⚡ SCALP MANAGEMENT: Professional Zone-Based TP", "yellow"))
-    print(colored(f"🛡️ PROTECTION: Danger Zone + Profit Protection + Smart Council", "yellow"))
-    print(colored(f"🚀 EXECUTION: {'ACTIVE' if EXECUTE_ORDERS and not DRY_RUN else 'SIMULATION'}", "yellow"))
-    
-    # بدء الخيوط
     import threading
-    threading.Thread(target=trade_loop_professional, daemon=True).start()
     
-    # تشغيل الخادم
+    # بدء البوت في thread منفصل
+    bot_thread = threading.Thread(target=bot.run, daemon=True)
+    bot_thread.start()
+    
+    logger.success(f"🤖 Bot started in separate thread")
+    logger.info(f"🌐 Web interface available at http://localhost:{PORT}")
+    logger.info(f"📊 Metrics at http://localhost:{PORT}/metrics")
+    
+    # تشغيل Flask
     app.run(host="0.0.0.0", port=PORT, debug=False, use_reloader=False)
