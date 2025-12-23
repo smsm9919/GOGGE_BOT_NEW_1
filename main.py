@@ -50,12 +50,194 @@ LOG_DETAILED = True
 STATE_PATH = "./bot_state.json"
 BOT_VERSION = "ULTIMATE DOGE PRO TRADER v10.0 — Supreme Edition"
 
-print(f"\n{'='*60}")
-print(colored(f"🚀 {BOT_VERSION}", "cyan", attrs=["bold"]))
-print(colored(f"📊 SYMBOL: {SYMBOL} | INTERVAL: {INTERVAL}", "yellow"))
-print(colored(f"⚡ LEVERAGE: {LEVERAGE}x | RISK: {RISK_ALLOC*100}%", "yellow"))
-print(colored(f"🔐 MODE: {'LIVE' if MODE_LIVE else 'PAPER'}", "green" if MODE_LIVE else "red"))
-print(f"{'='*60}\n")
+# =================== PROFESSIONAL LOGGING SYSTEM ===================
+class AdvancedLogger:
+    """نظام تسجيل متقدم مع أيقونات ملونة وعرض الرصيد"""
+    
+    def __init__(self):
+        self.last_balance = 0.0
+        self.balance_update_time = 0
+        self.cycle_count = 0
+        self.session_pnl = 0.0
+        self.session_start_balance = 0.0
+        self.session_start_time = time.time()
+        
+    def print_header(self):
+        """طباعة عنوان البوت"""
+        print(f"\n{colored('═'*70, 'cyan', attrs=['bold'])}")
+        print(colored(f"    🚀 {BOT_VERSION}", 'cyan', attrs=['bold', 'blink']))
+        print(colored(f"    📊 {SYMBOL} | ⏰ {INTERVAL} | ⚡ {LEVERAGE}x", 'yellow'))
+        print(colored(f"    🔐 MODE: {'LIVE 🟢' if MODE_LIVE else 'PAPER 🔴'}", 'green' if MODE_LIVE else 'red'))
+        print(colored('═'*70, 'cyan', attrs=['bold']), "\n")
+    
+    def info(self, msg, show_balance=False):
+        """معلومات عامة"""
+        if show_balance and time.time() - self.balance_update_time > 30:
+            self._show_balance()
+        print(f"{colored('ℹ️', 'blue')}  {msg}", flush=True)
+    
+    def success(self, msg, show_balance=False):
+        """نجاح"""
+        if show_balance and time.time() - self.balance_update_time > 30:
+            self._show_balance()
+        print(f"{colored('✅', 'green')}  {msg}", flush=True)
+    
+    def warning(self, msg):
+        """تحذير"""
+        print(f"{colored('⚠️', 'yellow')}  {msg}", flush=True)
+    
+    def error(self, msg):
+        """خطأ"""
+        print(f"{colored('❌', 'red', attrs=['bold'])}  {msg}", flush=True)
+    
+    def signal(self, msg):
+        """إشارة تداول"""
+        print(f"{colored('🎯', 'magenta', attrs=['bold'])}  {msg}", flush=True)
+    
+    def trade(self, msg, pnl=0.0):
+        """تنفيذ صفقة"""
+        if pnl > 0:
+            print(f"{colored('💰', 'green', attrs=['bold'])}  {msg}", flush=True)
+        elif pnl < 0:
+            print(f"{colored('💸', 'red', attrs=['bold'])}  {msg}", flush=True)
+        else:
+            print(f"{colored('💰', 'cyan')}  {msg}", flush=True)
+    
+    def golden(self, msg):
+        """صفقة ذهبية"""
+        print(f"{colored('🏆', 'yellow', attrs=['bold', 'blink'])}  {msg}", flush=True)
+    
+    def danger(self, msg):
+        """تحذير خطر"""
+        print(f"{colored('🔥', 'red', attrs=['bold', 'blink'])}  {msg}", flush=True)
+    
+    def council(self, msg):
+        """قرار مجلس الإدارة"""
+        print(f"{colored('🏛️', 'cyan', attrs=['bold'])}  {msg}", flush=True)
+    
+    def balance_display(self, balance: float, pnl: float = 0.0, equity: float = None):
+        """عرض الرصيد بشكل احترافي"""
+        self.last_balance = balance
+        self.balance_update_time = time.time()
+        self.cycle_count += 1
+        
+        # حساب PnL الجلسة
+        if self.session_start_balance == 0:
+            self.session_start_balance = balance
+        
+        session_pnl_pct = ((balance - self.session_start_balance) / self.session_start_balance * 100) if self.session_start_balance > 0 else 0
+        
+        print(f"\n{colored('─'*60, 'blue')}")
+        print(f"{colored('💰', 'yellow', attrs=['bold'])}  {colored('PORTFOLIO STATUS', 'cyan', attrs=['bold'])}")
+        print(f"{colored('├', 'blue')}  Balance: {colored(f'{balance:.2f}', 'green', attrs=['bold'])} USDT")
+        
+        if equity:
+            print(f"{colored('├', 'blue')}  Equity: {colored(f'{equity:.2f}', 'cyan')} USDT")
+        
+        if pnl != 0:
+            pnl_color = 'green' if pnl > 0 else 'red'
+            print(f"{colored('├', 'blue')}  PnL: {colored(f'{pnl:+.2f}', pnl_color)} USDT ({colored(f'{pnl/balance*100:+.2f}%', pnl_color)})")
+        
+        print(f"{colored('├', 'blue')}  Session PnL: {colored(f'{session_pnl_pct:+.2f}%', 'green' if session_pnl_pct > 0 else 'red')}")
+        
+        # تقدير الربح اليومي
+        hours_running = (time.time() - self.session_start_time) / 3600
+        if hours_running > 0:
+            daily_rate = (session_pnl_pct / hours_running) * 24
+            print(f"{colored('├', 'blue')}  Daily Rate: {colored(f'{daily_rate:+.2f}%', 'green' if daily_rate > 0 else 'red')}")
+        
+        print(f"{colored('├', 'blue')}  Cycle: {self.cycle_count}")
+        print(f"{colored('└', 'blue')}  Time: {datetime.now().strftime('%H:%M:%S')}")
+        print(f"{colored('─'*60, 'blue')}\n")
+    
+    def market_status(self, price: float, volume: float, spread: float):
+        """حالة السوق"""
+        print(f"{colored('📈', 'blue')}  {colored('MARKET STATUS', 'cyan')}")
+        print(f"{colored('├', 'blue')}  Price: {colored(f'{price:.6f}', 'yellow')}")
+        print(f"{colored('├', 'blue')}  24h Volume: {colored(f'{volume:.0f}', 'cyan')}")
+        print(f"{colored('├', 'blue')}  Spread: {colored(f'{spread:.2f}', 'green' if spread < 5 else 'red')} bps")
+        print(f"{colored('└', 'blue')}  Time: {datetime.now().strftime('%H:%M:%S')}\n")
+    
+    def banner(self, text):
+        """بانر للملاحظات المهمة"""
+        print(f"\n{colored('╔' + '═'*(len(text)+4) + '╗', 'cyan')}")
+        print(f"{colored('║', 'cyan')}  {colored(text, 'cyan', attrs=['bold'])}  {colored('║', 'cyan')}")
+        print(f"{colored('╚' + '═'*(len(text)+4) + '╝', 'cyan')}\n")
+    
+    def trade_decision(self, action: str, reason: str, confidence: float, zone_strength: float):
+        """قرار التداول"""
+        action_color = 'green' if action == 'BUY' else 'red'
+        print(f"\n{colored('╔' + '═'*68 + '╗', 'cyan')}")
+        print(f"{colored('║', 'cyan')}  {colored('🎯 TRADE DECISION', 'magenta', attrs=['bold'])}")
+        print(f"{colored('║', 'cyan')}  Action: {colored(action, action_color, attrs=['bold'])}")
+        print(f"{colored('║', 'cyan')}  Reason: {reason}")
+        print(f"{colored('║', 'cyan')}  Confidence: {colored(f'{confidence:.2f}/1.00', 'cyan' if confidence > 0.7 else 'yellow')}")
+        print(f"{colored('║', 'cyan')}  Zone Strength: {colored(f'{zone_strength:.1f}/10.0', 'green' if zone_strength > 7 else 'yellow')}")
+        print(f"{colored('╚' + '═'*68 + '╝', 'cyan')}\n")
+    
+    def trade_execution(self, side: str, qty: float, price: float, tp_levels: list, sl: float):
+        """تنفيذ الصفقة"""
+        side_color = 'green' if side == 'BUY' else 'red'
+        print(f"\n{colored('╔' + '═'*68 + '╗', 'green' if side == 'BUY' else 'red')}")
+        print(f"{colored('║', 'green' if side == 'BUY' else 'red')}  {colored('💰 TRADE EXECUTED', side_color, attrs=['bold'])}")
+        print(f"{colored('║', 'green' if side == 'BUY' else 'red')}  Side: {colored(side, side_color, attrs=['bold'])}")
+        print(f"{colored('║', 'green' if side == 'BUY' else 'red')}  Quantity: {colored(f'{qty:.4f}', 'yellow')}")
+        print(f"{colored('║', 'green' if side == 'BUY' else 'red')}  Entry Price: {colored(f'{price:.6f}', 'cyan')}")
+        print(f"{colored('║', 'green' if side == 'BUY' else 'red')}  Stop Loss: {colored(f'{sl:.6f}', 'red')}")
+        
+        for i, tp in enumerate(tp_levels):
+            tp_color = 'green' if i == 0 else 'yellow' if i == 1 else 'cyan'
+            print(f"{colored('║', 'green' if side == 'BUY' else 'red')}  TP{i+1}: {colored(f'{tp:.6f}', tp_color)}")
+        
+        print(f"{colored('║', 'green' if side == 'BUY' else 'red')}  Time: {datetime.now().strftime('%H:%M:%S')}")
+        print(f"{colored('╚' + '═'*68 + '╝', 'green' if side == 'BUY' else 'red')}\n")
+    
+    def trade_closed(self, side: str, exit_price: float, pnl: float, pnl_pct: float, reason: str):
+        """إغلاق الصفقة"""
+        pnl_color = 'green' if pnl > 0 else 'red'
+        print(f"\n{colored('╔' + '═'*68 + '╗', pnl_color)}")
+        print(f"{colored('║', pnl_color)}  {colored('📊 TRADE CLOSED', pnl_color, attrs=['bold'])}")
+        print(f"{colored('║', pnl_color)}  Side: {colored(side, 'green' if side == 'long' else 'red')}")
+        print(f"{colored('║', pnl_color)}  Exit Price: {colored(f'{exit_price:.6f}', 'cyan')}")
+        print(f"{colored('║', pnl_color)}  PnL: {colored(f'{pnl:+.2f}', pnl_color)} USDT")
+        print(f"{colored('║', pnl_color)}  PnL %: {colored(f'{pnl_pct:+.2f}%', pnl_color)}")
+        print(f"{colored('║', pnl_color)}  Reason: {reason}")
+        print(f"{colored('║', pnl_color)}  Time: {datetime.now().strftime('%H:%M:%S')}")
+        print(f"{colored('╚' + '═'*68 + '╝', pnl_color)}\n")
+    
+    def indicators_status(self, rsi: float, adx: float, macd: float, ma_fast: float, ma_slow: float):
+        """حالة المؤشرات"""
+        print(f"{colored('📊', 'blue')}  {colored('INDICATORS', 'cyan')}")
+        
+        # RSI
+        rsi_color = 'red' if rsi > 70 else 'green' if rsi < 30 else 'yellow'
+        rsi_status = "OVERSOLD 🟢" if rsi < 30 else "OVERBOUGHT 🔴" if rsi > 70 else "NEUTRAL 🟡"
+        print(f"{colored('├', 'blue')}  RSI: {colored(f'{rsi:.1f}', rsi_color)} [{rsi_status}]")
+        
+        # ADX
+        adx_color = 'green' if adx > 25 else 'yellow' if adx > 20 else 'red'
+        adx_status = "STRONG 📈" if adx > 25 else "MODERATE ⚡" if adx > 20 else "WEAK 📉"
+        print(f"{colored('├', 'blue')}  ADX: {colored(f'{adx:.1f}', adx_color)} [{adx_status}]")
+        
+        # MACD
+        macd_color = 'green' if macd > 0 else 'red'
+        macd_status = "BULLISH 🟢" if macd > 0 else "BEARISH 🔴"
+        print(f"{colored('├', 'blue')}  MACD: {colored(f'{macd:.4f}', macd_color)} [{macd_status}]")
+        
+        # Moving Averages
+        ma_status = "BULLISH 📈" if ma_fast > ma_slow else "BEARISH 📉"
+        print(f"{colored('├', 'blue')}  MA Fast/Slow: {colored(f'{ma_fast:.6f}', 'cyan')} / {colored(f'{ma_slow:.6f}', 'yellow')}")
+        print(f"{colored('└', 'blue')}  MA Status: {colored(ma_status, 'green' if ma_fast > ma_slow else 'red')}")
+    
+    def _show_balance(self):
+        """عرض الرصيد الداخلي"""
+        # سيتم استدعاؤها من دالة balance_display
+        pass
+
+logger = AdvancedLogger()
+
+# عرض عنوان البوت
+logger.print_header()
 
 # === Technical Indicators Settings ===
 RSI_LEN = 14
@@ -217,50 +399,6 @@ class TradingContext:
     resistance_zones: List[Dict]
     manipulation_signals: List[str]
     danger_zones: List[str]
-
-# =================== LOGGING SYSTEM ===================
-class ProLogger:
-    """نظام تسجيل محترف"""
-    
-    @staticmethod
-    def info(msg):
-        print(f"{colored('ℹ️', 'blue')} {msg}", flush=True)
-    
-    @staticmethod
-    def success(msg):
-        print(f"{colored('✅', 'green')} {msg}", flush=True)
-    
-    @staticmethod
-    def warning(msg):
-        print(f"{colored('⚠️', 'yellow')} {msg}", flush=True)
-    
-    @staticmethod
-    def error(msg):
-        print(f"{colored('❌', 'red')} {msg}", flush=True)
-    
-    @staticmethod
-    def signal(msg):
-        print(f"{colored('🎯', 'cyan', attrs=['bold'])} {msg}", flush=True)
-    
-    @staticmethod
-    def trade(msg):
-        print(f"{colored('💰', 'magenta', attrs=['bold'])} {msg}", flush=True)
-    
-    @staticmethod
-    def golden(msg):
-        print(f"{colored('🏆', 'yellow', attrs=['bold'])} {msg}", flush=True)
-    
-    @staticmethod
-    def danger(msg):
-        print(f"{colored('🔥', 'red', attrs=['bold'])} {msg}", flush=True)
-    
-    @staticmethod
-    def banner(text):
-        print(f"\n{colored('='*60, 'cyan')}")
-        print(colored(f"   {text}", 'cyan', attrs=['bold']))
-        print(colored('='*60, 'cyan'), "\n")
-
-logger = ProLogger()
 
 # =================== TECHNICAL INDICATORS ===================
 class AdvancedIndicators:
@@ -1723,6 +1861,9 @@ class ProfessionalTradeManager:
         self.total_pnl = 0.0
         self.max_drawdown = 0.0
         self.cooldown_until = 0
+        self.total_trades = 0
+        self.winning_trades = 0
+        self.losing_trades = 0
         
     def open_trade(self, signal: SmartSignal, qty: float, entry_price: float):
         """فتح صفقة جديدة"""
@@ -1740,13 +1881,15 @@ class ProfessionalTradeManager:
         }
         self.entry_time = time.time()
         self.best_price = entry_price
+        self.total_trades += 1
         
-        logger.trade(f"📈 TRADE OPENED: {signal.action} {qty:.4f} @ {entry_price:.6f}")
-        logger.trade(f"   Type: {signal.trade_type.value}")
-        logger.trade(f"   Confidence: {signal.confidence:.2f}")
-        logger.trade(f"   Zone Strength: {signal.zone_strength:.1f}/10")
-        logger.trade(f"   SL: {signal.stop_loss:.6f}")
-        logger.trade(f"   TPs: {', '.join([f'{tp:.6f}' for tp in signal.take_profits])}")
+        logger.trade_execution(
+            side=signal.action,
+            qty=qty,
+            price=entry_price,
+            tp_levels=signal.take_profits,
+            sl=signal.stop_loss
+        )
         
         for reason in signal.reasons[:3]:
             logger.info(f"   📝 {reason}")
@@ -1763,8 +1906,10 @@ class ProfessionalTradeManager:
         # حساب PnL الحالي
         if signal.action == 'BUY':
             pnl_pct = (current_price - entry) / entry * 100
+            pnl_usdt = (current_price - entry) * qty
         else:  # SELL
             pnl_pct = (entry - current_price) / entry * 100
+            pnl_usdt = (entry - current_price) * qty
         
         self.current_trade['current_pnl'] = pnl_pct
         self.current_trade['max_pnl'] = max(self.current_trade['max_pnl'], pnl_pct)
@@ -1779,33 +1924,33 @@ class ProfessionalTradeManager:
         
         # 1. تحقق من Stop Loss
         if self._check_stop_loss(current_price, signal):
-            return self._close_trade("STOP_LOSS", current_price, pnl_pct)
+            return self._close_trade("STOP_LOSS", current_price, pnl_pct, pnl_usdt)
         
         # 2. تحقق من Take Profit Levels
         tp_action = self._check_take_profits(current_price, signal)
         if tp_action:
-            return self._close_trade(tp_action, current_price, pnl_pct)
+            return self._close_trade(tp_action, current_price, pnl_pct, pnl_usdt)
         
         # 3. إدارة Trailing Stop للترند
         if signal.trade_type in [TradeType.TREND_FOLLOW, TradeType.GOLDEN_BREAKOUT]:
             trail_action = self._manage_trailing_stop(current_price, signal, ctx)
             if trail_action:
-                return self._close_trade(trail_action, current_price, pnl_pct)
+                return self._close_trade(trail_action, current_price, pnl_pct, pnl_usdt)
         
         # 4. حماية الربح
         if self.current_trade['max_pnl'] > 0.5 and pnl_pct < self.current_trade['max_pnl'] * 0.5:
-            return self._close_trade("PROFIT_PROTECTION", current_price, pnl_pct)
+            return self._close_trade("PROFIT_PROTECTION", current_price, pnl_pct, pnl_usdt)
         
         # 5. كشف المناطق الخطرة
         if ctx.danger_zones and len(ctx.danger_zones) >= 2:
-            return self._close_trade("DANGER_ZONE", current_price, pnl_pct)
+            return self._close_trade("DANGER_ZONE", current_price, pnl_pct, pnl_usdt)
         
         # 6. Time Stop (حسب نوع الصفقة)
         time_in_trade = time.time() - self.entry_time
         if signal.trade_type == TradeType.SCALP_RETEST and time_in_trade > 1800:  # 30 دقيقة
-            return self._close_trade("TIME_STOP_SCALP", current_price, pnl_pct)
+            return self._close_trade("TIME_STOP_SCALP", current_price, pnl_pct, pnl_usdt)
         elif time_in_trade > 7200:  # ساعتين
-            return self._close_trade("TIME_STOP_MAX", current_price, pnl_pct)
+            return self._close_trade("TIME_STOP_MAX", current_price, pnl_pct, pnl_usdt)
         
         return None
     
@@ -1864,22 +2009,23 @@ class ProfessionalTradeManager:
         
         return None
     
-    def _close_trade(self, reason: str, exit_price: float, pnl_pct: float) -> str:
+    def _close_trade(self, reason: str, exit_price: float, pnl_pct: float, pnl_usdt: float) -> str:
         """إغلاق الصفقة"""
         signal = self.current_trade['signal']
         entry = self.current_trade['entry_price']
         qty = self.current_trade['qty']
+        side = "long" if signal.action == "BUY" else "short"
         
-        # حساب PnL النهائي
-        if signal.action == 'BUY':
-            pnl = (exit_price - entry) * qty
-        else:
-            pnl = (entry - exit_price) * qty
-        
-        self.total_pnl += pnl
+        self.total_pnl += pnl_usdt
         
         # تحديث الإحصائيات
-        if pnl_pct < 0:
+        if pnl_pct > 0:
+            self.winning_trades += 1
+            self.consecutive_wins += 1
+            self.consecutive_losses = 0
+            self.cooldown_until = time.time() + COOLDOWN_AFTER_WIN
+        else:
+            self.losing_trades += 1
             self.consecutive_losses += 1
             self.consecutive_wins = 0
             self.max_drawdown = min(self.max_drawdown, pnl_pct)
@@ -1890,10 +2036,6 @@ class ProfessionalTradeManager:
                 self.cooldown_until = time.time() + COOLDOWN_AFTER_LOSS * 2
             else:
                 self.cooldown_until = time.time() + COOLDOWN_AFTER_LOSS
-        else:
-            self.consecutive_wins += 1
-            self.consecutive_losses = 0
-            self.cooldown_until = time.time() + COOLDOWN_AFTER_WIN
         
         # تسجيل في التاريخ
         trade_record = {
@@ -1903,7 +2045,7 @@ class ProfessionalTradeManager:
             'entry': entry,
             'exit': exit_price,
             'qty': qty,
-            'pnl': pnl,
+            'pnl': pnl_usdt,
             'pnl_pct': pnl_pct,
             'reason': reason,
             'duration': time.time() - self.entry_time,
@@ -1912,11 +2054,13 @@ class ProfessionalTradeManager:
         self.trade_history.append(trade_record)
         
         # تسجيل النتيجة
-        color = "green" if pnl_pct > 0 else "red"
-        logger.trade(colored(f"📊 TRADE CLOSED: {signal.action} @ {exit_price:.6f}", color))
-        logger.trade(colored(f"   PnL: {pnl_pct:+.2f}% | Total: {self.total_pnl:+.2f} USDT", color))
-        logger.trade(f"   Reason: {reason}")
-        logger.trade(f"   Duration: {trade_record['duration']:.0f}s")
+        logger.trade_closed(
+            side=side,
+            exit_price=exit_price,
+            pnl=pnl_usdt,
+            pnl_pct=pnl_pct,
+            reason=reason
+        )
         
         # إعادة تعيين
         self.current_trade = None
@@ -1928,15 +2072,49 @@ class ProfessionalTradeManager:
     def should_trade(self) -> bool:
         """هل يمكن التداول الآن؟"""
         if time.time() < self.cooldown_until:
+            remaining = int(self.cooldown_until - time.time())
+            if remaining > 0 and remaining % 30 == 0:  # كل 30 ثانية
+                logger.info(f"⏳ Cooldown: {remaining}s remaining")
             return False
         
         if self.consecutive_losses >= 3:
+            logger.warning(f"🚫 Max consecutive losses reached: {self.consecutive_losses}")
             return False
         
         if abs(self.max_drawdown) > MAX_DRAWDOWN_PCT:
+            logger.warning(f"🚫 Max drawdown reached: {self.max_drawdown:.2f}%")
             return False
         
         return True
+    
+    def get_statistics(self) -> Dict[str, Any]:
+        """الحصول على الإحصائيات"""
+        win_rate = (self.winning_trades / self.total_trades * 100) if self.total_trades > 0 else 0
+        
+        # حساب متوسط الربح والخسارة
+        avg_win = 0.0
+        avg_loss = 0.0
+        
+        if self.trade_history:
+            wins = [t['pnl_pct'] for t in self.trade_history if t['pnl_pct'] > 0]
+            losses = [t['pnl_pct'] for t in self.trade_history if t['pnl_pct'] < 0]
+            
+            avg_win = np.mean(wins) if wins else 0.0
+            avg_loss = np.mean(losses) if losses else 0.0
+        
+        return {
+            'total_trades': self.total_trades,
+            'winning_trades': self.winning_trades,
+            'losing_trades': self.losing_trades,
+            'win_rate': win_rate,
+            'total_pnl': self.total_pnl,
+            'consecutive_wins': self.consecutive_wins,
+            'consecutive_losses': self.consecutive_losses,
+            'max_drawdown': self.max_drawdown,
+            'avg_win': avg_win,
+            'avg_loss': avg_loss,
+            'profit_factor': abs(avg_win / avg_loss) if avg_loss != 0 else 0
+        }
 
 # =================== EXCHANGE INTEGRATION ===================
 class BingXExchange:
@@ -1960,7 +2138,7 @@ class BingXExchange:
             market = self.exchange.market(self.symbol)
             self.precision = market['precision']['amount']
             self.min_qty = market['limits']['amount']['min']
-            logger.info(f"Market loaded: {self.symbol}")
+            logger.success(f"Market loaded: {self.symbol}")
         except Exception as e:
             logger.error(f"Failed to load market: {e}")
     
@@ -1968,7 +2146,9 @@ class BingXExchange:
         """الحصول على الرصيد"""
         try:
             balance = self.exchange.fetch_balance(params={"type": "swap"})
-            return balance['USDT']['total']
+            total_balance = balance['USDT']['total']
+            logger.info(f"💰 Balance: {total_balance:.2f} USDT")
+            return total_balance
         except Exception as e:
             logger.error(f"Failed to get balance: {e}")
             return 0.0
@@ -1989,10 +2169,20 @@ class BingXExchange:
             bid = orderbook['bids'][0][0] if orderbook['bids'] else 0
             ask = orderbook['asks'][0][0] if orderbook['asks'] else 0
             if bid and ask:
-                return ((ask - bid) / ((ask + bid) / 2)) * 10000
+                spread = ((ask - bid) / ((ask + bid) / 2)) * 10000
+                return spread
         except Exception as e:
             logger.error(f"Failed to get spread: {e}")
         return 0.0
+    
+    def get_24h_volume(self) -> float:
+        """الحصول على حجم التداول لـ24 ساعة"""
+        try:
+            ticker = self.exchange.fetch_ticker(self.symbol)
+            return ticker['quoteVolume'] if 'quoteVolume' in ticker else 0
+        except Exception as e:
+            logger.error(f"Failed to get 24h volume: {e}")
+            return 0.0
     
     def execute_order(self, side: str, qty: float) -> bool:
         """تنفيذ أمر"""
@@ -2013,11 +2203,11 @@ class BingXExchange:
                 params={"positionSide": "LONG" if side == "buy" else "SHORT", "reduceOnly": False}
             )
             
-            logger.success(f"Order executed: {side.upper()} {qty:.4f}")
+            logger.success(f"✅ Order executed: {side.upper()} {qty:.4f}")
             return True
             
         except Exception as e:
-            logger.error(f"Failed to execute order: {e}")
+            logger.error(f"❌ Failed to execute order: {e}")
             return False
     
     def close_position(self, side: str, qty: float) -> bool:
@@ -2036,11 +2226,11 @@ class BingXExchange:
                 params={"positionSide": "LONG" if side == "long" else "SHORT", "reduceOnly": True}
             )
             
-            logger.success(f"Position closed: {side} {qty:.4f}")
+            logger.success(f"✅ Position closed: {side} {qty:.4f}")
             return True
             
         except Exception as e:
-            logger.error(f"Failed to close position: {e}")
+            logger.error(f"❌ Failed to close position: {e}")
             return False
 
 # =================== MAIN BOT ENGINE ===================
@@ -2055,12 +2245,7 @@ class UltimateDogeProBot:
         self.last_update = 0
         self.update_interval = 15  # ثانية
         self.is_running = True
-        
-        # الإحصائيات
-        self.total_trades = 0
-        self.winning_trades = 0
-        self.losing_trades = 0
-        self.total_profit = 0.0
+        self.cycle_count = 0
         
         logger.banner("ULTIMATE DOGE PRO BOT INITIALIZED")
     
@@ -2100,9 +2285,59 @@ class UltimateDogeProBot:
         
         return qty
     
+    def show_market_status(self):
+        """عرض حالة السوق"""
+        try:
+            price = self.exchange.get_current_price()
+            volume_24h = self.exchange.get_24h_volume()
+            spread = self.exchange.get_orderbook_spread()
+            
+            logger.market_status(price, volume_24h, spread)
+        except Exception as e:
+            logger.error(f"Failed to show market status: {e}")
+    
+    def show_balance_status(self, show_equity=True):
+        """عرض حالة الرصيد"""
+        try:
+            balance = self.exchange.get_balance()
+            pnl = self.trade_manager.total_pnl
+            
+            if show_equity and self.trade_manager.current_trade:
+                # حساب قيمة المركز الحالي
+                current_price = self.exchange.get_current_price()
+                trade = self.trade_manager.current_trade
+                
+                if trade['signal'].action == 'BUY':
+                    equity = balance + (current_price - trade['entry_price']) * trade['qty']
+                else:
+                    equity = balance + (trade['entry_price'] - current_price) * trade['qty']
+            else:
+                equity = None
+            
+            logger.balance_display(balance, pnl, equity)
+        except Exception as e:
+            logger.error(f"Failed to show balance status: {e}")
+    
+    def show_indicators_status(self, df: pd.DataFrame):
+        """عرض حالة المؤشرات"""
+        try:
+            if df is not None and len(df) > 50:
+                ctx = self.signal_generator.analyze_market(df)
+                logger.indicators_status(
+                    rsi=ctx.rsi,
+                    adx=ctx.adx,
+                    macd=ctx.macd_histogram,
+                    ma_fast=ctx.ma_fast,
+                    ma_slow=ctx.ma_slow
+                )
+        except Exception as e:
+            logger.error(f"Failed to show indicators: {e}")
+    
     def run_cycle(self):
         """دورة التداول الرئيسية"""
         try:
+            self.cycle_count += 1
+            
             # 1. تحديث البيانات
             current_time = time.time()
             if current_time - self.last_update >= self.update_interval:
@@ -2113,14 +2348,21 @@ class UltimateDogeProBot:
                 time.sleep(5)
                 return
             
-            # 2. التحقق من السبريد
+            # 2. عرض معلومات كل 10 دورات
+            if self.cycle_count % 10 == 0:
+                logger.banner(f"CYCLE {self.cycle_count}")
+                self.show_market_status()
+                self.show_balance_status()
+                self.show_indicators_status(self.ohlcv_data)
+            
+            # 3. التحقق من السبريد
             spread = self.exchange.get_orderbook_spread()
             if spread > MAX_SPREAD_BPS:
                 logger.warning(f"Spread too high: {spread:.1f} bps")
                 time.sleep(10)
                 return
             
-            # 3. إذا كانت هناك صفقة مفتوحة، إدارتها
+            # 4. إذا كانت هناك صفقة مفتوحة، إدارتها
             if self.trade_manager.current_trade:
                 current_price = self.exchange.get_current_price()
                 if current_price > 0:
@@ -2131,21 +2373,15 @@ class UltimateDogeProBot:
                     
                     if close_reason:
                         # إغلاق الصفقة في البورصة
-                        signal = self.trade_manager.current_trade['signal']
-                        qty = self.trade_manager.current_trade['qty']
-                        side = "long" if signal.action == "BUY" else "short"
+                        trade = self.trade_manager.current_trade
+                        qty = trade['qty']
+                        side = "long" if trade['signal'].action == "BUY" else "short"
                         self.exchange.close_position(side, qty)
                         
-                        # تحديث الإحصائيات
-                        self.total_trades += 1
-                        last_trade = self.trade_manager.trade_history[-1]
-                        if last_trade['pnl_pct'] > 0:
-                            self.winning_trades += 1
-                        else:
-                            self.losing_trades += 1
-                        self.total_profit += last_trade['pnl']
+                        # عرض الرصيد بعد الإغلاق
+                        self.show_balance_status(show_equity=False)
             
-            # 4. إذا لم تكن هناك صفقة مفتوحة، البحث عن إشارات
+            # 5. إذا لم تكن هناك صفقة مفتوحة، البحث عن إشارات
             elif self.trade_manager.should_trade():
                 # تحليل السوق
                 ctx = self.signal_generator.analyze_market(self.ohlcv_data)
@@ -2160,16 +2396,12 @@ class UltimateDogeProBot:
                     best_signal = signals[0]
                     
                     # عرض الإشارة
-                    logger.banner("NEW TRADE SIGNAL DETECTED")
-                    logger.golden(f"🏆 {best_signal.trade_type.value}")
-                    logger.signal(f"Action: {best_signal.action}")
-                    logger.signal(f"Entry: {best_signal.entry_price:.6f}")
-                    logger.signal(f"Confidence: {best_signal.confidence:.2f}")
-                    logger.signal(f"Zone Strength: {best_signal.zone_strength:.1f}/10")
-                    logger.signal(f"R:R Ratio: {best_signal.risk_reward:.2f}")
-                    
-                    for i, reason in enumerate(best_signal.reasons[:5]):
-                        logger.info(f"{i+1}. {reason}")
+                    logger.trade_decision(
+                        action=best_signal.action,
+                        reason=best_signal.reasons[0] if best_signal.reasons else "No reason",
+                        confidence=best_signal.confidence,
+                        zone_strength=best_signal.zone_strength
+                    )
                     
                     # الحصول على الرصيد وحساب الحجم
                     balance = self.exchange.get_balance()
@@ -2182,13 +2414,10 @@ class UltimateDogeProBot:
                             qty
                         ):
                             self.trade_manager.open_trade(best_signal, qty, best_signal.entry_price)
-            
-            # 5. عرض الإحصائيات كل 10 دورات
-            if self.total_trades > 0 and self.total_trades % 10 == 0:
-                self.show_statistics()
+                            self.show_balance_status()
             
             # 6. النوم قبل الدورة التالية
-            sleep_time = 5 if self.trade_manager.current_trade else 10
+            sleep_time = 3 if self.trade_manager.current_trade else 5
             time.sleep(sleep_time)
             
         except Exception as e:
@@ -2198,41 +2427,36 @@ class UltimateDogeProBot:
     
     def show_statistics(self):
         """عرض الإحصائيات"""
+        stats = self.trade_manager.get_statistics()
+        
         logger.banner("TRADING STATISTICS")
-        
-        win_rate = (self.winning_trades / self.total_trades * 100) if self.total_trades > 0 else 0
-        avg_win = 0
-        avg_loss = 0
-        
-        if self.trade_manager.trade_history:
-            wins = [t['pnl_pct'] for t in self.trade_manager.trade_history if t['pnl_pct'] > 0]
-            losses = [t['pnl_pct'] for t in self.trade_manager.trade_history if t['pnl_pct'] < 0]
-            
-            avg_win = np.mean(wins) if wins else 0
-            avg_loss = np.mean(losses) if losses else 0
-        
-        logger.info(f"Total Trades: {self.total_trades}")
-        logger.info(f"Winning Trades: {self.winning_trades} ({win_rate:.1f}%)")
-        logger.info(f"Losing Trades: {self.losing_trades}")
-        logger.info(f"Total Profit: {self.total_profit:.2f} USDT")
-        logger.info(f"Avg Win: {avg_win:+.2f}%")
-        logger.info(f"Avg Loss: {avg_loss:+.2f}%")
-        logger.info(f"Consecutive Wins: {self.trade_manager.consecutive_wins}")
-        logger.info(f"Consecutive Losses: {self.trade_manager.consecutive_losses}")
-        logger.info(f"Max Drawdown: {self.trade_manager.max_drawdown:.2f}%")
+        logger.info(f"📈 Total Trades: {stats['total_trades']}")
+        logger.info(f"✅ Winning Trades: {stats['winning_trades']} ({stats['win_rate']:.1f}%)")
+        logger.info(f"❌ Losing Trades: {stats['losing_trades']}")
+        logger.info(f"💰 Total PnL: {stats['total_pnl']:+.2f} USDT")
+        logger.info(f"📊 Avg Win: {stats['avg_win']:+.2f}%")
+        logger.info(f"📉 Avg Loss: {stats['avg_loss']:+.2f}%")
+        logger.info(f"⚡ Consecutive Wins: {stats['consecutive_wins']}")
+        logger.info(f"🔻 Consecutive Losses: {stats['consecutive_losses']}")
+        logger.info(f"📉 Max Drawdown: {stats['max_drawdown']:.2f}%")
+        logger.info(f"📊 Profit Factor: {stats['profit_factor']:.2f}")
     
     def run(self):
         """تشغيل البوت"""
         logger.success("🚀 Starting Ultimate Doge Pro Bot...")
         
+        # عرض الرصيد الأولي
+        self.show_balance_status(show_equity=False)
+        
         while self.is_running:
             try:
                 self.run_cycle()
             except KeyboardInterrupt:
-                logger.warning("Bot stopped by user")
+                logger.warning("🛑 Bot stopped by user")
                 self.is_running = False
+                self.show_statistics()
             except Exception as e:
-                logger.error(f"Unexpected error: {e}")
+                logger.error(f"⚠️ Unexpected error: {e}")
                 traceback.print_exc()
                 time.sleep(60)
 
@@ -2248,47 +2472,192 @@ def home():
     <head>
         <title>Ultimate Doge Pro Bot</title>
         <style>
-            body { font-family: Arial, sans-serif; margin: 40px; }
-            .container { max-width: 800px; margin: 0 auto; }
-            .status { padding: 20px; border-radius: 10px; margin: 20px 0; }
-            .running { background: #d4edda; color: #155724; }
-            .stopped { background: #f8d7da; color: #721c24; }
-            .stat { margin: 10px 0; padding: 10px; background: #f8f9fa; border-radius: 5px; }
+            body { 
+                font-family: 'Arial', sans-serif; 
+                margin: 0; 
+                padding: 20px; 
+                background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+                min-height: 100vh;
+                color: white;
+            }
+            .container { 
+                max-width: 1000px; 
+                margin: 0 auto; 
+                background: rgba(255, 255, 255, 0.1);
+                backdrop-filter: blur(10px);
+                border-radius: 20px;
+                padding: 30px;
+                box-shadow: 0 8px 32px rgba(0, 0, 0, 0.1);
+            }
+            .header {
+                text-align: center;
+                margin-bottom: 30px;
+            }
+            .status-card {
+                background: rgba(255, 255, 255, 0.2);
+                border-radius: 15px;
+                padding: 20px;
+                margin: 20px 0;
+                transition: transform 0.3s;
+            }
+            .status-card:hover {
+                transform: translateY(-5px);
+            }
+            .stats-grid {
+                display: grid;
+                grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+                gap: 15px;
+                margin: 20px 0;
+            }
+            .stat-item {
+                background: rgba(255, 255, 255, 0.15);
+                padding: 15px;
+                border-radius: 10px;
+                text-align: center;
+            }
+            .btn {
+                display: inline-block;
+                background: linear-gradient(45deg, #FF6B6B, #FF8E53);
+                color: white;
+                padding: 12px 30px;
+                border-radius: 25px;
+                text-decoration: none;
+                margin: 10px;
+                transition: all 0.3s;
+                font-weight: bold;
+            }
+            .btn:hover {
+                transform: scale(1.05);
+                box-shadow: 0 5px 15px rgba(255, 107, 107, 0.4);
+            }
+            .live-indicator {
+                display: inline-block;
+                width: 12px;
+                height: 12px;
+                background: #4CAF50;
+                border-radius: 50%;
+                animation: pulse 2s infinite;
+                margin-right: 8px;
+            }
+            @keyframes pulse {
+                0% { opacity: 1; }
+                50% { opacity: 0.5; }
+                100% { opacity: 1; }
+            }
+            .icon {
+                font-size: 24px;
+                margin-right: 10px;
+            }
         </style>
     </head>
     <body>
         <div class="container">
-            <h1>🚀 Ultimate Doge Pro Bot v10.0</h1>
-            <div class="status running">
-                <h2>✅ Bot is Running</h2>
+            <div class="header">
+                <h1>🚀 Ultimate Doge Pro Bot v10.0</h1>
+                <p><span class="live-indicator"></span> Live Trading System</p>
+            </div>
+            
+            <div class="status-card">
+                <h2>📊 System Status</h2>
+                <div class="stats-grid">
+                    <div class="stat-item">
+                        <div class="icon">💰</div>
+                        <h3>Balance</h3>
+                        <p>Loading...</p>
+                    </div>
+                    <div class="stat-item">
+                        <div class="icon">📈</div>
+                        <h3>Total PnL</h3>
+                        <p>Loading...</p>
+                    </div>
+                    <div class="stat-item">
+                        <div class="icon">✅</div>
+                        <h3>Win Rate</h3>
+                        <p>Loading...</p>
+                    </div>
+                    <div class="stat-item">
+                        <div class="icon">⚡</div>
+                        <h3>Trades</h3>
+                        <p>Loading...</p>
+                    </div>
+                </div>
+            </div>
+            
+            <div class="status-card">
+                <h2>🔗 Quick Links</h2>
+                <div style="text-align: center;">
+                    <a href="/metrics" class="btn">📊 Trading Metrics</a>
+                    <a href="/health" class="btn">❤️ Health Check</a>
+                    <a href="/statistics" class="btn">📈 Statistics</a>
+                    <a href="/signals" class="btn">🎯 Recent Signals</a>
+                </div>
+            </div>
+            
+            <div class="status-card">
+                <h2>⚙️ Configuration</h2>
                 <p><strong>Symbol:</strong> ''' + SYMBOL + '''</p>
                 <p><strong>Interval:</strong> ''' + INTERVAL + '''</p>
-                <p><strong>Mode:</strong> ''' + ("LIVE" if MODE_LIVE else "PAPER") + '''</p>
+                <p><strong>Leverage:</strong> ''' + str(LEVERAGE) + '''x</p>
+                <p><strong>Risk Allocation:</strong> ''' + str(RISK_ALLOC * 100) + '''%</p>
+                <p><strong>Mode:</strong> ''' + ("LIVE 🟢" if MODE_LIVE else "PAPER 🔴") + '''</p>
             </div>
-            <h2>Quick Links</h2>
-            <ul>
-                <li><a href="/metrics">📊 Trading Metrics</a></li>
-                <li><a href="/health">❤️ Health Check</a></li>
-                <li><a href="/statistics">📈 Statistics</a></li>
-                <li><a href="/signals">🎯 Recent Signals</a></li>
-            </ul>
         </div>
+        
+        <script>
+            async function updateStats() {
+                try {
+                    const response = await fetch('/statistics');
+                    const data = await response.json();
+                    
+                    // Update statistics
+                    document.querySelectorAll('.stat-item')[0].querySelector('p').textContent = data.balance || 'Loading...';
+                    document.querySelectorAll('.stat-item')[1].querySelector('p').textContent = data.total_pnl ? data.total_pnl.toFixed(2) + ' USDT' : 'Loading...';
+                    document.querySelectorAll('.stat-item')[2].querySelector('p').textContent = data.win_rate ? data.win_rate.toFixed(1) + '%' : 'Loading...';
+                    document.querySelectorAll('.stat-item')[3].querySelector('p').textContent = data.total_trades || '0';
+                    
+                    // Update configuration with actual data if available
+                    if (data.balance) {
+                        document.querySelectorAll('.status-card')[2].innerHTML += `
+                            <p><strong>Current Balance:</strong> ${data.balance.toFixed(2)} USDT</p>
+                            <p><strong>Active Trades:</strong> ${data.current_trade ? 'Yes' : 'No'}</p>
+                        `;
+                    }
+                } catch (error) {
+                    console.error('Error updating stats:', error);
+                }
+            }
+            
+            // Update stats every 10 seconds
+            setInterval(updateStats, 10000);
+            updateStats(); // Initial call
+        </script>
     </body>
     </html>
     '''
 
 @app.route('/metrics')
 def metrics():
-    return {
-        'bot': BOT_VERSION,
-        'symbol': SYMBOL,
-        'interval': INTERVAL,
-        'mode': 'LIVE' if MODE_LIVE else 'PAPER',
-        'leverage': LEVERAGE,
-        'risk_allocation': RISK_ALLOC,
-        'status': 'running',
-        'timestamp': datetime.utcnow().isoformat()
-    }
+    try:
+        balance = bot.exchange.get_balance()
+        price = bot.exchange.get_current_price()
+        spread = bot.exchange.get_orderbook_spread()
+        
+        return {
+            'bot': BOT_VERSION,
+            'symbol': SYMBOL,
+            'interval': INTERVAL,
+            'mode': 'LIVE' if MODE_LIVE else 'PAPER',
+            'leverage': LEVERAGE,
+            'risk_allocation': RISK_ALLOC,
+            'balance': balance,
+            'price': price,
+            'spread': spread,
+            'status': 'running',
+            'timestamp': datetime.utcnow().isoformat(),
+            'cycle_count': bot.cycle_count
+        }
+    except Exception as e:
+        return {'status': 'error', 'message': str(e)}, 500
 
 @app.route('/health')
 def health():
@@ -2301,43 +2670,48 @@ def health():
             'price': price,
             'balance': balance,
             'current_trade': bot.trade_manager.current_trade is not None,
-            'exchange_connected': price > 0
+            'exchange_connected': price > 0,
+            'cycle_count': bot.cycle_count,
+            'uptime': time.time() - bot.session_start_time if hasattr(bot, 'session_start_time') else 0
         }
     except Exception as e:
         return {'status': 'error', 'message': str(e)}, 500
 
 @app.route('/statistics')
 def statistics():
-    stats = {
-        'total_trades': bot.total_trades,
-        'winning_trades': bot.winning_trades,
-        'losing_trades': bot.losing_trades,
-        'total_profit': bot.total_profit,
-        'win_rate': (bot.winning_trades / bot.total_trades * 100) if bot.total_trades > 0 else 0,
-        'current_trade': bot.trade_manager.current_trade,
-        'consecutive_wins': bot.trade_manager.consecutive_wins,
-        'consecutive_losses': bot.trade_manager.consecutive_losses,
-        'total_pnl': bot.trade_manager.total_pnl,
-        'max_drawdown': bot.trade_manager.max_drawdown
-    }
-    return stats
+    try:
+        stats = bot.trade_manager.get_statistics()
+        balance = bot.exchange.get_balance()
+        
+        stats['balance'] = balance
+        stats['current_trade'] = bot.trade_manager.current_trade is not None
+        stats['cycle_count'] = bot.cycle_count
+        stats['timestamp'] = datetime.utcnow().isoformat()
+        
+        return stats
+    except Exception as e:
+        return {'status': 'error', 'message': str(e)}, 500
 
 @app.route('/signals')
 def signals():
-    if bot.signal_generator.last_signals:
-        signals = []
-        for signal in list(bot.signal_generator.last_signals)[-5:]:
-            signals.append({
-                'action': signal.action,
-                'type': signal.trade_type.value,
-                'entry': signal.entry_price,
-                'confidence': signal.confidence,
-                'zone_strength': signal.zone_strength,
-                'timestamp': signal.timestamp,
-                'reasons': signal.reasons[:3]
-            })
-        return {'signals': signals}
-    return {'signals': []}
+    try:
+        if bot.signal_generator.last_signals:
+            signals = []
+            for signal in list(bot.signal_generator.last_signals)[-5:]:
+                signals.append({
+                    'action': signal.action,
+                    'type': signal.trade_type.value,
+                    'entry': signal.entry_price,
+                    'confidence': signal.confidence,
+                    'zone_strength': signal.zone_strength,
+                    'timestamp': signal.timestamp,
+                    'time_ago': time.time() - signal.timestamp,
+                    'reasons': signal.reasons[:3]
+                })
+            return {'signals': signals}
+        return {'signals': []}
+    except Exception as e:
+        return {'status': 'error', 'message': str(e)}, 500
 
 # =================== MAIN EXECUTION ===================
 if __name__ == "__main__":
