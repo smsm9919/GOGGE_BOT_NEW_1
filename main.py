@@ -205,29 +205,44 @@ class AdvancedLogger:
         print(f"{colored('║', pnl_color)}  Time: {datetime.now().strftime('%H:%M:%S')}")
         print(f"{colored('╚' + '═'*68 + '╝', pnl_color)}\n")
     
-    def indicators_status(self, rsi: float, adx: float, macd: float, ma_fast: float, ma_slow: float):
-        """حالة المؤشرات"""
-        print(f"{colored('📊', 'blue')}  {colored('INDICATORS', 'cyan')}")
+    def strategy_status(self, indicators: dict):
+        """حالة الاستراتيجية والمؤشرات"""
+        print(f"\n{colored('📊', 'blue')}  {colored('STRATEGY STATUS', 'cyan', attrs=['bold'])}")
         
-        # RSI
-        rsi_color = 'red' if rsi > 70 else 'green' if rsi < 30 else 'yellow'
-        rsi_status = "OVERSOLD 🟢" if rsi < 30 else "OVERBOUGHT 🔴" if rsi > 70 else "NEUTRAL 🟡"
-        print(f"{colored('├', 'blue')}  RSI: {colored(f'{rsi:.1f}', rsi_color)} [{rsi_status}]")
+        # حالة هيكل السوق
+        if 'structure' in indicators:
+            structure = indicators['structure']
+            trend_color = 'green' if structure.get('trend') == 'bullish' else 'red' if structure.get('trend') == 'bearish' else 'yellow'
+            print(f"{colored('├', 'blue')}  Trend: {colored(structure.get('trend', 'neutral').upper(), trend_color)}")
         
-        # ADX
-        adx_color = 'green' if adx > 25 else 'yellow' if adx > 20 else 'red'
-        adx_status = "STRONG 📈" if adx > 25 else "MODERATE ⚡" if adx > 20 else "WEAK 📉"
-        print(f"{colored('├', 'blue')}  ADX: {colored(f'{adx:.1f}', adx_color)} [{adx_status}]")
+        # حالة المؤشرات
+        if 'rsi' in indicators:
+            rsi = indicators['rsi']
+            rsi_color = 'red' if rsi > 70 else 'green' if rsi < 30 else 'yellow'
+            rsi_status = "OVERSOLD 🟢" if rsi < 30 else "OVERBOUGHT 🔴" if rsi > 70 else "NEUTRAL 🟡"
+            print(f"{colored('├', 'blue')}  RSI: {colored(f'{rsi:.1f}', rsi_color)} [{rsi_status}]")
         
-        # MACD
-        macd_color = 'green' if macd > 0 else 'red'
-        macd_status = "BULLISH 🟢" if macd > 0 else "BEARISH 🔴"
-        print(f"{colored('├', 'blue')}  MACD: {colored(f'{macd:.4f}', macd_color)} [{macd_status}]")
+        if 'adx' in indicators:
+            adx = indicators['adx']
+            adx_color = 'green' if adx > 25 else 'yellow' if adx > 20 else 'red'
+            adx_status = "STRONG 📈" if adx > 25 else "MODERATE ⚡" if adx > 20 else "WEAK 📉"
+            print(f"{colored('├', 'blue')}  ADX: {colored(f'{adx:.1f}', adx_color)} [{adx_status}]")
         
-        # Moving Averages
-        ma_status = "BULLISH 📈" if ma_fast > ma_slow else "BEARISH 📉"
-        print(f"{colored('├', 'blue')}  MA Fast/Slow: {colored(f'{ma_fast:.6f}', 'cyan')} / {colored(f'{ma_slow:.6f}', 'yellow')}")
-        print(f"{colored('└', 'blue')}  MA Status: {colored(ma_status, 'green' if ma_fast > ma_slow else 'red')}")
+        if 'macd' in indicators:
+            macd = indicators.get('macd_histogram', 0)
+            macd_color = 'green' if macd > 0 else 'red'
+            macd_status = "BULLISH 🟢" if macd > 0 else "BEARISH 🔴"
+            print(f"{colored('├', 'blue')}  MACD: {colored(f'{macd:.4f}', macd_color)} [{macd_status}]")
+        
+        # حالة المتوسطات
+        if 'ma_fast' in indicators and 'ma_slow' in indicators:
+            ma_fast = indicators['ma_fast']
+            ma_slow = indicators['ma_slow']
+            ma_status = "BULLISH 📈" if ma_fast > ma_slow else "BEARISH 📉"
+            print(f"{colored('├', 'blue')}  MA Fast/Slow: {colored(f'{ma_fast:.6f}', 'cyan')} / {colored(f'{ma_slow:.6f}', 'yellow')}")
+            print(f"{colored('└', 'blue')}  MA Status: {colored(ma_status, 'green' if ma_fast > ma_slow else 'red')}")
+        
+        print()
     
     def _show_balance(self):
         """عرض الرصيد الداخلي"""
@@ -734,22 +749,24 @@ class LiquidityDetector:
         low = df['low'].astype(float).values
         volume = df['volume'].astype(float).values
         
-        if len(df) < MANIPULATION_DETECTION_WINDOW + 1:
+        if len(df) < MANIPULATION_DETECTION_WINDOW + 3:
             return signals
         
         # 1. False Breakouts (كسر وهمي)
-        for i in range(len(df) - MANIPULATION_DETECTION_WINDOW, len(df) - 1):
+        for i in range(len(df) - MANIPULATION_DETECTION_WINDOW, len(df) - 2):
             # كسر قمة ثم عودة
-            if (high[i] > max(high[i-3:i]) and  # كسر قمة
-                close[i+1] < high[i] and        # إغلاق أقل
-                close[i+2] < close[i+1]):       # استمرار الهبوط
-                signals.append(f"FALSE_BREAKOUT_HIGH_{i}")
+            if i + 2 < len(close):
+                if (high[i] > max(high[max(0, i-3):i]) and  # كسر قمة
+                    close[i+1] < high[i] and        # إغلاق أقل
+                    close[i+2] < close[i+1]):       # استمرار الهبوط
+                    signals.append(f"FALSE_BREAKOUT_HIGH_{i}")
             
             # كسر قاع ثم عودة
-            if (low[i] < min(low[i-3:i]) and    # كسر قاع
-                close[i+1] > low[i] and         # إغلاق أعلى
-                close[i+2] > close[i+1]):       # استمرار الصعود
-                signals.append(f"FALSE_BREAKOUT_LOW_{i}")
+            if i + 2 < len(close):
+                if (low[i] < min(low[max(0, i-3):i]) and    # كسر قاع
+                    close[i+1] > low[i] and         # إغلاق أعلى
+                    close[i+2] > close[i+1]):       # استمرار الصعود
+                    signals.append(f"FALSE_BREAKOUT_LOW_{i}")
         
         # 2. Volume Spikes (قفزات حجم مفاجئة)
         volume_ma = np.mean(volume[-VOLUME_MA:])
@@ -2246,6 +2263,7 @@ class UltimateDogeProBot:
         self.update_interval = 15  # ثانية
         self.is_running = True
         self.cycle_count = 0
+        self.session_start_time = time.time()
         
         logger.banner("ULTIMATE DOGE PRO BOT INITIALIZED")
     
@@ -2318,20 +2336,28 @@ class UltimateDogeProBot:
         except Exception as e:
             logger.error(f"Failed to show balance status: {e}")
     
-    def show_indicators_status(self, df: pd.DataFrame):
-        """عرض حالة المؤشرات"""
+    def show_strategy_status(self, df: pd.DataFrame):
+        """عرض حالة الاستراتيجية والمؤشرات"""
         try:
             if df is not None and len(df) > 50:
                 ctx = self.signal_generator.analyze_market(df)
-                logger.indicators_status(
-                    rsi=ctx.rsi,
-                    adx=ctx.adx,
-                    macd=ctx.macd_histogram,
-                    ma_fast=ctx.ma_fast,
-                    ma_slow=ctx.ma_slow
-                )
+                
+                indicators = {
+                    'rsi': ctx.rsi,
+                    'adx': ctx.adx,
+                    'macd': ctx.macd_histogram,
+                    'ma_fast': ctx.ma_fast,
+                    'ma_slow': ctx.ma_slow,
+                    'structure': {
+                        'trend': ctx.structure.trend,
+                        'last_bos': ctx.structure.last_bos,
+                        'last_choch': ctx.structure.last_choch
+                    }
+                }
+                
+                logger.strategy_status(indicators)
         except Exception as e:
-            logger.error(f"Failed to show indicators: {e}")
+            logger.error(f"Failed to show strategy status: {e}")
     
     def run_cycle(self):
         """دورة التداول الرئيسية"""
@@ -2353,7 +2379,7 @@ class UltimateDogeProBot:
                 logger.banner(f"CYCLE {self.cycle_count}")
                 self.show_market_status()
                 self.show_balance_status()
-                self.show_indicators_status(self.ohlcv_data)
+                self.show_strategy_status(self.ohlcv_data)
             
             # 3. التحقق من السبريد
             spread = self.exchange.get_orderbook_spread()
@@ -2672,7 +2698,7 @@ def health():
             'current_trade': bot.trade_manager.current_trade is not None,
             'exchange_connected': price > 0,
             'cycle_count': bot.cycle_count,
-            'uptime': time.time() - bot.session_start_time if hasattr(bot, 'session_start_time') else 0
+            'uptime': time.time() - bot.session_start_time
         }
     except Exception as e:
         return {'status': 'error', 'message': str(e)}, 500
