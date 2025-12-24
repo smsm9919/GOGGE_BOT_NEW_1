@@ -215,21 +215,21 @@ class AdvancedLogger:
             trend_color = 'green' if structure.get('trend') == 'bullish' else 'red' if structure.get('trend') == 'bearish' else 'yellow'
             print(f"{colored('├', 'blue')}  Trend: {colored(structure.get('trend', 'neutral').upper(), trend_color)}")
         
-        # حالة المؤشرات
-        if 'rsi' in indicators:
+        # حالة المؤشرات - يتم عرضها فقط إذا كانت موجودة
+        if 'rsi' in indicators and indicators['rsi'] is not None:
             rsi = indicators['rsi']
             rsi_color = 'red' if rsi > 70 else 'green' if rsi < 30 else 'yellow'
             rsi_status = "OVERSOLD 🟢" if rsi < 30 else "OVERBOUGHT 🔴" if rsi > 70 else "NEUTRAL 🟡"
             print(f"{colored('├', 'blue')}  RSI: {colored(f'{rsi:.1f}', rsi_color)} [{rsi_status}]")
         
-        if 'adx' in indicators:
+        if 'adx' in indicators and indicators['adx'] is not None:
             adx = indicators['adx']
             adx_color = 'green' if adx > 25 else 'yellow' if adx > 20 else 'red'
             adx_status = "STRONG 📈" if adx > 25 else "MODERATE ⚡" if adx > 20 else "WEAK 📉"
             print(f"{colored('├', 'blue')}  ADX: {colored(f'{adx:.1f}', adx_color)} [{adx_status}]")
         
-        if 'macd' in indicators:
-            macd = indicators.get('macd_histogram', 0)
+        if 'macd_histogram' in indicators and indicators['macd_histogram'] is not None:
+            macd = indicators['macd_histogram']
             macd_color = 'green' if macd > 0 else 'red'
             macd_status = "BULLISH 🟢" if macd > 0 else "BEARISH 🔴"
             print(f"{colored('├', 'blue')}  MACD: {colored(f'{macd:.4f}', macd_color)} [{macd_status}]")
@@ -238,9 +238,10 @@ class AdvancedLogger:
         if 'ma_fast' in indicators and 'ma_slow' in indicators:
             ma_fast = indicators['ma_fast']
             ma_slow = indicators['ma_slow']
-            ma_status = "BULLISH 📈" if ma_fast > ma_slow else "BEARISH 📉"
-            print(f"{colored('├', 'blue')}  MA Fast/Slow: {colored(f'{ma_fast:.6f}', 'cyan')} / {colored(f'{ma_slow:.6f}', 'yellow')}")
-            print(f"{colored('└', 'blue')}  MA Status: {colored(ma_status, 'green' if ma_fast > ma_slow else 'red')}")
+            if ma_fast is not None and ma_slow is not None:
+                ma_status = "BULLISH 📈" if ma_fast > ma_slow else "BEARISH 📉"
+                print(f"{colored('├', 'blue')}  MA Fast/Slow: {colored(f'{ma_fast:.6f}', 'cyan')} / {colored(f'{ma_slow:.6f}', 'yellow')}")
+                print(f"{colored('└', 'blue')}  MA Status: {colored(ma_status, 'green' if ma_fast > ma_slow else 'red')}")
         
         print()
     
@@ -417,71 +418,207 @@ class TradingContext:
 
 # =================== TECHNICAL INDICATORS ===================
 class AdvancedIndicators:
-    """فئة المؤشرات المتقدمة"""
+    """فئة المؤشرات المتقدمة - مطابقة لـ BingX"""
     
     @staticmethod
     def calculate_all(df: pd.DataFrame) -> Dict[str, Any]:
-        """حساب جميع المؤشرات مرة واحدة"""
+        """حساب جميع المؤشرات مرة واحدة - مطابق لـ BingX"""
         results = {}
         
         # الأسعار الأساسية
-        close = df['close'].astype(float)
-        high = df['high'].astype(float)
-        low = df['low'].astype(float)
-        volume = df['volume'].astype(float)
+        close = df['close'].astype(float).values
+        high = df['high'].astype(float).values
+        low = df['low'].astype(float).values
+        volume = df['volume'].astype(float).values
         
-        # 1. المتوسطات المتحركة
-        results['ma_fast'] = close.rolling(window=MA_FAST).mean()
-        results['ma_slow'] = close.rolling(window=MA_SLOW).mean()
-        results['ma_trend'] = close.rolling(window=MA_TREND).mean()
+        # حساب المتوسطات المتحركة
+        def calculate_sma(prices, period):
+            if len(prices) < period:
+                return np.full_like(prices, np.nan)
+            sma = np.full_like(prices, np.nan)
+            for i in range(period-1, len(prices)):
+                sma[i] = np.mean(prices[i-period+1:i+1])
+            return sma
         
-        # 2. RSI مع تحسينات
-        delta = close.diff()
-        gain = (delta.where(delta > 0, 0)).rolling(window=RSI_LEN).mean()
-        loss = (-delta.where(delta < 0, 0)).rolling(window=RSI_LEN).mean()
-        rs = gain / (loss + 1e-12)
-        results['rsi'] = 100 - (100 / (1 + rs))
-        results['rsi_ma'] = results['rsi'].rolling(window=RSI_LEN).mean()
+        def calculate_ema(prices, period):
+            if len(prices) < period:
+                return np.full_like(prices, np.nan)
+            ema = np.full_like(prices, np.nan)
+            multiplier = 2.0 / (period + 1)
+            
+            # أول قيمة EMA هي SMA
+            sma = np.mean(prices[:period])
+            ema[period-1] = sma
+            
+            # حساب بقية القيم
+            for i in range(period, len(prices)):
+                ema[i] = (prices[i] - ema[i-1]) * multiplier + ema[i-1]
+            
+            return ema
         
-        # 3. ATR
-        tr1 = high - low
-        tr2 = abs(high - close.shift())
-        tr3 = abs(low - close.shift())
-        tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
-        results['atr'] = tr.rolling(window=ATR_LEN).mean()
+        # 1. المتوسطات المتحركة (SMA كما في BingX)
+        results['ma_fast'] = calculate_sma(close, MA_FAST)
+        results['ma_slow'] = calculate_sma(close, MA_SLOW)
+        results['ma_trend'] = calculate_sma(close, MA_TREND)
         
-        # 4. ADX & DI
-        plus_dm = high.diff()
-        minus_dm = low.diff() * -1
+        # 2. RSI - تطابق BingX
+        def calculate_rsi(prices, period=RSI_LEN):
+            if len(prices) < period + 1:
+                return np.full_like(prices, np.nan)
+            
+            deltas = np.diff(prices)
+            seed = deltas[:period]
+            up = seed[seed >= 0].sum() / period
+            down = -seed[seed < 0].sum() / period
+            rs = up / down if down != 0 else 0
+            rsi = np.zeros_like(prices)
+            rsi[:period] = 100. - 100. / (1. + rs)
+            
+            for i in range(period, len(prices)):
+                delta = deltas[i-1]
+                if delta > 0:
+                    upval = delta
+                    downval = 0.
+                else:
+                    upval = 0.
+                    downval = -delta
+                
+                up = (up * (period - 1) + upval) / period
+                down = (down * (period - 1) + downval) / period
+                rs = up / down if down != 0 else 0
+                rsi[i] = 100. - 100. / (1. + rs)
+            
+            return rsi
         
-        plus_dm = plus_dm.where((plus_dm > minus_dm) & (plus_dm > 0), 0)
-        minus_dm = minus_dm.where((minus_dm > plus_dm) & (minus_dm > 0), 0)
+        results['rsi'] = calculate_rsi(close)
+        results['rsi_ma'] = calculate_sma(results['rsi'], RSI_LEN)
         
-        tr_smooth = tr.rolling(window=ADX_LEN).mean()
-        plus_di = 100 * (plus_dm.rolling(window=ADX_LEN).mean() / tr_smooth)
-        minus_di = 100 * (minus_dm.rolling(window=ADX_LEN).mean() / tr_smooth)
+        # 3. ATR - تطابق BingX
+        def calculate_atr(high, low, close, period=ATR_LEN):
+            if len(high) < period:
+                return np.full_like(high, np.nan)
+            
+            tr = np.zeros_like(high)
+            tr[0] = high[0] - low[0]
+            
+            for i in range(1, len(high)):
+                hl = high[i] - low[i]
+                hc = abs(high[i] - close[i-1])
+                lc = abs(low[i] - close[i-1])
+                tr[i] = max(hl, hc, lc)
+            
+            atr = np.full_like(high, np.nan)
+            atr[period-1] = np.mean(tr[:period])
+            
+            for i in range(period, len(high)):
+                atr[i] = (atr[i-1] * (period - 1) + tr[i]) / period
+            
+            return atr
         
-        dx = 100 * abs(plus_di - minus_di) / (plus_di + minus_di + 1e-12)
-        results['adx'] = dx.rolling(window=ADX_LEN).mean()
-        results['di_plus'] = plus_di
-        results['di_minus'] = minus_di
+        results['atr'] = calculate_atr(high, low, close)
         
-        # 5. MACD
-        exp1 = close.ewm(span=MACD_FAST, adjust=False).mean()
-        exp2 = close.ewm(span=MACD_SLOW, adjust=False).mean()
-        results['macd'] = exp1 - exp2
-        results['macd_signal'] = results['macd'].ewm(span=MACD_SIGNAL, adjust=False).mean()
-        results['macd_histogram'] = results['macd'] - results['macd_signal']
+        # 4. ADX & DI - تطابق BingX
+        def calculate_adx(high, low, close, period=ADX_LEN):
+            if len(high) < period * 2:
+                return np.full_like(high, np.nan), np.full_like(high, np.nan), np.full_like(high, np.nan)
+            
+            # حساب TR
+            tr = np.zeros_like(high)
+            tr[0] = high[0] - low[0]
+            
+            for i in range(1, len(high)):
+                hl = high[i] - low[i]
+                hc = abs(high[i] - close[i-1])
+                lc = abs(low[i] - close[i-1])
+                tr[i] = max(hl, hc, lc)
+            
+            # حساب +DM و -DM
+            plus_dm = np.zeros_like(high)
+            minus_dm = np.zeros_like(high)
+            
+            for i in range(1, len(high)):
+                up_move = high[i] - high[i-1]
+                down_move = low[i-1] - low[i]
+                
+                if up_move > down_move and up_move > 0:
+                    plus_dm[i] = up_move
+                else:
+                    plus_dm[i] = 0
+                
+                if down_move > up_move and down_move > 0:
+                    minus_dm[i] = down_move
+                else:
+                    minus_dm[i] = 0
+            
+            # حساب المتوسطات
+            tr_smooth = np.zeros_like(high)
+            plus_di = np.zeros_like(high)
+            minus_di = np.zeros_like(high)
+            dx = np.zeros_like(high)
+            adx = np.full_like(high, np.nan)
+            
+            # القيم الأولية
+            tr_smooth[period-1] = np.sum(tr[:period])
+            plus_di[period-1] = 100 * np.sum(plus_dm[:period]) / tr_smooth[period-1]
+            minus_di[period-1] = 100 * np.sum(minus_dm[:period]) / tr_smooth[period-1]
+            dx[period-1] = 100 * abs(plus_di[period-1] - minus_di[period-1]) / (plus_di[period-1] + minus_di[period-1])
+            adx[period-1] = dx[period-1]
+            
+            # حساب بقية القيم
+            for i in range(period, len(high)):
+                tr_smooth[i] = tr_smooth[i-1] - (tr_smooth[i-1] / period) + tr[i]
+                plus_di[i] = 100 * (plus_di[i-1] * (period - 1) + plus_dm[i]) / tr_smooth[i]
+                minus_di[i] = 100 * (minus_di[i-1] * (period - 1) + minus_dm[i]) / tr_smooth[i]
+                
+                sum_di = plus_di[i] + minus_di[i]
+                if sum_di != 0:
+                    dx[i] = 100 * abs(plus_di[i] - minus_di[i]) / sum_di
+                else:
+                    dx[i] = 0
+                
+                adx[i] = (adx[i-1] * (period - 1) + dx[i]) / period
+            
+            return adx, plus_di, minus_di
+        
+        adx_result = calculate_adx(high, low, close)
+        results['adx'] = adx_result[0]
+        results['di_plus'] = adx_result[1]
+        results['di_minus'] = adx_result[2]
+        
+        # 5. MACD - تطابق BingX
+        def calculate_macd(prices, fast=MACD_FAST, slow=MACD_SLOW, signal=MACD_SIGNAL):
+            if len(prices) < slow:
+                return np.full_like(prices, np.nan), np.full_like(prices, np.nan), np.full_like(prices, np.nan)
+            
+            ema_fast = calculate_ema(prices, fast)
+            ema_slow = calculate_ema(prices, slow)
+            macd_line = ema_fast - ema_slow
+            signal_line = calculate_ema(macd_line, signal)
+            histogram = macd_line - signal_line
+            
+            return macd_line, signal_line, histogram
+        
+        macd_result = calculate_macd(close)
+        results['macd'] = macd_result[0]
+        results['macd_signal'] = macd_result[1]
+        results['macd_histogram'] = macd_result[2]
         
         # 6. VWAP
         typical_price = (high + low + close) / 3
-        results['vwap'] = (typical_price * volume).cumsum() / volume.cumsum()
+        cumulative_tp = np.cumsum(typical_price * volume)
+        cumulative_volume = np.cumsum(volume)
+        vwap = cumulative_tp / cumulative_volume
+        results['vwap'] = vwap
         
         # 7. Volume Analysis
-        results['volume_ma'] = volume.rolling(window=VOLUME_MA).mean()
+        volume_series = pd.Series(volume)
+        results['volume_ma'] = volume_series.rolling(window=VOLUME_MA).mean().values
         results['volume_ratio'] = volume / results['volume_ma']
-        volume_z = (volume - volume.rolling(window=50).mean()) / (volume.rolling(window=50).std() + 1e-12)
-        results['volume_zscore'] = volume_z
+        
+        # حساب Z-score للحجم
+        volume_mean = volume_series.rolling(window=50).mean().values
+        volume_std = volume_series.rolling(window=50).std().values
+        results['volume_zscore'] = (volume - volume_mean) / (volume_std + 1e-12)
         
         return results
 
@@ -1367,159 +1504,219 @@ class UltimateSignalGenerator:
         
     def analyze_market(self, df: pd.DataFrame) -> TradingContext:
         """تحليل السوق الشامل"""
-        # حساب جميع المؤشرات
-        indicators = self.indicators.calculate_all(df)
-        
-        # كشف هيكل السوق
-        structure = self.structure_detector.detect_swings(df)
-        
-        # كشف Order Blocks و FVGs
-        order_blocks = self.ob_detector.detect_order_blocks(df)
-        fvgs = self.ob_detector.detect_fvgs(df)
-        
-        # كشف السيولة والتلاعب
-        liquidity_zones = self.liquidity_detector.detect_liquidity_zones(df)
-        manipulation_signals = self.liquidity_detector.detect_manipulation(df)
-        
-        # تحديد التحيز والطور
-        current_idx = len(df) - 1
-        bias = self._determine_bias(indicators, df, current_idx)
-        phase = self._determine_phase(indicators, structure, current_idx)
-        
-        # قوة السوق
-        market_strength = self._calculate_market_strength(indicators, structure, current_idx)
-        
-        # مناطق الخطر
-        danger_zones = self._detect_danger_zones(indicators, df, current_idx)
-        
-        # بناء السياق
-        ctx = TradingContext(
-            price=float(df['close'].iloc[current_idx]),
-            volume=float(df['volume'].iloc[current_idx]),
-            volume_ma=float(indicators['volume_ma'].iloc[current_idx]),
-            volume_ratio=float(indicators['volume_ratio'].iloc[current_idx]),
-            volume_zscore=float(indicators['volume_zscore'].iloc[current_idx]),
-            atr=float(indicators['atr'].iloc[current_idx]),
-            rsi=float(indicators['rsi'].iloc[current_idx]),
-            rsi_ma=float(indicators['rsi_ma'].iloc[current_idx]),
-            adx=float(indicators['adx'].iloc[current_idx]),
-            di_plus=float(indicators['di_plus'].iloc[current_idx]),
-            di_minus=float(indicators['di_minus'].iloc[current_idx]),
-            macd=float(indicators['macd'].iloc[current_idx]),
-            macd_signal=float(indicators['macd_signal'].iloc[current_idx]),
-            macd_histogram=float(indicators['macd_histogram'].iloc[current_idx]),
-            ma_fast=float(indicators['ma_fast'].iloc[current_idx]),
-            ma_slow=float(indicators['ma_slow'].iloc[current_idx]),
-            ma_trend=float(indicators['ma_trend'].iloc[current_idx]),
-            vwap=float(indicators['vwap'].iloc[current_idx]),
-            bias=bias,
-            phase=phase,
-            market_strength=market_strength,
-            structure=structure,
-            order_blocks=order_blocks,
-            fair_value_gaps=fvgs,
-            liquidity_zones=liquidity_zones,
-            support_zones=[z for z in liquidity_zones if 'support' in z['type']],
-            resistance_zones=[z for z in liquidity_zones if 'resistance' in z['type']],
-            manipulation_signals=manipulation_signals,
-            danger_zones=danger_zones
-        )
-        
-        return ctx
+        try:
+            # حساب جميع المؤشرات - مطابقة لـ BingX
+            indicators = self.indicators.calculate_all(df)
+            
+            # كشف هيكل السوق
+            structure = self.structure_detector.detect_swings(df)
+            
+            # كشف Order Blocks و FVGs
+            order_blocks = self.ob_detector.detect_order_blocks(df)
+            fvgs = self.ob_detector.detect_fvgs(df)
+            
+            # كشف السيولة والتلاعب
+            liquidity_zones = self.liquidity_detector.detect_liquidity_zones(df)
+            manipulation_signals = self.liquidity_detector.detect_manipulation(df)
+            
+            # تحديد التحيز والطور
+            current_idx = len(df) - 1
+            
+            # التحقق من وجود القيم
+            if current_idx >= 0 and len(indicators['rsi']) > current_idx:
+                rsi_value = float(indicators['rsi'][current_idx]) if not np.isnan(indicators['rsi'][current_idx]) else 50.0
+                adx_value = float(indicators['adx'][current_idx]) if not np.isnan(indicators['adx'][current_idx]) else 20.0
+                ma_fast_value = float(indicators['ma_fast'][current_idx]) if not np.isnan(indicators['ma_fast'][current_idx]) else float(df['close'].iloc[current_idx])
+                ma_slow_value = float(indicators['ma_slow'][current_idx]) if not np.isnan(indicators['ma_slow'][current_idx]) else float(df['close'].iloc[current_idx])
+            else:
+                rsi_value = 50.0
+                adx_value = 20.0
+                ma_fast_value = float(df['close'].iloc[current_idx])
+                ma_slow_value = float(df['close'].iloc[current_idx])
+            
+            bias = self._determine_bias(indicators, df, current_idx)
+            phase = self._determine_phase(indicators, structure, current_idx)
+            
+            # قوة السوق
+            market_strength = self._calculate_market_strength(indicators, structure, current_idx)
+            
+            # مناطق الخطر
+            danger_zones = self._detect_danger_zones(indicators, df, current_idx)
+            
+            # بناء السياق
+            ctx = TradingContext(
+                price=float(df['close'].iloc[current_idx]),
+                volume=float(df['volume'].iloc[current_idx]),
+                volume_ma=float(indicators['volume_ma'][current_idx]) if not np.isnan(indicators['volume_ma'][current_idx]) else float(df['volume'].iloc[current_idx]),
+                volume_ratio=float(indicators['volume_ratio'][current_idx]) if not np.isnan(indicators['volume_ratio'][current_idx]) else 1.0,
+                volume_zscore=float(indicators['volume_zscore'][current_idx]) if not np.isnan(indicators['volume_zscore'][current_idx]) else 0.0,
+                atr=float(indicators['atr'][current_idx]) if not np.isnan(indicators['atr'][current_idx]) else 0.0,
+                rsi=rsi_value,
+                rsi_ma=float(indicators['rsi_ma'][current_idx]) if not np.isnan(indicators['rsi_ma'][current_idx]) else rsi_value,
+                adx=adx_value,
+                di_plus=float(indicators['di_plus'][current_idx]) if not np.isnan(indicators['di_plus'][current_idx]) else 25.0,
+                di_minus=float(indicators['di_minus'][current_idx]) if not np.isnan(indicators['di_minus'][current_idx]) else 25.0,
+                macd=float(indicators['macd'][current_idx]) if not np.isnan(indicators['macd'][current_idx]) else 0.0,
+                macd_signal=float(indicators['macd_signal'][current_idx]) if not np.isnan(indicators['macd_signal'][current_idx]) else 0.0,
+                macd_histogram=float(indicators['macd_histogram'][current_idx]) if not np.isnan(indicators['macd_histogram'][current_idx]) else 0.0,
+                ma_fast=ma_fast_value,
+                ma_slow=ma_slow_value,
+                ma_trend=float(indicators['ma_trend'][current_idx]) if not np.isnan(indicators['ma_trend'][current_idx]) else ma_slow_value,
+                vwap=float(indicators['vwap'][current_idx]) if not np.isnan(indicators['vwap'][current_idx]) else float(df['close'].iloc[current_idx]),
+                bias=bias,
+                phase=phase,
+                market_strength=market_strength,
+                structure=structure,
+                order_blocks=order_blocks,
+                fair_value_gaps=fvgs,
+                liquidity_zones=liquidity_zones,
+                support_zones=[z for z in liquidity_zones if 'support' in z['type']],
+                resistance_zones=[z for z in liquidity_zones if 'resistance' in z['type']],
+                manipulation_signals=manipulation_signals,
+                danger_zones=danger_zones
+            )
+            
+            return ctx
+        except Exception as e:
+            logger.error(f"Error in analyze_market: {e}")
+            # إرجاع سياق افتراضي في حالة الخطأ
+            return TradingContext(
+                price=float(df['close'].iloc[-1]),
+                volume=float(df['volume'].iloc[-1]),
+                volume_ma=float(df['volume'].iloc[-1]),
+                volume_ratio=1.0,
+                volume_zscore=0.0,
+                atr=0.0,
+                rsi=50.0,
+                rsi_ma=50.0,
+                adx=20.0,
+                di_plus=25.0,
+                di_minus=25.0,
+                macd=0.0,
+                macd_signal=0.0,
+                macd_histogram=0.0,
+                ma_fast=float(df['close'].iloc[-1]),
+                ma_slow=float(df['close'].iloc[-1]),
+                ma_trend=float(df['close'].iloc[-1]),
+                vwap=float(df['close'].iloc[-1]),
+                bias=MarketBias.NEUTRAL,
+                phase=MarketPhase.CHOP,
+                market_strength=5.0,
+                structure=MarketStructure(),
+                order_blocks=[],
+                fair_value_gaps=[],
+                liquidity_zones=[],
+                support_zones=[],
+                resistance_zones=[],
+                manipulation_signals=[],
+                danger_zones=[]
+            )
     
     def _determine_bias(self, indicators: Dict, df: pd.DataFrame, idx: int) -> MarketBias:
         """تحديد تحيز السوق"""
-        ma_fast = indicators['ma_fast'].iloc[idx]
-        ma_slow = indicators['ma_slow'].iloc[idx]
-        ma_trend = indicators['ma_trend'].iloc[idx]
-        price = df['close'].iloc[idx]
-        
-        # قواعد التحيز
-        if price > ma_fast > ma_slow > ma_trend:
-            return MarketBias.STRONG_BULL
-        elif price > ma_fast > ma_slow:
-            return MarketBias.BULL
-        elif price < ma_fast < ma_slow < ma_trend:
-            return MarketBias.STRONG_BEAR
-        elif price < ma_fast < ma_slow:
-            return MarketBias.BEAR
-        else:
+        try:
+            ma_fast = indicators['ma_fast'][idx] if idx < len(indicators['ma_fast']) and not np.isnan(indicators['ma_fast'][idx]) else float(df['close'].iloc[idx])
+            ma_slow = indicators['ma_slow'][idx] if idx < len(indicators['ma_slow']) and not np.isnan(indicators['ma_slow'][idx]) else float(df['close'].iloc[idx])
+            ma_trend = indicators['ma_trend'][idx] if idx < len(indicators['ma_trend']) and not np.isnan(indicators['ma_trend'][idx]) else ma_slow
+            price = df['close'].iloc[idx]
+            
+            # قواعد التحيز
+            if price > ma_fast > ma_slow > ma_trend:
+                return MarketBias.STRONG_BULL
+            elif price > ma_fast > ma_slow:
+                return MarketBias.BULL
+            elif price < ma_fast < ma_slow < ma_trend:
+                return MarketBias.STRONG_BEAR
+            elif price < ma_fast < ma_slow:
+                return MarketBias.BEAR
+            else:
+                return MarketBias.NEUTRAL
+        except:
             return MarketBias.NEUTRAL
     
     def _determine_phase(self, indicators: Dict, structure: MarketStructure, idx: int) -> MarketPhase:
         """تحديد طور السوق"""
-        adx = indicators['adx'].iloc[idx]
-        volume_ratio = indicators['volume_ratio'].iloc[idx]
-        di_plus = indicators['di_plus'].iloc[idx]
-        di_minus = indicators['di_minus'].iloc[idx]
-        
-        if adx < 20 and volume_ratio < 1.2:
-            return MarketPhase.CHOP
-        elif adx > 25 and di_plus > di_minus:
-            return MarketPhase.MARKUP
-        elif adx > 25 and di_minus > di_plus:
-            return MarketPhase.MARKDOWN
-        elif volume_ratio > 1.5 and structure.last_bos:
-            return MarketPhase.BREAKOUT
-        elif structure.last_choch:
-            return MarketPhase.REVERSAL
-        elif volume_ratio > 1.3 and abs(di_plus - di_minus) < 5:
-            return MarketPhase.ACCUMULATION if di_plus > di_minus else MarketPhase.DISTRIBUTION
-        else:
+        try:
+            adx = indicators['adx'][idx] if idx < len(indicators['adx']) and not np.isnan(indicators['adx'][idx]) else 20.0
+            volume_ratio = indicators['volume_ratio'][idx] if idx < len(indicators['volume_ratio']) and not np.isnan(indicators['volume_ratio'][idx]) else 1.0
+            di_plus = indicators['di_plus'][idx] if idx < len(indicators['di_plus']) and not np.isnan(indicators['di_plus'][idx]) else 25.0
+            di_minus = indicators['di_minus'][idx] if idx < len(indicators['di_minus']) and not np.isnan(indicators['di_minus'][idx]) else 25.0
+            
+            if adx < 20 and volume_ratio < 1.2:
+                return MarketPhase.CHOP
+            elif adx > 25 and di_plus > di_minus:
+                return MarketPhase.MARKUP
+            elif adx > 25 and di_minus > di_plus:
+                return MarketPhase.MARKDOWN
+            elif volume_ratio > 1.5 and structure.last_bos:
+                return MarketPhase.BREAKOUT
+            elif structure.last_choch:
+                return MarketPhase.REVERSAL
+            elif volume_ratio > 1.3 and abs(di_plus - di_minus) < 5:
+                return MarketPhase.ACCUMULATION if di_plus > di_minus else MarketPhase.DISTRIBUTION
+            else:
+                return MarketPhase.CHOP
+        except:
             return MarketPhase.CHOP
     
     def _calculate_market_strength(self, indicators: Dict, structure: MarketStructure, idx: int) -> float:
         """حساب قوة السوق"""
-        strength = 0.0
-        
-        # ADX (30%)
-        adx = indicators['adx'].iloc[idx]
-        strength += min(3.0, adx / 50 * 3)
-        
-        # Volume (30%)
-        volume_ratio = indicators['volume_ratio'].iloc[idx]
-        strength += min(3.0, volume_ratio * 1.5)
-        
-        # Trend Structure (20%)
-        if structure.trend != "neutral":
-            strength += 2.0
-        
-        # Momentum (20%)
-        macd_hist = abs(indicators['macd_histogram'].iloc[idx])
-        strength += min(2.0, macd_hist * 10)
-        
-        return min(10.0, strength)
+        try:
+            strength = 0.0
+            
+            # ADX (30%)
+            adx = indicators['adx'][idx] if idx < len(indicators['adx']) and not np.isnan(indicators['adx'][idx]) else 20.0
+            strength += min(3.0, adx / 50 * 3)
+            
+            # Volume (30%)
+            volume_ratio = indicators['volume_ratio'][idx] if idx < len(indicators['volume_ratio']) and not np.isnan(indicators['volume_ratio'][idx]) else 1.0
+            strength += min(3.0, volume_ratio * 1.5)
+            
+            # Trend Structure (20%)
+            if structure.trend != "neutral":
+                strength += 2.0
+            
+            # Momentum (20%)
+            macd_hist = abs(indicators['macd_histogram'][idx]) if idx < len(indicators['macd_histogram']) and not np.isnan(indicators['macd_histogram'][idx]) else 0.0
+            strength += min(2.0, macd_hist * 10)
+            
+            return min(10.0, strength)
+        except:
+            return 5.0
     
     def _detect_danger_zones(self, indicators: Dict, df: pd.DataFrame, idx: int) -> List[str]:
         """كشف المناطق الخطرة"""
         dangers = []
         
-        # RSI في أقصى المدى
-        rsi = indicators['rsi'].iloc[idx]
-        if rsi > 85 or rsi < 15:
-            dangers.append(f"RSI_EXTREME_{rsi:.1f}")
-        
-        # حجم ضعيف جدًا
-        volume_ratio = indicators['volume_ratio'].iloc[idx]
-        if volume_ratio < 0.5:
-            dangers.append(f"LOW_VOLUME_{volume_ratio:.1f}")
-        
-        # ADX ضعيف مع تقلبات كبيرة
-        adx = indicators['adx'].iloc[idx]
-        atr = indicators['atr'].iloc[idx]
-        price = df['close'].iloc[idx]
-        
-        if adx < 15 and atr / price * 100 > 1.5:
-            dangers.append(f"HIGH_VOLATILITY_CHOP")
-        
-        # اختراق كاذب حديث
-        if len(df) > 5:
-            recent_high = df['high'].iloc[idx-5:idx].max()
-            recent_low = df['low'].iloc[idx-5:idx].min()
+        try:
+            # RSI في أقصى المدى
+            rsi = indicators['rsi'][idx] if idx < len(indicators['rsi']) and not np.isnan(indicators['rsi'][idx]) else 50.0
+            if rsi > 85 or rsi < 15:
+                dangers.append(f"RSI_EXTREME_{rsi:.1f}")
             
-            if price > recent_high * 1.01 or price < recent_low * 0.99:
-                if volume_ratio < 1.0:
-                    dangers.append("FAKE_BREAKOUT_SUSPECTED")
+            # حجم ضعيف جدًا
+            volume_ratio = indicators['volume_ratio'][idx] if idx < len(indicators['volume_ratio']) and not np.isnan(indicators['volume_ratio'][idx]) else 1.0
+            if volume_ratio < 0.5:
+                dangers.append(f"LOW_VOLUME_{volume_ratio:.1f}")
+            
+            # ADX ضعيف مع تقلبات كبيرة
+            adx = indicators['adx'][idx] if idx < len(indicators['adx']) and not np.isnan(indicators['adx'][idx]) else 20.0
+            atr = indicators['atr'][idx] if idx < len(indicators['atr']) and not np.isnan(indicators['atr'][idx]) else 0.0
+            price = df['close'].iloc[idx]
+            
+            if adx < 15 and atr / price * 100 > 1.5:
+                dangers.append(f"HIGH_VOLATILITY_CHOP")
+            
+            # اختراق كاذب حديث
+            if len(df) > 5:
+                recent_high = df['high'].iloc[idx-5:idx].max()
+                recent_low = df['low'].iloc[idx-5:idx].min()
+                
+                if price > recent_high * 1.01 or price < recent_low * 0.99:
+                    if volume_ratio < 1.0:
+                        dangers.append("FAKE_BREAKOUT_SUSPECTED")
+        except:
+            pass
         
         return dangers
     
@@ -1527,39 +1724,46 @@ class UltimateSignalGenerator:
         """توليد إشارات ذكية متكاملة"""
         signals = []
         
-        # تحليل السوق أولاً
-        ctx = self.analyze_market(df)
-        
-        # 1. إشارات المناطق الذهبية
-        golden_signals = self._generate_golden_signals(df, ctx)
-        signals.extend(golden_signals)
-        
-        # 2. إشارات Break of Structure
-        bos_signals = self._generate_bos_signals(df, ctx)
-        signals.extend(bos_signals)
-        
-        # 3. إشارات Retest
-        retest_signals = self._generate_retest_signals(df, ctx)
-        signals.extend(retest_signals)
-        
-        # 4. إشارات Trend Following
-        trend_signals = self._generate_trend_signals(df, ctx)
-        signals.extend(trend_signals)
-        
-        # 5. تقييم جميع الإشارات بواسطة المجلس
-        evaluated_signals = []
-        for signal in signals:
-            evaluation = self.council.evaluate_signal(signal, ctx, df)
+        try:
+            # تحليل السوق أولاً
+            ctx = self.analyze_market(df)
             
-            if evaluation['approved']:
-                signal.confidence = evaluation['confidence']
-                signal.reasons.extend(evaluation['reasons'])
-                evaluated_signals.append(signal)
-        
-        # حفظ آخر الإشارات
-        self.last_signals.extend(evaluated_signals[:3])
-        
-        return evaluated_signals
+            # 1. إشارات المناطق الذهبية
+            golden_signals = self._generate_golden_signals(df, ctx)
+            signals.extend(golden_signals)
+            
+            # 2. إشارات Break of Structure
+            bos_signals = self._generate_bos_signals(df, ctx)
+            signals.extend(bos_signals)
+            
+            # 3. إشارات Retest
+            retest_signals = self._generate_retest_signals(df, ctx)
+            signals.extend(retest_signals)
+            
+            # 4. إشارات Trend Following
+            trend_signals = self._generate_trend_signals(df, ctx)
+            signals.extend(trend_signals)
+            
+            # 5. تقييم جميع الإشارات بواسطة المجلس
+            evaluated_signals = []
+            for signal in signals:
+                try:
+                    evaluation = self.council.evaluate_signal(signal, ctx, df)
+                    
+                    if evaluation['approved']:
+                        signal.confidence = evaluation['confidence']
+                        signal.reasons.extend(evaluation['reasons'])
+                        evaluated_signals.append(signal)
+                except Exception as e:
+                    logger.error(f"Error evaluating signal: {e}")
+            
+            # حفظ آخر الإشارات
+            self.last_signals.extend(evaluated_signals[:3])
+            
+            return evaluated_signals
+        except Exception as e:
+            logger.error(f"Error generating signals: {e}")
+            return []
     
     def _generate_golden_signals(self, df: pd.DataFrame, ctx: TradingContext) -> List[SmartSignal]:
         """توليد إشارات المناطق الذهبية"""
@@ -2345,7 +2549,7 @@ class UltimateDogeProBot:
                 indicators = {
                     'rsi': ctx.rsi,
                     'adx': ctx.adx,
-                    'macd': ctx.macd_histogram,
+                    'macd_histogram': ctx.macd_histogram,
                     'ma_fast': ctx.ma_fast,
                     'ma_slow': ctx.ma_slow,
                     'structure': {
