@@ -476,49 +476,54 @@ def tbe_score_entry(htf_ctx, daily_open_ctx, indicators, zone, chop_penalty):
     """
     حساب درجة الدخول بناءً على السياق الكلي
     """
-    score = 5.0  # درجة أساسية
-    
-    # HTF Context
-    if htf_ctx.get("trend") == "bull":
-        if zone["type"] in ["FVG", "OB"]:  # BUY zones
-            score += TBE_HTF_WEIGHT
-        else:
-            score -= 1.0
-    elif htf_ctx.get("trend") == "bear":
-        if zone["type"] in ["FVG", "OB"]:  # SELL zones
-            score += TBE_HTF_WEIGHT
-        else:
-            score -= 1.0
-    
-    # Daily Open Bias
-    current_price = indicators.get('price', 0)
-    daily_open = daily_open_ctx.get('open', current_price)
-    
-    if current_price > daily_open:
-        score += 1.0  # انحياز للشراء
-    elif current_price < daily_open:
-        score += 1.0  # انحياز للبيع
-    
-    # مؤشر RSI
-    rsi = indicators.get('rsi', 50)
-    if rsi > 55:
-        score += 0.5
-    elif rsi < 45:
-        score += 0.5
-    
-    # مؤشر التدفق (إذا كان متاحاً)
-    flow = indicators.get('flow', {})
-    if flow.get('ok'):
-        if flow.get('delta_z', 0) > 0.3:
-            score += TBE_FLOW_WEIGHT
-        elif flow.get('delta_z', 0) < -0.3:
-            score += TBE_FLOW_WEIGHT
-    
-    # عقوبة التداول في نطاق جانبي على HTF
-    if chop_penalty and htf_ctx.get("chop", False):
-        score -= 2.0
-    
-    return max(0, score)  # التأكد من عدم وجود درجات سلبية
+    try:
+        score = 5.0  # درجة أساسية
+        
+        # HTF Context
+        if htf_ctx.get("trend") == "bull":
+            if zone.get("type") in ["FVG", "OB"]:  # BUY zones
+                score += TBE_HTF_WEIGHT
+            else:
+                score -= 1.0
+        elif htf_ctx.get("trend") == "bear":
+            if zone.get("type") in ["FVG", "OB"]:  # SELL zones
+                score += TBE_HTF_WEIGHT
+            else:
+                score -= 1.0
+        
+        # Daily Open Bias
+        current_price = indicators.get('price', 0)
+        daily_open = daily_open_ctx.get('open', current_price)
+        
+        if current_price > daily_open:
+            score += 1.0  # انحياز للشراء
+        elif current_price < daily_open:
+            score += 1.0  # انحياز للبيع
+        
+        # مؤشر RSI
+        rsi = indicators.get('rsi', 50)
+        if rsi > 55:
+            score += 0.5
+        elif rsi < 45:
+            score += 0.5
+        
+        # مؤشر التدفق (إذا كان متاحاً)
+        flow = indicators.get('flow', {})
+        if flow.get('ok'):
+            delta_z = flow.get('delta_z', 0)
+            if delta_z > 0.3:
+                score += TBE_FLOW_WEIGHT
+            elif delta_z < -0.3:
+                score += TBE_FLOW_WEIGHT
+        
+        # عقوبة التداول في نطاق جانبي على HTF
+        if chop_penalty and htf_ctx.get("chop", False):
+            score -= 2.0
+        
+        return max(0, min(score, 10))  # التأكد من أن الدرجة بين 0 و 10
+    except Exception as e:
+        log_w(f"TBE score error: {e}")
+        return 5.0  # درجة متوسطة في حالة الخطأ
 
 def tbe_failfast_check(df, zone, side, entry_price, bars_in_trade):
     """
@@ -547,91 +552,104 @@ def tbe_update(df, htf_ctx, daily_open_ctx, indicators):
     """
     global TBE_STATE
     
-    # إذا كان في حالة REHUNT، تحقق من انتهاء الوقت
-    if TBE_STATE["state"] == "REHUNT":
-        if TBE_STATE["ttl_bars"] <= 0:
-            TBE_STATE["state"] = "IDLE"
-            log_i("TBE: REHUNT cooldown finished")
-        else:
-            TBE_STATE["ttl_bars"] -= 1
-            return {"enter": False, "reason": "REHUNT_COOLDOWN", "stage": "REHUNT"}
+    # تهيئة القاموس الافتراضي
+    default_result = {"enter": False, "reason": "NO_TRIGGER", "stage": TBE_STATE["state"]}
     
-    # 1) حالة IDLE: ابحث عن Sweep
-    if TBE_STATE["state"] == "IDLE":
-        sweep = detect_sweep_tbe(df, indicators.get('atr', 0))
-        if sweep["ok"]:
-            TBE_STATE["state"] = "SWEPT"
-            TBE_STATE["dir"] = sweep["dir"]
-            TBE_STATE["sweep_level"] = sweep["level"]
-            TBE_STATE["created_at"] = len(df)
-            TBE_STATE["ttl_bars"] = 12
-            log_g(f"🎯 TBE SWEPT: {sweep['dir']} at {sweep['level']:.6f}")
-            return {"enter": False, "reason": "SWEPT", "stage": "SWEPT", "dir": sweep["dir"]}
-    
-    # 2) حالة SWEPT: ابحث عن كسر الهيكل (BOS/CHoCH)
-    elif TBE_STATE["state"] == "SWEPT":
-        if TBE_STATE["ttl_bars"] <= 0:
-            tbe_reset("EXPIRED_AFTER_SWEEP")
-            return {"enter": False, "reason": "EXPIRED_AFTER_SWEEP"}
+    try:
+        # إذا كان في حالة REHUNT، تحقق من انتهاء الوقت
+        if TBE_STATE["state"] == "REHUNT":
+            if TBE_STATE["ttl_bars"] <= 0:
+                TBE_STATE["state"] = "IDLE"
+                log_i("TBE: REHUNT cooldown finished")
+            else:
+                TBE_STATE["ttl_bars"] -= 1
+                return {"enter": False, "reason": "REHUNT_COOLDOWN", "stage": "REHUNT"}
         
-        bos = detect_bos_choc_tbe(df, dir_filter=TBE_STATE["dir"])
-        if bos["ok"] and bos["dir"] == TBE_STATE["dir"]:
-            TBE_STATE["state"] = "BROKEN"
-            TBE_STATE["break_level"] = bos["level"]
-            TBE_STATE["ttl_bars"] = 12
-            log_g(f"🎯 TBE BROKEN: {bos['dir']} at {bos['level']:.6f} ({bos['change_pct']:.2f}%)")
-            return {"enter": False, "reason": "STRUCTURE_SHIFT", "stage": "BROKEN", "dir": bos["dir"]}
+        # 1) حالة IDLE: ابحث عن Sweep
+        if TBE_STATE["state"] == "IDLE":
+            sweep = detect_sweep_tbe(df, indicators.get('atr', 0))
+            if sweep.get("ok"):
+                TBE_STATE["state"] = "SWEPT"
+                TBE_STATE["dir"] = sweep.get("dir")
+                TBE_STATE["sweep_level"] = sweep.get("level")
+                TBE_STATE["created_at"] = len(df)
+                TBE_STATE["ttl_bars"] = 12
+                log_g(f"🎯 TBE SWEPT: {sweep.get('dir')} at {sweep.get('level', 0):.6f}")
+                return {"enter": False, "reason": "SWEPT", "stage": "SWEPT", "dir": sweep.get("dir")}
         
-        TBE_STATE["ttl_bars"] -= 1
-    
-    # 3) حالة BROKEN: ابحث عن انعكاس الزخم ثم بناء المنطقة
-    elif TBE_STATE["state"] == "BROKEN":
-        if TBE_STATE["ttl_bars"] <= 0:
-            tbe_reset("EXPIRED_AFTER_BOS")
-            return {"enter": False, "reason": "EXPIRED_AFTER_BOS"}
-        
-        mom = momentum_flip_tbe(df, indicators, dir_filter=TBE_STATE["dir"])
-        if mom["ok"] and mom["dir"] == TBE_STATE["dir"]:
-            zone = build_ob_or_fvg_tbe(df, dir_filter=TBE_STATE["dir"])
-            if zone["ok"]:
-                TBE_STATE["state"] = "WAIT_RETEST"
-                TBE_STATE["zone"] = zone
-                TBE_STATE["ttl_bars"] = TBE_ZONE_TTL_BARS
-                log_g(f"🎯 TBE ZONE: {zone['type']} at {zone['low']:.6f}-{zone['high']:.6f}")
-                return {"enter": False, "reason": "ZONE_CREATED", "stage": "WAIT_RETEST", "dir": TBE_STATE["dir"], "zone": zone}
-        
-        TBE_STATE["ttl_bars"] -= 1
-    
-    # 4) حالة WAIT_RETEST: انتظار عودة السعر للمنطقة مع رفض
-    elif TBE_STATE["state"] == "WAIT_RETEST":
-        if TBE_STATE["ttl_bars"] <= 0:
-            tbe_reset("EXPIRED_WAIT_RETEST")
-            return {"enter": False, "reason": "EXPIRED_WAIT_RETEST"}
-        
-        current_price = indicators.get('price', float(df['close'].iloc[-1]))
-        zone = TBE_STATE["zone"]
-        
-        # تحقق إذا كانت المنطقة في القائمة السوداء
-        if zone in TBE_STATE["blacklisted_zones"]:
-            tbe_reset("ZONE_BLACKLISTED")
-            return {"enter": False, "reason": "ZONE_BLACKLISTED"}
-        
-        if price_in_zone(current_price, zone) and rejection_ok(df, TBE_STATE["dir"]):
-            chop_penalty = htf_ctx.get("chop", False)
-            score = tbe_score_entry(htf_ctx, daily_open_ctx, indicators, zone, chop_penalty)
+        # 2) حالة SWEPT: ابحث عن كسر الهيكل (BOS/CHoCH)
+        elif TBE_STATE["state"] == "SWEPT":
+            if TBE_STATE["ttl_bars"] <= 0:
+                tbe_reset("EXPIRED_AFTER_SWEEP")
+                return {"enter": False, "reason": "EXPIRED_AFTER_SWEEP"}
             
-            if score >= TBE_ENTRY_SCORE_MIN:
-                enter_side = TBE_STATE["dir"]
-                enter_zone = zone
-                reason = "TBE_ENTRY"
-                log_g(f"🎯 TBE ENTRY TRIGGERED: {enter_side} score={score:.1f} zone={zone['type']}")
-                tbe_reset("ENTERED")
-                return {"enter": True, "side": enter_side, "zone": enter_zone, 
-                        "score": score, "reason": reason, "stage": "ENTRY"}
+            bos = detect_bos_choc_tbe(df, dir_filter=TBE_STATE["dir"])
+            if bos.get("ok") and bos.get("dir") == TBE_STATE["dir"]:
+                TBE_STATE["state"] = "BROKEN"
+                TBE_STATE["break_level"] = bos.get("level")
+                TBE_STATE["ttl_bars"] = 12
+                log_g(f"🎯 TBE BROKEN: {bos.get('dir')} at {bos.get('level', 0):.6f} ({bos.get('change_pct', 0):.2f}%)")
+                return {"enter": False, "reason": "STRUCTURE_SHIFT", "stage": "BROKEN", "dir": bos.get("dir")}
+            
+            TBE_STATE["ttl_bars"] -= 1
         
-        TBE_STATE["ttl_bars"] -= 1
-    
-    return {"enter": False, "reason": "NO_TRIGGER", "stage": TBE_STATE["state"]}
+        # 3) حالة BROKEN: ابحث عن انعكاس الزخم ثم بناء المنطقة
+        elif TBE_STATE["state"] == "BROKEN":
+            if TBE_STATE["ttl_bars"] <= 0:
+                tbe_reset("EXPIRED_AFTER_BOS")
+                return {"enter": False, "reason": "EXPIRED_AFTER_BOS"}
+            
+            mom = momentum_flip_tbe(df, indicators, dir_filter=TBE_STATE["dir"])
+            if mom.get("ok") and mom.get("dir") == TBE_STATE["dir"]:
+                zone = build_ob_or_fvg_tbe(df, dir_filter=TBE_STATE["dir"])
+                if zone.get("ok"):
+                    TBE_STATE["state"] = "WAIT_RETEST"
+                    TBE_STATE["zone"] = zone
+                    TBE_STATE["ttl_bars"] = TBE_ZONE_TTL_BARS
+                    log_g(f"🎯 TBE ZONE: {zone.get('type')} at {zone.get('low', 0):.6f}-{zone.get('high', 0):.6f}")
+                    return {"enter": False, "reason": "ZONE_CREATED", "stage": "WAIT_RETEST", "dir": TBE_STATE["dir"], "zone": zone}
+            
+            TBE_STATE["ttl_bars"] -= 1
+        
+        # 4) حالة WAIT_RETEST: انتظار عودة السعر للمنطقة مع رفض
+        elif TBE_STATE["state"] == "WAIT_RETEST":
+            if TBE_STATE["ttl_bars"] <= 0:
+                tbe_reset("EXPIRED_WAIT_RETEST")
+                return {"enter": False, "reason": "EXPIRED_WAIT_RETEST"}
+            
+            current_price = indicators.get('price', float(df['close'].iloc[-1]))
+            zone = TBE_STATE.get("zone")
+            
+            if not zone:
+                tbe_reset("NO_ZONE")
+                return {"enter": False, "reason": "NO_ZONE"}
+            
+            # تحقق إذا كانت المنطقة في القائمة السوداء
+            if zone in TBE_STATE["blacklisted_zones"]:
+                tbe_reset("ZONE_BLACKLISTED")
+                return {"enter": False, "reason": "ZONE_BLACKLISTED"}
+            
+            if price_in_zone(current_price, zone) and rejection_ok(df, TBE_STATE["dir"]):
+                chop_penalty = htf_ctx.get("chop", False)
+                score = tbe_score_entry(htf_ctx, daily_open_ctx, indicators, zone, chop_penalty)
+                
+                if score >= TBE_ENTRY_SCORE_MIN:
+                    enter_side = TBE_STATE["dir"]
+                    enter_zone = zone
+                    reason = "TBE_ENTRY"
+                    log_g(f"🎯 TBE ENTRY TRIGGERED: {enter_side} score={score:.1f} zone={zone.get('type')}")
+                    tbe_reset("ENTERED")
+                    return {"enter": True, "side": enter_side, "zone": enter_zone, 
+                            "score": score, "reason": reason, "stage": "ENTRY"}
+            
+            TBE_STATE["ttl_bars"] -= 1
+        
+        return default_result
+        
+    except Exception as e:
+        log_w(f"TBE update error: {e}")
+        tbe_reset(f"ERROR: {str(e)[:50]}")
+        return default_result
 
 # =================== HTF & DAILY OPEN CONTEXT ===================
 last_htf_update = 0
@@ -720,22 +738,30 @@ def fetch_ohlcv_generic(exchange, symbol, timeframe, limit):
         return pd.DataFrame()
 
 def get_htf_ctx():
-    """الحصول على سياق HTF مع التخزين المؤقت"""
+    """الحصول على سياق HTF مع التخزين المؤقت ومعالجة الأخطاء"""
     global last_htf_update, htf_ctx_cache
-    now = time.time()
-    if now - last_htf_update > 900:  # تحديث كل 15 دقيقة
-        htf_ctx_cache = fetch_htf_context(ex, SYMBOL, "1h", 200)
-        last_htf_update = now
-    return htf_ctx_cache
+    try:
+        now = time.time()
+        if now - last_htf_update > 900:  # تحديث كل 15 دقيقة
+            htf_ctx_cache = fetch_htf_context(ex, SYMBOL, "1h", 200)
+            last_htf_update = now
+        return htf_ctx_cache or {"trend": "none", "chop": False, "ema200": 0, "ma_slope": 0}
+    except Exception as e:
+        log_w(f"get_htf_ctx error: {e}")
+        return {"trend": "none", "chop": False, "ema200": 0, "ma_slope": 0}
 
 def get_daily_open_ctx():
-    """الحصول على افتتاح اليوم مع التخزين المؤقت"""
+    """الحصول على افتتاح اليوم مع التخزين المؤقت ومعالجة الأخطاء"""
     global last_daily_open_update, daily_open_cache
-    now = time.time()
-    if now - last_daily_open_update > 3600:  # تحديث كل ساعة
-        daily_open_cache = fetch_daily_open_context(ex, SYMBOL)
-        last_daily_open_update = now
-    return daily_open_cache or {"open": 0, "high": 0, "low": 0, "range": 0}
+    try:
+        now = time.time()
+        if now - last_daily_open_update > 3600:  # تحديث كل ساعة
+            daily_open_cache = fetch_daily_open_context(ex, SYMBOL)
+            last_daily_open_update = now
+        return daily_open_cache or {"open": 0, "high": 0, "low": 0, "range": 0}
+    except Exception as e:
+        log_w(f"get_daily_open_ctx error: {e}")
+        return {"open": 0, "high": 0, "low": 0, "range": 0}
 
 # =================== SMC/ICT TOOLS ===================
 def _fib_zone(last_impulse_low, last_impulse_high):
@@ -2188,6 +2214,8 @@ def trade_loop_enhanced():
 
             sig = None
             trade_decision = None
+            tbe_data = None
+            zone = None
 
             # ⚡ فحص الفرص السريعة أولاً
             fast_opp = detect_fast_opportunity(df, council_data)
@@ -2203,13 +2231,19 @@ def trade_loop_enhanced():
             # Trend Birth Engine - إذا لم تكن هناك فرصة سريعة
             elif TBE_ENABLED and not STATE["open"] and reason is None:
                 tbe_decision = tbe_update(df, htf_ctx, daily_open_ctx, ind)
-                if tbe_decision["enter"]:
+                if tbe_decision.get("enter"):
                     sig = tbe_decision["side"].lower()
                     trade_decision = {**tbe_decision, "source": "TBE"}
+                    zone = tbe_decision.get("zone")
+                    tbe_data = {
+                        "stage": tbe_decision.get("stage", "ENTRY"),
+                        "score": tbe_decision.get("score", 0),
+                        "reason": tbe_decision.get("reason", "")
+                    }
                     log_g(f"🎯 TBE Decision: {tbe_decision['side']} score={tbe_decision.get('score',0):.1f}")
             
             # Council Elite - كخيار احتياطي
-            elif not STATE["open"] and reason is None and (not trade_decision or not trade_decision["enter"]):
+            elif not STATE["open"] and reason is None and (not trade_decision or not trade_decision.get("enter")):
                 if council_data["score_b"] >= COUNCIL_STRONG_TH and council_data["b"] > council_data["s"]:
                     sig = "buy"
                     trade_decision = {"enter": True, "side": "BUY", "reason": "COUNCIL_BUY", "source": "COUNCIL"}
@@ -2217,30 +2251,27 @@ def trade_loop_enhanced():
                     sig = "sell"
                     trade_decision = {"enter": True, "side": "SELL", "reason": "COUNCIL_SELL", "source": "COUNCIL"}
             
-            if sig and trade_decision and trade_decision["enter"]:
+            # تنفيذ الدخول إذا كان هناك إشارة
+            if sig and trade_decision and trade_decision.get("enter"):
                 qty = compute_size(bal, px or info["price"])
                 if qty > 0:
                     # إذا كان القرار من TBE، نمرر المنطقة
                     if trade_decision.get("source") == "TBE":
-                        zone = trade_decision.get("zone")
-                        tbe_data = {
-                            "stage": trade_decision.get("stage", "ENTRY"),
-                            "score": trade_decision.get("score", 0),
-                            "reason": trade_decision.get("reason", "")
-                        }
                         ok = open_market(sig, qty, px or info["price"], zone, tbe_data)
                         if ok:
-                            log_i(f"✅ TBE entry: {sig.upper()} - score={tbe_data['score']:.1f}")
+                            log_i(f"✅ TBE entry: {sig.upper()} - score={tbe_data.get('score',0):.1f}")
                     else:
                         ok = open_market(sig, qty, px or info["price"])
                         if ok:
                             log_i(f"✅ {'FAST' if trade_decision.get('source') == 'FAST' else 'Council'} entry: {sig.upper()}")
                 else:
                     reason = "qty<=0"
+                    log_w(f"⚠️ Cannot enter: quantity is zero or negative")
             
             # 🔍 لوج التشخيص إذا لم يتم الدخول
             if not STATE["open"] and not sig:
-                print(f"🔍 لا توجد صفقة | السبب: {reason or trade_decision.get('reason')} | الانتشار: {spread_bps}", flush=True)
+                reason_str = reason or (trade_decision.get('reason') if trade_decision else "No signal")
+                print(f"🔍 لا توجد صفقة | السبب: {reason_str} | الانتشار: {spread_bps}", flush=True)
 
             # ⚡ نوم أقصر بين الدورات
             sleep_time = 0.5 if time_to_candle_close(df) <= 30 else BASE_SLEEP
@@ -2258,7 +2289,7 @@ def pretty_snapshot(bal, info, ind, spread_bps, reason=None, df=None):
     if LOG_LEGACY:
         left_s = time_to_candle_close(df) if df is not None else 0
         print(colored("─"*100,"cyan"))
-        print(colored(f"📊 {SYMBOL} {INTERVAL} • {'LIVE' if MODE_LIVE else 'PAPER'} • {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC","cyan"))
+        print(colored(f"📊 {SYMBOL} {INTERVAL} • {'LIVE' if MODE_LIVE else 'PAPER'} • {datetime.utcnow().strftime('%Y-%m-d %H:%M:%S')} UTC","cyan"))
         print(colored("─"*100,"cyan"))
         print("📈 INDICATORS & RF")
         print(f"   💲 Price {fmt(info.get('price'))} | RF filt={fmt(info.get('filter'))}  hi={fmt(info.get('hi'))} lo={fmt(info.get('lo'))}")
