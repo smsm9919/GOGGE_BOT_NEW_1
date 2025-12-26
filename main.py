@@ -8,6 +8,7 @@ RF Futures Bot — RF-LIVE ONLY (BingX Perp via CCXT)
 • ENHANCED VERSION - More Trades & Faster Execution
 • TREND BIRTH ENGINE v1 - اصطياد بدايات الترند
 • MID TREND SYSTEM - تداول الترندات المتوسطة والضعيفة
+• INTEGRATED ADVANCED SYSTEM - EMA200 + Ichimoku + Volume Profile Pipeline
 """
 
 import os, time, math, random, signal, sys, traceback, logging, json
@@ -35,6 +36,7 @@ PORT = int(os.getenv("PORT", 5000))
 # ==== Run mode / Logging toggles ====
 LOG_LEGACY = False
 LOG_ADDONS = True
+LOG_INTEGRATED_SYSTEM = True  # New: Integrated system logging
 
 # ==== Execution Switches ====
 EXECUTE_ORDERS = True
@@ -42,7 +44,7 @@ SHADOW_MODE_DASHBOARD = False
 DRY_RUN = False
 
 # ==== Addon: Logging + Recovery Settings ====
-BOT_VERSION = "DOGE Council ELITE v7.0 — Enhanced Fast Trading + Trend Birth Engine + Mid Trend System"
+BOT_VERSION = "DOGE Council ELITE v8.0 — Integrated Advanced System (EMA200 + Ichimoku + Volume Profile)"
 print("🔁 Booting:", BOT_VERSION, flush=True)
 
 STATE_PATH = "./bot_state.json"
@@ -148,6 +150,43 @@ NEAR_CLOSE_S = 0.5       # ⬇️ كان 1 ثانية - تخفيض 50%
 # Spread - RELAXED FOR MORE TRADES
 MAX_SPREAD_BPS = 15.0    # ⬆️ كان 6.0 - زيادة 150%
 
+# =================== INTEGRATED ADVANCED SYSTEM SETTINGS ===================
+INTEGRATED_SYSTEM_ENABLED = True
+USE_EMA200_FILTER = True
+USE_ICHIMOKU_REGIME = True
+USE_VOLUME_PROFILE_LOCATION = True
+
+# Volume Profile Settings
+VP_BINS = 24
+VP_LOOKBACK_PERIOD = 200
+VP_UPDATE_EVERY_N_BARS = 30
+
+# Ichimoku Settings
+ICHIMOKU_TENKAN = 9
+ICHIMOKU_KIJUN = 26
+ICHIMOKU_SENKOU = 52
+ICHIMOKU_DISPLACEMENT = 26
+
+# EMA Settings
+EMA_PERIOD = 200
+SMA_PERIOD = 50
+
+# Regime Thresholds
+REGIME_TREND_STRONG_ADX_MIN = 35
+REGIME_TREND_WEAK_ADX_MIN = 20
+REGIME_RANGE_ADX_MAX = 18
+
+# Location Filter Thresholds
+LOCATION_EXCELLENT_DISTANCE = 0.5  # %
+LOCATION_GOOD_DISTANCE = 0.3       # %
+
+# Integrated Decision Weights
+WEIGHT_TBE = 2.0
+WEIGHT_COUNCIL = 1.5
+WEIGHT_MID_TREND = 1.2
+WEIGHT_LOCATION_EXCELLENT = 2.0
+WEIGHT_LOCATION_GOOD = 1.0
+
 # =================== MID TREND SETTINGS ===================
 MID_TREND_ADX_MIN = 20.0          # الحد الأدنى لـ ADX للترند المتوسط
 MID_TREND_ADX_MAX = 30.0          # الحد الأقصى لـ ADX للترند المتوسط
@@ -187,11 +226,16 @@ def log_e(msg): print(f"❌ {msg}", flush=True)
 
 def log_banner(text): print(f"\n{'—'*12} {text} {'—'*12}\n", flush=True)
 
+def log_integrated_system(msg):
+    """تسجيل خاص بالنظام المتكامل"""
+    if LOG_INTEGRATED_SYSTEM:
+        print(f"🧠 {msg}", flush=True)
+
 # =============== TRADE OPEN LOG (BUY=🟢 / SELL=🔴) ===============
 def log_trade_open(*, side:str, price:float, qty:float, leverage:int,
                    source:str, mode:str, risk_alloc:float,
                    council:dict=None, gz:dict=None, mgmt:dict=None,
-                   tbe_data:dict=None):
+                   tbe_data:dict=None, regime:str=None, location_quality:str=None):
     lamp = "🟢 BUY" if side.lower().startswith("b") else "🔴 SELL"
     p = f"{float(price):.6f}"
     q = f"{float(qty):.4f}"
@@ -226,7 +270,10 @@ def log_trade_open(*, side:str, price:float, qty:float, leverage:int,
         score = tbe_data.get("score", 0)
         tbe_part = f" | TBE={stage} s={score:.1f}"
 
-    msg = f"{lamp} • {mode_icon} {mode.upper()} • {source} | Price={p} Qty={q} Lev={lev} Risk={ra}{c_part}{gz_part}{mg_part}{tbe_part}"
+    regime_part = f" | Regime={regime}" if regime else ""
+    location_part = f" | Location={location_quality}" if location_quality else ""
+
+    msg = f"{lamp} • {mode_icon} {mode.upper()} • {source} | Price={p} Qty={q} Lev={lev} Risk={ra}{c_part}{gz_part}{mg_part}{tbe_part}{regime_part}{location_part}"
 
     try:
         (log_g if side.lower().startswith("b") else log_w)(msg)
@@ -250,6 +297,648 @@ def load_state() -> dict:
     except Exception as e:
         log_w(f"state load failed: {e}")
     return {}
+
+# =================== INTEGRATED ADVANCED INDICATORS ===================
+
+# 1) EMA200 + SMA System
+def compute_trend_filters(df, ema_period=EMA_PERIOD, sma_period=SMA_PERIOD):
+    """حساب فلاتر الاتجاه الأساسية"""
+    if len(df) < ema_period:
+        return {"ema200": 0, "sma50": 0, "trend": "none", "slope": 0, "price_vs_ema": 0}
+    
+    closes = df['close'].astype(float)
+    ema200 = closes.ewm(span=ema_period, adjust=False).mean().iloc[-1]
+    sma50 = closes.rolling(sma_period).mean().iloc[-1]
+    
+    # حساب ميل EMA
+    ema_prev = closes.ewm(span=ema_period, adjust=False).mean().iloc[-5] if len(df) >= 5 else ema200
+    ema_slope = ((ema200 - ema_prev) / ema_prev * 100) if ema_prev != 0 else 0
+    
+    # تحديد الاتجاه
+    current_price = closes.iloc[-1]
+    trend = "none"
+    
+    if current_price > ema200 and ema_slope > 0:
+        trend = "bull"
+    elif current_price < ema200 and ema_slope < 0:
+        trend = "bear"
+    
+    price_vs_ema = ((current_price - ema200) / ema200 * 100) if ema200 != 0 else 0
+    
+    return {
+        "ema200": ema200,
+        "sma50": sma50,
+        "trend": trend,
+        "slope": ema_slope,
+        "price_vs_ema": price_vs_ema,
+        "price_above_ema": current_price > ema200
+    }
+
+# 2) Ichimoku Cloud System
+def compute_ichimoku(df, tenkan=ICHIMOKU_TENKAN, kijun=ICHIMOKU_KIJUN, 
+                     senkou=ICHIMOKU_SENKOU, displacement=ICHIMOKU_DISPLACEMENT):
+    """حساب سحابة إيشيموكو الكاملة"""
+    if len(df) < senkou + displacement:
+        return {
+            "tenkan": 0, "kijun": 0, "senkou_a": 0, "senkou_b": 0,
+            "chikou": 0, "cloud_top": 0, "cloud_bottom": 0,
+            "regime": "none", "momentum": "none", "cloud_color": "neutral",
+            "price_above_cloud": False, "price_below_cloud": False,
+            "tenkan_vs_kijun": "none"
+        }
+    
+    high = df['high'].astype(float)
+    low = df['low'].astype(float)
+    close = df['close'].astype(float)
+    
+    # Tenkan (Conversion Line)
+    tenkan_high = high.rolling(tenkan).max()
+    tenkan_low = low.rolling(tenkan).min()
+    tenkan_line = (tenkan_high + tenkan_low) / 2
+    
+    # Kijun (Base Line)
+    kijun_high = high.rolling(kijun).max()
+    kijun_low = low.rolling(kijun).min()
+    kijun_line = (kijun_high + kijun_low) / 2
+    
+    # Senkou Span A (Leading Span A)
+    senkou_a = ((tenkan_line + kijun_line) / 2).shift(displacement)
+    
+    # Senkou Span B (Leading Span B)
+    senkou_high = high.rolling(senkou).max()
+    senkou_low = low.rolling(senkou).min()
+    senkou_b = ((senkou_high + senkou_low) / 2).shift(displacement)
+    
+    # Chikou (Lagging Span)
+    chikou = close.shift(-displacement)
+    
+    current_price = close.iloc[-1]
+    cloud_top = max(senkou_a.iloc[-1], senkou_b.iloc[-1])
+    cloud_bottom = min(senkou_a.iloc[-1], senkou_b.iloc[-1])
+    
+    # تحديد النظام (Regime)
+    regime = "none"
+    if current_price > cloud_top:
+        regime = "bull_strong"
+    elif current_price < cloud_bottom:
+        regime = "bear_strong"
+    elif cloud_bottom <= current_price <= cloud_top:
+        regime = "inside_cloud"
+    elif current_price > cloud_bottom and current_price < cloud_top:
+        regime = "near_cloud_edge"
+    
+    # تحديد الزخم (Momentum)
+    momentum = "none"
+    if tenkan_line.iloc[-1] > kijun_line.iloc[-1] and current_price > tenkan_line.iloc[-1]:
+        momentum = "bull_strong"
+    elif tenkan_line.iloc[-1] < kijun_line.iloc[-1] and current_price < tenkan_line.iloc[-1]:
+        momentum = "bear_strong"
+    elif tenkan_line.iloc[-1] > kijun_line.iloc[-1]:
+        momentum = "bull_weak"
+    elif tenkan_line.iloc[-1] < kijun_line.iloc[-1]:
+        momentum = "bear_weak"
+    
+    # لون السحابة
+    cloud_color = "green" if senkou_a.iloc[-1] > senkou_b.iloc[-1] else "red" if senkou_a.iloc[-1] < senkou_b.iloc[-1] else "neutral"
+    
+    return {
+        "tenkan": float(tenkan_line.iloc[-1]),
+        "kijun": float(kijun_line.iloc[-1]),
+        "senkou_a": float(senkou_a.iloc[-1]),
+        "senkou_b": float(senkou_b.iloc[-1]),
+        "chikou": float(chikou.iloc[-1]) if not pd.isna(chikou.iloc[-1]) else current_price,
+        "cloud_top": float(cloud_top),
+        "cloud_bottom": float(cloud_bottom),
+        "cloud_color": cloud_color,
+        "regime": regime,
+        "momentum": momentum,
+        "price_above_cloud": current_price > cloud_top,
+        "price_below_cloud": current_price < cloud_bottom,
+        "tenkan_vs_kijun": "bull" if tenkan_line.iloc[-1] > kijun_line.iloc[-1] else "bear",
+        "cloud_thickness": ((cloud_top - cloud_bottom) / cloud_bottom * 100) if cloud_bottom > 0 else 0
+    }
+
+# 3) Volume Profile System (Optimized)
+class VolumeProfileAnalyzer:
+    """محلل Volume Profile مع التخزين المؤقت"""
+    
+    def __init__(self, bins=VP_BINS, lookback_period=VP_LOOKBACK_PERIOD, update_every_n_bars=VP_UPDATE_EVERY_N_BARS):
+        self.bins = bins
+        self.lookback_period = lookback_period
+        self.update_every_n_bars = update_every_n_bars
+        self.cache = {}
+        self.last_update_bar = 0
+        
+    def calculate_vp(self, df):
+        """حساب Volume Profile (مخفف الأداء)"""
+        if len(df) < self.lookback_period:
+            return self._default_vp(df)
+        
+        # استخدام نافذة محددة فقط
+        window = df.iloc[-self.lookback_period:].copy()
+        
+        # حساب النطاق السعري
+        high_max = window['high'].astype(float).max()
+        low_min = window['low'].astype(float).min()
+        price_range = high_max - low_min
+        
+        if price_range == 0:
+            return self._default_vp(df)
+        
+        bin_size = price_range / self.bins
+        
+        # تجميع الحجم حسب الصندوق السعري
+        volume_by_bin = {}
+        for idx, row in window.iterrows():
+            price = (float(row['high']) + float(row['low']) + float(row['close'])) / 3  # Typical Price
+            volume = float(row['volume']) if 'volume' in row else 0
+            
+            bin_index = min(int((price - low_min) / bin_size), self.bins - 1)
+            volume_by_bin[bin_index] = volume_by_bin.get(bin_index, 0) + volume
+        
+        # إيجاد POC (أعلى حجم)
+        if not volume_by_bin:
+            return self._default_vp(df)
+            
+        poc_bin = max(volume_by_bin, key=volume_by_bin.get)
+        poc_price = low_min + (poc_bin + 0.5) * bin_size
+        poc_volume = volume_by_bin[poc_bin]
+        
+        # حساب VAH و VAL (أعلى 70% من الحجم)
+        total_volume = sum(volume_by_bin.values())
+        if total_volume == 0:
+            return self._default_vp(df)
+        
+        sorted_bins = sorted(volume_by_bin.items(), key=lambda x: x[1], reverse=True)
+        
+        cumulative_volume = 0
+        value_area_bins = []
+        
+        for bin_idx, volume in sorted_bins:
+            cumulative_volume += volume
+            value_area_bins.append(bin_idx)
+            if cumulative_volume >= 0.7 * total_volume:
+                break
+        
+        if not value_area_bins:
+            return self._default_vp(df)
+        
+        vah_bin = max(value_area_bins)
+        val_bin = min(value_area_bins)
+        
+        vah_price = low_min + (vah_bin + 0.5) * bin_size
+        val_price = low_min + (val_bin + 0.5) * bin_size
+        
+        return {
+            "poc": poc_price,
+            "vah": vah_price,
+            "val": val_price,
+            "range_high": high_max,
+            "range_low": low_min,
+            "poc_volume": poc_volume,
+            "total_volume": total_volume,
+            "value_area_percent": 70,
+            "price_range": price_range,
+            "bin_size": bin_size
+        }
+    
+    def _default_vp(self, df):
+        """قيم افتراضية عندما لا تكفي البيانات"""
+        current_price = float(df['close'].iloc[-1]) if len(df) > 0 else 0
+        return {
+            "poc": current_price,
+            "vah": current_price * 1.01,
+            "val": current_price * 0.99,
+            "range_high": current_price * 1.02,
+            "range_low": current_price * 0.98,
+            "poc_volume": 0,
+            "total_volume": 0,
+            "value_area_percent": 0,
+            "price_range": current_price * 0.04,
+            "bin_size": current_price * 0.001
+        }
+    
+    def get_vp_levels(self, df, bar_index):
+        """الحصول على مستويات Volume Profile مع التخزين المؤقت"""
+        cache_key = f"{bar_index}_{len(df)}"
+        
+        # تحديث كل N شمعة فقط
+        if (bar_index - self.last_update_bar >= self.update_every_n_bars or 
+            cache_key not in self.cache):
+            
+            vp_levels = self.calculate_vp(df)
+            self.cache = {cache_key: vp_levels}
+            self.last_update_bar = bar_index
+            return vp_levels
+        
+        return self.cache.get(cache_key, self._default_vp(df))
+
+# تهيئة محلل Volume Profile
+vp_analyzer = VolumeProfileAnalyzer()
+
+# =================== INTEGRATED DECISION PIPELINE ===================
+
+def assess_market_regime(df, indicators=None):
+    """
+    المرحلة A: تقييم نظام السوق (Market Regime)
+    """
+    if indicators is None:
+        indicators = compute_indicators(df)
+    
+    # 1) استخدام إيشيموكو لتحديد النظام
+    ichimoku = compute_ichimoku(df)
+    
+    # 2) استخدام ADX لمقاومة الترند
+    adx = indicators.get('adx', 0)
+    
+    # 3) استخدام EMA200 للتأكيد
+    trend_filters = compute_trend_filters(df)
+    
+    regime = "RANGE"
+    regime_details = {
+        "ichimoku_regime": ichimoku["regime"],
+        "adx": adx,
+        "ema_trend": trend_filters["trend"],
+        "reasons": []
+    }
+    
+    # قرار النظام
+    if adx >= REGIME_TREND_STRONG_ADX_MIN and ichimoku["regime"] in ["bull_strong", "bear_strong"]:
+        if trend_filters["trend"] in ["bull", "bear"]:
+            regime = "TREND_STRONG"
+            regime_details["reasons"].append(f"ADX قوي ({adx:.1f}) + إيشيموكو {ichimoku['regime']}")
+    elif adx >= REGIME_TREND_WEAK_ADX_MIN and ichimoku["regime"] in ["bull_weak", "bear_weak", "near_cloud_edge"]:
+        regime = "TREND_WEAK"
+        regime_details["reasons"].append(f"ADX متوسط ({adx:.1f}) + إيشيموكو {ichimoku['regime']}")
+    elif ichimoku["regime"] == "inside_cloud" or adx < REGIME_RANGE_ADX_MAX:
+        regime = "RANGE"
+        regime_details["reasons"].append(f"داخل السحابة أو ADX منخفض ({adx:.1f})")
+    
+    return regime, regime_details
+
+def assess_direction_filter(df, regime):
+    """
+    المرحلة B: فلترة الاتجاه (Direction Filter)
+    """
+    trend_filters = compute_trend_filters(df)
+    ichimoku = compute_ichimoku(df)
+    
+    allowed_directions = {
+        "buy": False,
+        "sell": False,
+        "reasons": []
+    }
+    
+    # قواعد صارمة للترند القوي
+    if regime == "TREND_STRONG":
+        if trend_filters["trend"] == "bull" and ichimoku["tenkan_vs_kijun"] == "bull":
+            allowed_directions["buy"] = True
+            allowed_directions["reasons"].append("TREND_STRONG: EMA200 صاعد + Tenkan > Kijun")
+        elif trend_filters["trend"] == "bear" and ichimoku["tenkan_vs_kijun"] == "bear":
+            allowed_directions["sell"] = True
+            allowed_directions["reasons"].append("TREND_STRONG: EMA200 هابط + Tenkan < Kijun")
+    
+    # قواعد أكثر مرونة للترند المتوسط
+    elif regime == "TREND_WEAK":
+        price_vs_ema = trend_filters["price_vs_ema"]
+        
+        if price_vs_ema > 1.0:  # فوق EMA200 بـ 1%
+            allowed_directions["buy"] = True
+            allowed_directions["reasons"].append(f"TREND_WEAK: السعر فوق EMA200 ({price_vs_ema:.1f}%)")
+        elif price_vs_ema < -1.0:  # تحت EMA200 بـ 1%
+            allowed_directions["sell"] = True
+            allowed_directions["reasons"].append(f"TREND_WEAK: السعر تحت EMA200 ({price_vs_ema:.1f}%)")
+        else:
+            # في الرينج - السماح للطرفين
+            allowed_directions["buy"] = True
+            allowed_directions["sell"] = True
+            allowed_directions["reasons"].append("TREND_WEAK: قريب من EMA200 - نطاق جانبي")
+    
+    # الرينج - السماح للطرفين بشروط
+    else:  # RANGE
+        allowed_directions["buy"] = True
+        allowed_directions["sell"] = True
+        allowed_directions["reasons"].append("RANGE: السماح للشراء والبيع مع تأكيدات")
+    
+    return allowed_directions
+
+def assess_location_filter(df, direction, regime):
+    """
+    المرحلة C: فلترة الموقع (Location Filter)
+    """
+    current_price = float(df['close'].iloc[-1]) if len(df) > 0 else 0
+    
+    # الحصول على مستويات Volume Profile
+    vp_levels = vp_analyzer.get_vp_levels(df, len(df))
+    
+    location_score = 0
+    location_quality = "POOR"
+    reasons = []
+    nearest_level = None
+    nearest_distance = 100.0  # نسبة مئوية
+    
+    # حساب المسافة لكل مستوى
+    distances = {}
+    for level_name, level_price in [("POC", vp_levels["poc"]), 
+                                    ("VAH", vp_levels["vah"]), 
+                                    ("VAL", vp_levels["val"])]:
+        if level_price > 0:
+            distance_pct = abs((current_price - level_price) / level_price * 100)
+            distances[level_name] = distance_pct
+            
+            if distance_pct < nearest_distance:
+                nearest_distance = distance_pct
+                nearest_level = level_name
+    
+    # تقييم الموقع بناءً على الاتجاه والنظام
+    if direction == "buy":
+        # الشراء المثالي من VAL أو POC في ترند صاعد
+        if "VAL" in distances and distances["VAL"] < LOCATION_EXCELLENT_DISTANCE:
+            location_score += WEIGHT_LOCATION_EXCELLENT
+            reasons.append(f"📍 قريب من VAL ({distances['VAL']:.2f}%)")
+            location_quality = "EXCELLENT"
+        elif "POC" in distances and distances["POC"] < LOCATION_GOOD_DISTANCE:
+            location_score += WEIGHT_LOCATION_GOOD
+            reasons.append(f"📍 قريب من POC ({distances['POC']:.2f}%)")
+            location_quality = "GOOD"
+        
+        # العقوبة إذا كان قريب من VAH في شراء
+        if "VAH" in distances and distances["VAH"] < LOCATION_EXCELLENT_DISTANCE:
+            location_score -= 1
+            reasons.append(f"⚠️ قريب من VAH للشراء ({distances['VAH']:.2f}%)")
+    
+    elif direction == "sell":
+        # البيع المثالي من VAH أو POC في ترند هابط
+        if "VAH" in distances and distances["VAH"] < LOCATION_EXCELLENT_DISTANCE:
+            location_score += WEIGHT_LOCATION_EXCELLENT
+            reasons.append(f"📍 قريب من VAH ({distances['VAH']:.2f}%)")
+            location_quality = "EXCELLENT"
+        elif "POC" in distances and distances["POC"] < LOCATION_GOOD_DISTANCE:
+            location_score += WEIGHT_LOCATION_GOOD
+            reasons.append(f"📍 قريب من POC ({distances['POC']:.2f}%)")
+            location_quality = "GOOD"
+        
+        # العقوبة إذا كان قريب من VAL في بيع
+        if "VAL" in distances and distances["VAL"] < LOCATION_EXCELLENT_DISTANCE:
+            location_score -= 1
+            reasons.append(f"⚠️ قريب من VAL للبيع ({distances['VAL']:.2f}%)")
+    
+    # إذا لم نجد مستوى قريب، نعطي درجة متوسطة إذا كان النظام جيد
+    if location_score == 0 and regime in ["TREND_STRONG", "TREND_WEAK"]:
+        location_score = 0.5
+        reasons.append(f"📍 موقع متوسط - أقرب مستوى: {nearest_level} ({nearest_distance:.2f}%)")
+        location_quality = "NEUTRAL"
+    
+    return {
+        "score": location_score,
+        "quality": location_quality,
+        "reasons": reasons,
+        "vp_levels": vp_levels,
+        "current_price": current_price,
+        "distances": distances,
+        "nearest_level": nearest_level,
+        "nearest_distance": nearest_distance
+    }
+
+def integrated_entry_decision(df, council_data, htf_ctx, candles_analysis, bar_index):
+    """
+    قرار دخول متكامل باستخدام خط الأنابيب الاحترافي
+    """
+    try:
+        # إذا كان النظام المتكامل معطلاً، نعود للنظام القديم
+        if not INTEGRATED_SYSTEM_ENABLED:
+            return {
+                "enter": False,
+                "side": None,
+                "mode": None,
+                "reason": "INTEGRATED_SYSTEM_DISABLED",
+                "stage_logs": ["⚙️ Integrated system disabled - using legacy system"],
+                "regime": "LEGACY"
+            }
+        
+        # 1) جمع جميع المؤشرات
+        indicators = council_data["ind"] if council_data else compute_indicators(df)
+        
+        decision_log = {
+            "enter": False,
+            "side": None,
+            "mode": None,
+            "reason": "NO_SIGNAL",
+            "stage_logs": [],
+            "regime": None,
+            "direction_allowed": {"buy": False, "sell": False},
+            "location_quality": {"buy": "POOR", "sell": "POOR"},
+            "trigger": None,
+            "score": 0,
+            "vp_levels": None,
+            "trend_filters": None,
+            "ichimoku": None
+        }
+        
+        # 2) المرحلة A: تقييم نظام السوق
+        regime, regime_details = assess_market_regime(df, indicators)
+        decision_log["regime"] = regime
+        decision_log["stage_logs"].append(f"📊 REGIME: {regime} - {', '.join(regime_details['reasons'])}")
+        
+        # 3) المرحلة B: فلترة الاتجاه
+        direction_filter = assess_direction_filter(df, regime)
+        decision_log["direction_allowed"] = direction_filter
+        decision_log["stage_logs"].append(f"🧭 DIRECTION: BUY={direction_filter['buy']}, SELL={direction_filter['sell']}")
+        
+        # 4) المرحلة C: فلترة الموقع لكلا الاتجاهين
+        location_buy = assess_location_filter(df, "buy", regime)
+        location_sell = assess_location_filter(df, "sell", regime)
+        
+        decision_log["location_quality"]["buy"] = location_buy["quality"]
+        decision_log["location_quality"]["sell"] = location_sell["quality"]
+        decision_log["vp_levels"] = location_buy["vp_levels"]
+        
+        # حفظ بيانات المؤشرات المتقدمة
+        decision_log["trend_filters"] = compute_trend_filters(df)
+        decision_log["ichimoku"] = compute_ichimoku(df)
+        
+        decision_log["stage_logs"].append(f"📍 LOCATION: BUY={location_buy['quality']} (score={location_buy['score']:.1f}), SELL={location_sell['quality']} (score={location_sell['score']:.1f})")
+        
+        # 5) المرحلة D: المحفزات (Triggers) مع الأوزان
+        triggers = []
+        
+        # أ) Trend Birth Engine (أقوى محفز)
+        if TBE_ENABLED:
+            tbe_decision = tbe_update(df, htf_ctx, get_daily_open_ctx(), indicators)
+            if tbe_decision.get("enter"):
+                side = tbe_decision["side"].lower()
+                if direction_filter.get(side):
+                    triggers.append({
+                        "type": "TBE",
+                        "side": side,
+                        "base_score": tbe_decision.get("score", 5),
+                        "weighted_score": tbe_decision.get("score", 5) * WEIGHT_TBE,
+                        "reason": tbe_decision.get("reason", "TBE_ENTRY")
+                    })
+        
+        # ب) Council Elite (محفز قوي)
+        council_score_b = council_data.get("score_b", 0) if council_data else 0
+        council_score_s = council_data.get("score_s", 0) if council_data else 0
+        
+        if council_score_b >= COUNCIL_STRONG_TH and direction_filter.get("buy"):
+            triggers.append({
+                "type": "COUNCIL",
+                "side": "buy",
+                "base_score": council_score_b,
+                "weighted_score": council_score_b * WEIGHT_COUNCIL,
+                "reason": f"Council BUY score={council_score_b:.1f}"
+            })
+        
+        if council_score_s >= COUNCIL_STRONG_TH and direction_filter.get("sell"):
+            triggers.append({
+                "type": "COUNCIL",
+                "side": "sell",
+                "base_score": council_score_s,
+                "weighted_score": council_score_s * WEIGHT_COUNCIL,
+                "reason": f"Council SELL score={council_score_s:.1f}"
+            })
+        
+        # ج) Mid Trend Opportunities
+        mid_trend_opp = detect_mid_trend_opportunity(df, council_data, htf_ctx, candles_analysis)
+        if mid_trend_opp:
+            side = "buy" if "buy" in mid_trend_opp["action"] else "sell"
+            if direction_filter.get(side):
+                triggers.append({
+                    "type": "MID_TREND",
+                    "side": side,
+                    "base_score": MID_TREND_MIN_SCORE,
+                    "weighted_score": MID_TREND_MIN_SCORE * WEIGHT_MID_TREND,
+                    "reason": f"Mid Trend: {mid_trend_opp['reason']}"
+                })
+        
+        # د) Fast Trading (محفز سريع)
+        if FAST_TRADE_ENABLED:
+            fast_opp = detect_fast_opportunity(df, council_data)
+            if fast_opp:
+                side = "buy" if "buy" in fast_opp["action"] else "sell"
+                if direction_filter.get(side):
+                    triggers.append({
+                        "type": "FAST",
+                        "side": side,
+                        "base_score": FAST_MIN_SCORE,
+                        "weighted_score": FAST_MIN_SCORE,
+                        "reason": fast_opp["reason"]
+                    })
+        
+        # 6) اتخاذ القرار النهائي
+        best_trigger = None
+        best_score = 0
+        
+        for trigger in triggers:
+            # إضافة وزن جودة الموقع
+            location_score = 0
+            if trigger["side"] == "buy":
+                location_score = location_buy["score"]
+            else:  # sell
+                location_score = location_sell["score"]
+            
+            total_trigger_score = trigger["weighted_score"] + location_score
+            
+            if total_trigger_score > best_score:
+                best_score = total_trigger_score
+                best_trigger = trigger
+        
+        # 7) تطبيق الحد الأدنى للدرجة
+        if best_trigger:
+            min_required_score = {
+                "TREND_STRONG": 8.0,
+                "TREND_WEAK": 6.0,
+                "RANGE": 5.0
+            }.get(regime, 5.0)
+            
+            if best_score >= min_required_score:
+                decision_log["enter"] = True
+                decision_log["side"] = best_trigger["side"]
+                decision_log["reason"] = f"{best_trigger['type']}: {best_trigger['reason']}"
+                decision_log["trigger"] = best_trigger["type"]
+                decision_log["score"] = best_score
+                
+                # تحديد النمط بناءً على النظام
+                if regime == "TREND_STRONG":
+                    decision_log["mode"] = "strong_trend"
+                elif regime == "TREND_WEAK":
+                    decision_log["mode"] = "mid_trend"
+                else:
+                    decision_log["mode"] = "scalp"
+                
+                decision_log["stage_logs"].append(f"🎯 TRIGGER: {best_trigger['type']} ({best_trigger['side']}) total_score={best_score:.1f} (base={best_trigger['base_score']:.1f}, location={location_buy['score'] if best_trigger['side']=='buy' else location_sell['score']:.1f})")
+        
+        # 8) تسجيل تفصيلي
+        if not decision_log["enter"]:
+            if triggers:
+                decision_log["stage_logs"].append(f"⛔ NO_ENTRY: أفضل محفز={best_trigger['type'] if best_trigger else 'None'} score={best_score:.1f} < الحد الأدنى")
+            else:
+                decision_log["stage_logs"].append(f"⛔ NO_ENTRY: لا يوجد محفز كافٍ")
+        
+        return decision_log
+        
+    except Exception as e:
+        log_w(f"Integrated decision error: {e}")
+        return {
+            "enter": False,
+            "side": None,
+            "mode": None,
+            "reason": f"ERROR: {str(e)[:50]}",
+            "stage_logs": [f"❌ Decision Error: {e}"],
+            "regime": "ERROR"
+        }
+
+def log_integrated_decision_details(decision, df, council_data):
+    """تسجيل تفاصيل قرار النظام المتكامل"""
+    if not LOG_INTEGRATED_SYSTEM:
+        return
+    
+    regime = decision.get("regime", "UNKNOWN")
+    enter = decision.get("enter", False)
+    
+    print(f"\n{'='*80}", flush=True)
+    print(f"🧠 INTEGRATED ADVANCED SYSTEM ANALYSIS", flush=True)
+    print(f"{'='*80}", flush=True)
+    
+    # عرض تفاصيل المراحل
+    for stage_log in decision.get("stage_logs", []):
+        print(f"  {stage_log}", flush=True)
+    
+    if enter:
+        print(f"\n✅ ENTRY DECISION:", flush=True)
+        print(f"  • Side: {decision.get('side', '').upper()}", flush=True)
+        print(f"  • Mode: {decision.get('mode', '').upper()}", flush=True)
+        print(f"  • Regime: {regime}", flush=True)
+        print(f"  • Trigger: {decision.get('trigger', 'UNKNOWN')}", flush=True)
+        print(f"  • Score: {decision.get('score', 0):.1f}", flush=True)
+    else:
+        print(f"\n⏸️ NO ENTRY: {decision.get('reason', 'Unknown')}", flush=True)
+    
+    # عرض معلومات المؤشرات المتقدمة
+    if decision.get("trend_filters"):
+        tf = decision["trend_filters"]
+        print(f"\n📈 TREND FILTERS:", flush=True)
+        print(f"  • EMA200: {tf.get('ema200', 0):.6f} | Trend: {tf.get('trend', 'none')}", flush=True)
+        print(f"  • Price vs EMA: {tf.get('price_vs_ema', 0):.2f}%", flush=True)
+        print(f"  • EMA Slope: {tf.get('slope', 0):.2f}%", flush=True)
+    
+    if decision.get("ichimoku"):
+        ich = decision["ichimoku"]
+        print(f"\n☁️ ICHIMOKU CLOUD:", flush=True)
+        print(f"  • Regime: {ich.get('regime', 'none')}", flush=True)
+        print(f"  • Cloud Color: {ich.get('cloud_color', 'neutral')}", flush=True)
+        print(f"  • Tenkan/Kijun: {ich.get('tenkan_vs_kijun', 'none')}", flush=True)
+        print(f"  • Price vs Cloud: {'Above' if ich.get('price_above_cloud') else 'Below' if ich.get('price_below_cloud') else 'Inside'}", flush=True)
+    
+    if decision.get("vp_levels"):
+        vp = decision["vp_levels"]
+        print(f"\n📊 VOLUME PROFILE:", flush=True)
+        print(f"  • POC: {vp.get('poc', 0):.6f}", flush=True)
+        print(f"  • VAH: {vp.get('vah', 0):.6f}", flush=True)
+        print(f"  • VAL: {vp.get('val', 0):.6f}", flush=True)
+        print(f"  • Range: {vp.get('range_low', 0):.6f} - {vp.get('range_high', 0):.6f}", flush=True)
+    
+    print(f"{'='*80}\n", flush=True)
 
 # =================== TREND BIRTH ENGINE STATE MACHINE ===================
 TBE_STATE = {
@@ -1125,6 +1814,7 @@ def verify_execution_environment():
     print(f"🔧 EXECUTE_ORDERS: {EXECUTE_ORDERS} | SHADOW_MODE: {SHADOW_MODE_DASHBOARD} | DRY_RUN: {DRY_RUN}", flush=True)
     print(f"🎯 COUNCIL ELITE ENHANCED: Smart Entry + Fast Trading + Mid Trend", flush=True)
     print(f"📈 SMC/ICT: Golden Zones + FVG + BOS + Sweeps", flush=True)
+    print(f"🧠 INTEGRATED ADVANCED SYSTEM: EMA200 + Ichimoku + Volume Profile - {'مفعّل' if INTEGRATED_SYSTEM_ENABLED else 'معطّل'}", flush=True)
     print(f"🚀 TREND BIRTH ENGINE: اصطياد بدايات الترند - {'مفعّل' if TBE_ENABLED else 'معطّل'}", flush=True)
     print(f"🌊 MID TREND SYSTEM: تداول الترندات المتوسطة - مفعّل", flush=True)
     
@@ -1865,6 +2555,12 @@ def emit_snapshots(exchange, symbol, df, balance_fn=None, pnl_fn=None):
             if MID_TREND_ADX_MIN <= adx < MID_TREND_ADX_MAX:
                 print(f"🌊 MID_TREND AVAILABLE: ADX={adx:.1f} (between {MID_TREND_ADX_MIN}-{MID_TREND_ADX_MAX})", flush=True)
             
+            # إضافة معلومات النظام المتكامل
+            if INTEGRATED_SYSTEM_ENABLED:
+                ichimoku = compute_ichimoku(df)
+                trend_filters = compute_trend_filters(df)
+                print(f"🧠 INTEGRATED SYSTEM: Regime={ichimoku.get('regime', 'none')} | EMA200 Trend={trend_filters.get('trend', 'none')}", flush=True)
+            
             print("✅ ADDONS LIVE", flush=True)
 
         return {"bm": bm, "flow": flow, "cv": cv, "mode": mode, "gz": gz, "wallet": wallet}
@@ -1874,10 +2570,10 @@ def emit_snapshots(exchange, symbol, df, balance_fn=None, pnl_fn=None):
                 "mode": {"mode":"n/a"}, "gz": None, "wallet": ""}
 
 # =================== EXECUTION MANAGER ===================
-def execute_trade_decision(side, price, qty, mode, council_data, gz_data, tbe_data=None):
+def execute_trade_decision(side, price, qty, mode, council_data, gz_data, tbe_data=None, regime=None, location_quality=None):
     """تنفيذ قرار التداول مع التسجيل الواضح"""
     if not EXECUTE_ORDERS or DRY_RUN:
-        log_i(f"DRY_RUN: {side} {qty:.4f} @ {price:.6f} | mode={mode}")
+        log_i(f"DRY_RUN: {side} {qty:.4f} @ {price:.6f} | mode={mode} | regime={regime}")
         return True
     
     if qty <= 0:
@@ -1892,10 +2588,13 @@ def execute_trade_decision(side, price, qty, mode, council_data, gz_data, tbe_da
     if tbe_data and tbe_data.get("stage"):
         tbe_note = f" | TBE={tbe_data['stage']}"
     
+    regime_note = f" | Regime={regime}" if regime else ""
+    location_note = f" | Location={location_quality}" if location_quality else ""
+    
     votes = council_data
     print(f"🎯 EXECUTE: {side.upper()} {qty:.4f} @ {price:.6f} | "
           f"mode={mode} | votes={votes['b']}/{votes['s']} score={votes['score_b']:.1f}/{votes['score_s']:.1f}"
-          f"{gz_note}{tbe_note}", flush=True)
+          f"{gz_note}{tbe_note}{regime_note}{location_note}", flush=True)
 
     try:
         if MODE_LIVE:
@@ -1909,7 +2608,7 @@ def execute_trade_decision(side, price, qty, mode, council_data, gz_data, tbe_da
         return False
 
 # =================== ENHANCED TRADE EXECUTION ===================
-def open_market_enhanced(side, qty, price, zone=None, tbe_data=None):
+def open_market_enhanced(side, qty, price, zone=None, tbe_data=None, regime=None, location_quality=None):
     if qty <= 0: 
         log_e("skip open (qty<=0)")
         return False
@@ -1929,7 +2628,7 @@ def open_market_enhanced(side, qty, price, zone=None, tbe_data=None):
     
     management_config = setup_trade_management(mode)
     
-    success = execute_trade_decision(side, price, qty, mode, votes, gz, tbe_data)
+    success = execute_trade_decision(side, price, qty, mode, votes, gz, tbe_data, regime, location_quality)
     
     if success:
         STATE.update({
@@ -1948,7 +2647,9 @@ def open_market_enhanced(side, qty, price, zone=None, tbe_data=None):
             "management": management_config,
             "tbe_zone": zone,  # حفظ المنطقة إذا كانت من TBE
             "tbe_entry_time": int(time.time()),
-            "bars_in_trade": 0
+            "bars_in_trade": 0,
+            "entry_regime": regime,
+            "entry_location_quality": location_quality
         })
         
         save_state({
@@ -1967,20 +2668,24 @@ def open_market_enhanced(side, qty, price, zone=None, tbe_data=None):
             "breakeven_armed": False,
             "trail_active": False,
             "trail_tightened": False,
+            "entry_regime": regime,
+            "entry_location_quality": location_quality
         })
         
         log_trade_open(
             side=side, price=price, qty=qty, leverage=LEVERAGE,
-            source="Trend Birth Engine" if zone else "Council ELITE ENHANCED",
+            source="Integrated System" if regime else ("Trend Birth Engine" if zone else "Council ELITE ENHANCED"),
             mode=mode,
             risk_alloc=RISK_ALLOC,
             council=votes,
             gz=gz,
             mgmt=management_config,
-            tbe_data=tbe_data
+            tbe_data=tbe_data,
+            regime=regime,
+            location_quality=location_quality
         )
         
-        log_g(f"✅ POSITION OPENED: {side.upper()} | mode={mode} | {'TBE' if zone else 'Council'}")
+        log_g(f"✅ POSITION OPENED: {side.upper()} | mode={mode} | regime={regime} | location={location_quality}")
         return True
     
     return False
@@ -2062,7 +2767,8 @@ STATE = {
     "pnl": 0.0, "bars": 0, "trail": None, "breakeven": None,
     "tp1_done": False, "highest_profit_pct": 0.0,
     "profit_targets_achieved": 0,
-    "tbe_zone": None, "tbe_entry_time": 0, "bars_in_trade": 0
+    "tbe_zone": None, "tbe_entry_time": 0, "bars_in_trade": 0,
+    "entry_regime": None, "entry_location_quality": None
 }
 compound_pnl = 0.0
 wait_for_next_signal_side = None
@@ -2157,7 +2863,8 @@ def _reset_after_close(reason, prev_side=None):
         "pnl": 0.0, "bars": 0, "trail": None, "breakeven": None,
         "tp1_done": False, "highest_profit_pct": 0.0, "profit_targets_achieved": 0,
         "trail_tightened": False, "partial_taken": False,
-        "tbe_zone": None, "tbe_entry_time": 0, "bars_in_trade": 0
+        "tbe_zone": None, "tbe_entry_time": 0, "bars_in_trade": 0,
+        "entry_regime": None, "entry_location_quality": None
     })
     save_state({"in_position": False, "position_qty": 0})
     
@@ -2297,9 +3004,9 @@ def manage_after_entry_enhanced(df, ind, info):
 
 manage_after_entry = manage_after_entry_enhanced
 
-# =================== ENHANCED TRADE LOOP - TREND BIRTH ENGINE + MID TREND ===================
+# =================== ENHANCED TRADE LOOP - INTEGRATED SYSTEM ===================
 def trade_loop_enhanced():
-    """حلقة تداول محسنة مع Trend Birth Engine و Council Elite و Mid Trend System"""
+    """حلقة تداول محسنة مع النظام المتكامل"""
     global wait_for_next_signal_side
     loop_i = 0
     
@@ -2334,130 +3041,58 @@ def trade_loop_enhanced():
                     **info
                 })
             
-            # 🔍 تشخيص مفصل
+            # 🔍 قرار الدخول باستخدام النظام المتكامل
             council_data = council_votes_pro(df)
+            candles_analysis = compute_candles(df)
             
-            # قرار الدخول باستخدام نظام محسن
-            reason = None
-            if spread_bps is not None and spread_bps > MAX_SPREAD_BPS:
-                reason = f"spread too high ({fmt(spread_bps,2)}bps > {MAX_SPREAD_BPS})"
-
-            sig = None
-            trade_decision = None
-            tbe_data = None
-            zone = None
-
-            # ⚡ فحص الفرص السريعة أولاً
-            fast_opp = detect_fast_opportunity(df, council_data)
-            if fast_opp and not STATE["open"] and reason is None:
-                action = fast_opp["action"]
-                if action == "fast_buy":
-                    sig = "buy"
-                    trade_decision = {"enter": True, "side": "BUY", "reason": fast_opp["reason"], "source": "FAST", "mode": "scalp"}
-                else:
-                    sig = "sell"
-                    trade_decision = {"enter": True, "side": "SELL", "reason": fast_opp["reason"], "source": "FAST", "mode": "scalp"}
-            
-            # 🔍 فحص فرص MID_TREND
-            elif not STATE["open"] and reason is None:
-                mid_trend_opp = detect_mid_trend_opportunity(df, council_data, htf_ctx, compute_candles(df))
-                if mid_trend_opp:
-                    action = mid_trend_opp["action"]
-                    if action == "mid_trend_buy":
-                        sig = "buy"
-                        trade_decision = {
-                            "enter": True, 
-                            "side": "BUY", 
-                            "reason": f"MID_TREND: {mid_trend_opp['reason']}", 
-                            "source": "MID_TREND",
-                            "mode": "mid_trend",
-                            "wick_signal": mid_trend_opp.get("wick_signal", False)
-                        }
-                    elif action == "mid_trend_sell":
-                        sig = "sell"
-                        trade_decision = {
-                            "enter": True, 
-                            "side": "SELL", 
-                            "reason": f"MID_TREND: {mid_trend_opp['reason']}", 
-                            "source": "MID_TREND",
-                            "mode": "mid_trend",
-                            "wick_signal": mid_trend_opp.get("wick_signal", False)
-                        }
-            
-            # Trend Birth Engine - إذا لم تكن هناك فرصة سريعة أو mid trend
-            elif TBE_ENABLED and not STATE["open"] and reason is None and not trade_decision:
-                tbe_decision = tbe_update(df, htf_ctx, get_daily_open_ctx(), ind)
-                if tbe_decision.get("enter"):
-                    sig = tbe_decision["side"].lower()
-                    trade_decision = {
-                        **tbe_decision, 
-                        "source": "TBE",
-                        "mode": "strong_trend"
-                    }
-                    zone = tbe_decision.get("zone")
-                    tbe_data = {
-                        "stage": tbe_decision.get("stage", "ENTRY"),
-                        "score": tbe_decision.get("score", 0),
-                        "reason": tbe_decision.get("reason", "")
-                    }
-                    log_g(f"🎯 TBE Decision: {tbe_decision['side']} score={tbe_decision.get('score',0):.1f}")
-            
-            # Council Elite - كخيار احتياطي (لـ STRONG_TREND فقط)
-            elif not STATE["open"] and reason is None and not trade_decision:
-                if council_data["score_b"] >= COUNCIL_STRONG_TH and council_data["b"] > council_data["s"]:
-                    sig = "buy"
-                    trade_decision = {
-                        "enter": True, 
-                        "side": "BUY", 
-                        "reason": "STRONG_TREND: COUNCIL_BUY", 
-                        "source": "COUNCIL",
-                        "mode": "strong_trend"
-                    }
-                elif council_data["score_s"] >= COUNCIL_STRONG_TH and council_data["s"] > council_data["b"]:
-                    sig = "sell"
-                    trade_decision = {
-                        "enter": True, 
-                        "side": "SELL", 
-                        "reason": "STRONG_TREND: COUNCIL_SELL", 
-                        "source": "COUNCIL",
-                        "mode": "strong_trend"
-                    }
-            
-            # تنفيذ الدخول إذا كان هناك إشارة
-            if sig and trade_decision and trade_decision.get("enter"):
-                qty = compute_size(bal, px or info["price"])
-                if qty > 0:
-                    # تحديث نمط الإدارة بناءً على نوع الصفقة
-                    trade_mode = trade_decision.get("mode", "scalp")
-                    management_config = setup_trade_management(trade_mode)
+            if not STATE["open"] and spread_bps is not None and spread_bps <= MAX_SPREAD_BPS:
+                # استخدام النظام المتكامل لاتخاذ القرار
+                decision = integrated_entry_decision(
+                    df=df,
+                    council_data=council_data,
+                    htf_ctx=htf_ctx,
+                    candles_analysis=candles_analysis,
+                    bar_index=len(df)
+                )
+                
+                # تسجيل تفاصيل القرار
+                log_integrated_decision_details(decision, df, council_data)
+                
+                # تنفيذ الدخول إذا كان القرار إيجابي
+                if decision.get("enter"):
+                    side = decision["side"]
+                    qty = compute_size(bal, px or info["price"])
                     
-                    # إذا كان القرار من TBE، نمرر المنطقة
-                    if trade_decision.get("source") == "TBE":
-                        ok = open_market(sig, qty, px or info["price"], zone, {
-                            **tbe_data,
-                            "trade_mode": trade_mode
-                        })
-                        if ok:
-                            log_i(f"✅ TBE entry: {sig.upper()} - score={tbe_data.get('score',0):.1f} - mode={trade_mode}")
-                    else:
-                        # تحديث STATE بالمود قبل الدخول
-                        STATE["mode"] = trade_mode
+                    if qty > 0:
+                        # تحديد نمط الإدارة
+                        mode = decision.get("mode", "scalp")
+                        management_config = setup_trade_management(mode)
+                        
+                        # تحديث STATE
+                        STATE["mode"] = mode
                         STATE["management"] = management_config
                         
-                        ok = open_market(sig, qty, px or info["price"])
+                        # تنفيذ الصفقة
+                        ok = open_market(
+                            side, 
+                            qty, 
+                            px or info["price"],
+                            regime=decision.get("regime"),
+                            location_quality=decision["location_quality"][side]
+                        )
                         if ok:
-                            source = trade_decision.get("source", "Council")
-                            log_i(f"✅ {source} entry: {sig.upper()} - mode={trade_mode} - reason={trade_decision.get('reason', '')}")
+                            log_g(f"✅ INTEGRATED ENTRY: {side.upper()} | regime={decision.get('regime')} | score={decision['score']:.1f}")
+                        else:
+                            log_w("❌ فشل تنفيذ الصفقة")
+                    else:
+                        log_w(f"⚠️ Cannot enter: quantity is zero or negative")
                 else:
-                    reason = "qty<=0"
-                    log_w(f"⚠️ Cannot enter: quantity is zero or negative")
+                    # عرض سبب عدم الدخول
+                    if spread_bps is not None and spread_bps > MAX_SPREAD_BPS:
+                        log_w(f"⏸️ No entry: Spread too high ({spread_bps:.2f}bps > {MAX_SPREAD_BPS}bps)")
+                    else:
+                        log_i(f"⏸️ No entry: {decision.get('reason', 'Unknown')}")
             
-            # 🔍 لوج التشخيص إذا لم يتم الدخول
-            if not STATE["open"] and not sig:
-                reason_str = reason or (trade_decision.get('reason') if trade_decision else "No signal")
-                mode_str = trade_decision.get('mode', 'N/A') if trade_decision else 'N/A'
-                print(f"🔍 No trade | Reason: {reason_str} | Mode: {mode_str} | Spread: {spread_bps}", flush=True)
-
             # ⚡ نوم أقصر بين الدورات
             sleep_time = 0.5 if time_to_candle_close(df) <= 30 else BASE_SLEEP
             time.sleep(sleep_time)
@@ -2469,7 +3104,7 @@ def trade_loop_enhanced():
 
 trade_loop = trade_loop_enhanced
 
-# =================== LOOP / LOG ===================
+# =================== PROFESSIONAL SNAPSHOT ===================
 def pretty_snapshot(bal, info, ind, spread_bps, reason=None, df=None):
     if LOG_LEGACY:
         left_s = time_to_candle_close(df) if df is not None else 0
@@ -2480,12 +3115,18 @@ def pretty_snapshot(bal, info, ind, spread_bps, reason=None, df=None):
         print(f"   💲 Price {fmt(info.get('price'))} | RF filt={fmt(info.get('filter'))}  hi={fmt(info.get('hi'))} lo={fmt(info.get('lo'))}")
         print(f"   🧮 RSI={fmt(ind.get('rsi'))}  +DI={fmt(ind.get('plus_di'))}  -DI={fmt(ind.get('minus_di'))}  ADX={fmt(ind.get('adx'))}  ATR={fmt(ind.get('atr'))}")
         
+        # عرض معلومات النظام المتكامل
+        if INTEGRATED_SYSTEM_ENABLED:
+            ichimoku = compute_ichimoku(df)
+            trend_filters = compute_trend_filters(df)
+            print(f"   🧠 INTEGRATED SYSTEM: Regime={ichimoku.get('regime', 'none')} | EMA200 Trend={trend_filters.get('trend', 'none')}")
+        
         # عرض حالة MID_TREND
         adx = ind.get('adx', 0)
         if MID_TREND_ADX_MIN <= adx < MID_TREND_ADX_MAX:
             print(colored(f"   🌊 MID_TREND ZONE: ADX={adx:.1f} (eligible for weak/medium trend trades)", "yellow"))
         
-        print(f"   🎯 STRATEGIES: COUNCIL_ELITE + TREND_BIRTH_ENGINE + MID_TREND | spread_bps={fmt(spread_bps,2)}")
+        print(f"   🎯 STRATEGIES: COUNCIL_ELITE + TREND_BIRTH_ENGINE + MID_TREND + INTEGRATED_SYSTEM | spread_bps={fmt(spread_bps,2)}")
         print(f"   ⏱️ closes_in ≈ {left_s}s")
         print("\n🧭 POSITION")
         bal_line = f"Balance={fmt(bal,2)}  Risk={int(RISK_ALLOC*100)}%×{LEVERAGE}x  CompoundPnL={fmt(compound_pnl)}  Eq~{fmt((bal or 0)+compound_pnl,2)}"
@@ -2493,7 +3134,9 @@ def pretty_snapshot(bal, info, ind, spread_bps, reason=None, df=None):
         if STATE["open"]:
             lamp='🟩 LONG' if STATE['side']=='long' else '🟥 SHORT'
             mode_icon = "⚡" if STATE.get("mode") == "scalp" else "🌊" if STATE.get("mode") == "mid_trend" else "🚀" if STATE.get("mode") == "strong_trend" else "ℹ️"
-            print(f"   {lamp} {mode_icon} {STATE.get('mode', 'N/A').upper()}  Entry={fmt(STATE['entry'])}  Qty={fmt(STATE['qty'],4)}  Bars={STATE['bars']}  Trail={fmt(STATE['trail'])}  BE={fmt(STATE['breakeven'])}")
+            regime_info = f" | Regime={STATE.get('entry_regime', 'N/A')}" if STATE.get("entry_regime") else ""
+            location_info = f" | Location={STATE.get('entry_location_quality', 'N/A')}" if STATE.get("entry_location_quality") else ""
+            print(f"   {lamp} {mode_icon} {STATE.get('mode', 'N/A').upper()}{regime_info}{location_info}  Entry={fmt(STATE['entry'])}  Qty={fmt(STATE['qty'],4)}  Bars={STATE['bars']}  Trail={fmt(STATE['trail'])}  BE={fmt(STATE['breakeven'])}")
             print(f"   🎯 TP_done={STATE['profit_targets_achieved']}  HP={fmt(STATE['highest_profit_pct'],2)}%  Bars in trade: {STATE.get('bars_in_trade',0)}")
             if STATE.get('tbe_zone'):
                 zone = STATE['tbe_zone']
@@ -2510,17 +3153,25 @@ app = Flask(__name__)
 @app.route("/")
 def home():
     mode='LIVE' if MODE_LIVE else 'PAPER'
-    return f"✅ Council ELITE Bot ENHANCED — {SYMBOL} {INTERVAL} — {mode} — Trend Birth Engine v1 + Mid Trend System"
+    return f"✅ Council ELITE Bot INTEGRATED — {SYMBOL} {INTERVAL} — {mode} — Integrated Advanced System v1.0"
 
 @app.route("/metrics")
 def metrics():
+    df = fetch_ohlcv() if MODE_LIVE else pd.DataFrame()
+    
     return jsonify({
         "symbol": SYMBOL, "interval": INTERVAL, "mode": "live" if MODE_LIVE else "paper",
         "leverage": LEVERAGE, "risk_alloc": RISK_ALLOC, "price": price_now(),
         "state": STATE, "compound_pnl": compound_pnl,
-        "entry_mode": "TREND_BIRTH_ENGINE_v1 + MID_TREND_SYSTEM", "wait_for_next_signal": wait_for_next_signal_side,
+        "entry_mode": "INTEGRATED_ADVANCED_SYSTEM_v1.0 (EMA200 + Ichimoku + Volume Profile)",
+        "wait_for_next_signal": wait_for_next_signal_side,
         "guards": {"max_spread_bps": MAX_SPREAD_BPS, "final_chunk_qty": FINAL_CHUNK_QTY},
         "fast_trading": FAST_TRADE_ENABLED,
+        "integrated_system": {
+            "enabled": INTEGRATED_SYSTEM_ENABLED,
+            "components": ["EMA200", "Ichimoku", "Volume Profile"],
+            "version": "1.0"
+        },
         "trend_birth_engine": {
             "enabled": TBE_ENABLED,
             "state": TBE_STATE["state"],
@@ -2534,14 +3185,49 @@ def metrics():
         }
     })
 
+@app.route("/advanced_metrics")
+def advanced_metrics():
+    """إضافة مقاييس متقدمة للوحة التحكم"""
+    df = fetch_ohlcv()
+    ichimoku = compute_ichimoku(df)
+    trend_filters = compute_trend_filters(df)
+    vp_levels = vp_analyzer.get_vp_levels(df, len(df))
+    
+    return jsonify({
+        "trend_filters": trend_filters,
+        "ichimoku": {
+            "regime": ichimoku.get("regime"),
+            "cloud_color": ichimoku.get("cloud_color"),
+            "tenkan_vs_kijun": ichimoku.get("tenkan_vs_kijun"),
+            "price_vs_cloud": "above" if ichimoku.get("price_above_cloud") else "below" if ichimoku.get("price_below_cloud") else "inside"
+        },
+        "volume_profile": vp_levels,
+        "integrated_system": {
+            "enabled": INTEGRATED_SYSTEM_ENABLED,
+            "version": "1.0",
+            "decision_pipeline": ["REGIME", "DIRECTION", "LOCATION", "TRIGGER"],
+            "settings": {
+                "vp_bins": VP_BINS,
+                "vp_lookback": VP_LOOKBACK_PERIOD,
+                "ema_period": EMA_PERIOD,
+                "ichimoku_settings": {
+                    "tenkan": ICHIMOKU_TENKAN,
+                    "kijun": ICHIMOKU_KIJUN,
+                    "senkou": ICHIMOKU_SENKOU
+                }
+            }
+        }
+    })
+
 @app.route("/health")
 def health():
     return jsonify({
         "ok": True, "mode": "live" if MODE_LIVE else "paper",
         "open": STATE["open"], "side": STATE["side"], "qty": STATE["qty"],
         "compound_pnl": compound_pnl, "timestamp": datetime.utcnow().isoformat(),
-        "entry_mode": "TREND_BIRTH_ENGINE_v1 + MID_TREND_SYSTEM", "wait_for_next_signal": wait_for_next_signal_side,
+        "entry_mode": "INTEGRATED_ADVANCED_SYSTEM_v1.0", "wait_for_next_signal": wait_for_next_signal_side,
         "fast_trading": FAST_TRADE_ENABLED,
+        "integrated_system": INTEGRATED_SYSTEM_ENABLED,
         "trend_birth_engine": TBE_ENABLED,
         "mid_trend_system": True
     }), 200
@@ -2561,7 +3247,7 @@ def keepalive_loop():
 
 # =================== BOOT ===================
 if __name__ == "__main__":
-    log_banner("COUNCIL ELITE ENHANCED + TREND BIRTH ENGINE v1 + MID TREND SYSTEM INIT")
+    log_banner("COUNCIL ELITE INTEGRATED + ADVANCED SYSTEM v1.0 INIT")
     state = load_state() or {}
     state.setdefault("in_position", False)
 
@@ -2575,7 +3261,8 @@ if __name__ == "__main__":
 
     print(colored(f"MODE: {'LIVE' if MODE_LIVE else 'PAPER'}  •  {SYMBOL}  •  {INTERVAL}", "yellow"))
     print(colored(f"RISK: {int(RISK_ALLOC*100)}% × {LEVERAGE}x  •  COUNCIL_ELITE_ENHANCED=ENABLED", "yellow"))
-    print(colored(f"STRATEGIES: 1) STRONG_TREND  2) MID_TREND (ADX {MID_TREND_ADX_MIN}-{MID_TREND_ADX_MAX})  3) SCALP", "yellow"))
+    print(colored(f"🧠 INTEGRATED ADVANCED SYSTEM: {'ENABLED' if INTEGRATED_SYSTEM_ENABLED else 'DISABLED'} (EMA200 + Ichimoku + Volume Profile)", "yellow"))
+    print(colored(f"STRATEGIES: 1) INTEGRATED PIPELINE  2) TREND_BIRTH_ENGINE  3) MID_TREND (ADX {MID_TREND_ADX_MIN}-{MID_TREND_ADX_MAX})  4) SCALP", "yellow"))
     print(colored(f"SMC/ICT: Golden Zones + FVG + BOS + Sweeps + Order Blocks", "yellow"))
     print(colored(f"MANAGEMENT: Smart TP + Smart Exit + Trail Adaptation + Mode-based timing", "yellow"))
     print(colored(f"FAST TRADING: {'ENABLED' if FAST_TRADE_ENABLED else 'DISABLED'}", "yellow"))
@@ -2583,7 +3270,14 @@ if __name__ == "__main__":
     print(colored(f"MID_TREND SYSTEM: ENABLED (Wick-based + Council confirmation)", "yellow"))
     print(colored(f"EXECUTION: {'ACTIVE' if EXECUTE_ORDERS and not DRY_RUN else 'SIMULATION'}", "yellow"))
     
-    logging.info("Council ELITE ENHANCED + Trend Birth Engine v1 + Mid Trend System service starting…")
+    if INTEGRATED_SYSTEM_ENABLED:
+        print(colored(f"🧠 INTEGRATED SYSTEM PIPELINE:", "cyan"))
+        print(colored(f"   1. REGIME Assessment (Ichimoku + ADX + EMA200)", "cyan"))
+        print(colored(f"   2. DIRECTION Filter (EMA200 + Ichimoku Tenkan/Kijun)", "cyan"))
+        print(colored(f"   3. LOCATION Filter (Volume Profile POC/VAH/VAL)", "cyan"))
+        print(colored(f"   4. TRIGGER Selection (TBE/Council/Mid Trend/Fast)", "cyan"))
+    
+    logging.info("Council ELITE INTEGRATED + Advanced System v1.0 service starting…")
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
     signal.signal(signal.SIGINT,  lambda *_: sys.exit(0))
     
